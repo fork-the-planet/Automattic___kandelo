@@ -41,6 +41,12 @@ This document tracks the implementation status of POSIX APIs in the wasm-posix-k
 | `unlinkat()` | Partial | AT_FDCWD delegates to unlink/rmdir. AT_REMOVEDIR flag supported. |
 | `mkdirat()` | Partial | AT_FDCWD delegates to mkdir. umask applied. |
 | `renameat()` | Partial | Both dirfds must be AT_FDCWD or paths absolute. |
+| `faccessat()` | Partial | AT_FDCWD delegates to access(). Absolute paths handled. Relative paths with real dirfd return ENOSYS. |
+| `fchmodat()` | Partial | AT_FDCWD delegates to chmod(). AT_SYMLINK_NOFOLLOW accepted. Relative paths with real dirfd return ENOSYS. |
+| `fchownat()` | Partial | AT_FDCWD delegates to chown(). Relative paths with real dirfd return ENOSYS. |
+| `linkat()` | Partial | Both dirfds must be AT_FDCWD or paths absolute. |
+| `symlinkat()` | Partial | Target stored as-is. AT_FDCWD for linkpath dirfd only. Relative paths return ENOSYS. |
+| `readlinkat()` | Partial | AT_FDCWD delegates to readlink(). Relative paths with real dirfd return ENOSYS. |
 
 ## fcntl()
 
@@ -70,6 +76,8 @@ This document tracks the implementation status of POSIX APIs in the wasm-posix-k
 | `getppid()` | Full | Returns ppid (0 for init process). |
 | `getuid()` / `geteuid()` | Full | Simulated; defaults to uid=1000. Configurable at init. |
 | `getgid()` / `getegid()` | Full | Simulated; defaults to gid=1000. Configurable at init. |
+| `setuid()` / `seteuid()` | Full | Simulated. setuid sets both uid and euid. seteuid sets only euid. No privilege checks. |
+| `setgid()` / `setegid()` | Full | Simulated. setgid sets both gid and egid. setegid sets only egid. No privilege checks. |
 | `getpgrp()` | Full | Returns process group ID (simulated, defaults to pid). |
 | `setpgid()` | Full | Sets process group ID. pid=0 means self. pgid=0 means use target pid. |
 | `getsid()` | Full | Returns session ID (simulated, defaults to pid). pid=0 means self. |
@@ -128,7 +136,8 @@ This document tracks the implementation status of POSIX APIs in the wasm-posix-k
 | `sendto()` / `recvfrom()` | Stub | Returns ENOSYS. Requires host network stack for UDP. |
 | `setsockopt()` / `getsockopt()` | Partial | SOL_SOCKET level: SO_TYPE, SO_DOMAIN, SO_ERROR, SO_ACCEPTCONN, SO_RCVBUF, SO_SNDBUF readable. SO_REUSEADDR, SO_KEEPALIVE accepted (no-op). |
 | `shutdown()` | Full | SHUT_RD, SHUT_WR, SHUT_RDWR. Properly closes buffer endpoints. |
-| `select()` / `poll()` | Partial | poll() implemented. Checks readiness for regular files, pipes, and sockets. Timeout ignored (non-blocking only). select() can be userspace on top of poll(). |
+| `select()` | Partial | Wrapper around poll(). Converts fd_set bitmasks to pollfd array. Timeout ignored (non-blocking only). |
+| `poll()` | Partial | Checks readiness for regular files, pipes, and sockets. Timeout ignored (non-blocking only). |
 
 ## Time
 
@@ -165,6 +174,7 @@ This document tracks the implementation status of POSIX APIs in the wasm-posix-k
 | `umask()` | Full | Set file creation mask, returns previous mask. Default 0o022. Applied in open() and mkdir(). Masked to 0o777. |
 | `getrlimit()` | Full | Returns (soft, hard) resource limits. Defaults: NOFILE=(1024,4096), STACK=(8MB,infinity), others infinity. |
 | `setrlimit()` | Full | Sets resource limits (advisory, not enforced). Validates soft <= hard. |
+| `getrusage()` | Partial | Returns zeroed rusage struct (144 bytes). RUSAGE_SELF and RUSAGE_CHILDREN supported. No actual resource tracking in Wasm. |
 
 ---
 
@@ -211,3 +221,4 @@ These features require SharedArrayBuffer (and cross-origin isolation headers in 
 9. **Phase 9 (Complete):** Polish & gaps — tcgetattr/tcsetattr, ioctl (TIOCGWINSZ/TIOCSWINSZ), signal(), fcntl F_GETOWN/F_SETOWN, MSG_PEEK, O_NONBLOCK pipe enforcement, O_NOFOLLOW, time/gettimeofday/usleep/openat wrappers
 10. **Phase 10 (Complete):** Extended POSIX — umask, uname, sysconf, dup3, pipe2, ftruncate, fsync, writev, readv, getrlimit, setrlimit
 11. **Phase 11 (Complete):** Final gaps — truncate, fdatasync, fchmod, fchown, getpgrp, setpgid, getsid, setsid, fstatat, unlinkat, mkdirat, renameat
+12. **Phase 12 (Complete):** Remaining tractable — faccessat, fchmodat, fchownat, linkat, symlinkat, readlinkat, select, setuid/setgid/seteuid/setegid, getrusage

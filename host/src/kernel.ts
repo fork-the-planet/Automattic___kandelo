@@ -1412,4 +1412,113 @@ export class WasmPosixKernel {
     if (result < 0) throw new Error(`setsid failed: errno ${-result}`);
     return result;
   }
+
+  // ---- Public API: Phase 12 Remaining Tractable ----
+
+  /**
+   * Set real and effective user ID.
+   */
+  setuid(uid: number): void {
+    const fn = this.instance!.exports.kernel_setuid as (uid: number) => number;
+    const result = fn(uid);
+    if (result < 0) throw new Error(`setuid failed: errno ${-result}`);
+  }
+
+  /**
+   * Set real and effective group ID.
+   */
+  setgid(gid: number): void {
+    const fn = this.instance!.exports.kernel_setgid as (gid: number) => number;
+    const result = fn(gid);
+    if (result < 0) throw new Error(`setgid failed: errno ${-result}`);
+  }
+
+  /**
+   * Set effective user ID.
+   */
+  seteuid(euid: number): void {
+    const fn = this.instance!.exports.kernel_seteuid as (euid: number) => number;
+    const result = fn(euid);
+    if (result < 0) throw new Error(`seteuid failed: errno ${-result}`);
+  }
+
+  /**
+   * Set effective group ID.
+   */
+  setegid(egid: number): void {
+    const fn = this.instance!.exports.kernel_setegid as (egid: number) => number;
+    const result = fn(egid);
+    if (result < 0) throw new Error(`setegid failed: errno ${-result}`);
+  }
+
+  /**
+   * Get resource usage. Returns 144-byte rusage struct.
+   */
+  getrusage(who: number): Uint8Array {
+    const fn = this.instance!.exports.kernel_getrusage as (
+      who: number, bufPtr: number, bufLen: number
+    ) => number;
+    const tmpPtr = 16;
+    const result = fn(who, tmpPtr, 144);
+    if (result < 0) throw new Error(`getrusage failed: errno ${-result}`);
+    const mem = this.getMemoryBuffer();
+    return mem.slice(tmpPtr, tmpPtr + 144);
+  }
+
+  /**
+   * select() — synchronous I/O multiplexing.
+   * Takes fd arrays for read/write/except monitoring, returns arrays of ready fds.
+   */
+  select(
+    nfds: number,
+    readfds: number[] | null,
+    writefds: number[] | null,
+    exceptfds: number[] | null,
+  ): { readReady: number[]; writeReady: number[]; exceptReady: number[] } {
+    const fn = this.instance!.exports.kernel_select as (
+      nfds: number, readPtr: number, writePtr: number, exceptPtr: number, timeout: number
+    ) => number;
+
+    const mem = this.getMemoryBuffer();
+    // Allocate 3 fd_sets in Wasm memory (128 bytes each = 384 total)
+    const basePtr = 16;
+    const readPtr = readfds ? basePtr : 0;
+    const writePtr = writefds ? basePtr + 128 : 0;
+    const exceptPtr = exceptfds ? basePtr + 256 : 0;
+
+    // Initialize fd_sets
+    if (readfds) {
+      mem.fill(0, readPtr, readPtr + 128);
+      for (const fd of readfds) {
+        mem[readPtr + Math.floor(fd / 8)] |= 1 << (fd % 8);
+      }
+    }
+    if (writefds) {
+      mem.fill(0, writePtr, writePtr + 128);
+      for (const fd of writefds) {
+        mem[writePtr + Math.floor(fd / 8)] |= 1 << (fd % 8);
+      }
+    }
+    if (exceptfds) {
+      mem.fill(0, exceptPtr, exceptPtr + 128);
+      for (const fd of exceptfds) {
+        mem[exceptPtr + Math.floor(fd / 8)] |= 1 << (fd % 8);
+      }
+    }
+
+    const result = fn(nfds, readPtr, writePtr, exceptPtr, 0);
+    if (result < 0) throw new Error(`select failed: errno ${-result}`);
+
+    // Extract results
+    const extractReady = (ptr: number, fds: number[] | null): number[] => {
+      if (!fds || !ptr) return [];
+      return fds.filter(fd => (mem[ptr + Math.floor(fd / 8)] >> (fd % 8)) & 1);
+    };
+
+    return {
+      readReady: extractReady(readPtr, readfds),
+      writeReady: extractReady(writePtr, writefds),
+      exceptReady: extractReady(exceptPtr, exceptfds),
+    };
+  }
 }
