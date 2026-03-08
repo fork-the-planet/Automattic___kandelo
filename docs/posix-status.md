@@ -19,10 +19,10 @@ This document tracks the implementation status of POSIX APIs in the wasm-posix-k
 | `openat()` | Planned | Same as open() with AT_FDCWD and relative fd support. |
 | `close()` | Partial | Ref-counted OFD cleanup. Host handle closed when last ref dropped. EINTR not yet handled. |
 | `read()` | Partial | Host-delegated for files. Pipe reads from kernel ring buffer. Short reads permitted. O_NONBLOCK not yet enforced. |
-| `pread()` | Planned | Read at offset without modifying file position. |
+| `pread()` | Partial | Host-delegated via seek-read-restore. Not atomic (single-threaded safe only). Rejects pipes/sockets with ESPIPE. |
 | `write()` | Partial | Host-delegated for files. Pipe writes to kernel ring buffer. EPIPE on closed read end. O_APPEND seek-to-end not yet atomic. |
-| `pwrite()` | Planned | Write at offset without modifying file position. |
-| `lseek()` | Partial | SEEK_SET, SEEK_CUR implemented. SEEK_END returns ENOSYS (needs host file size query). |
+| `pwrite()` | Partial | Host-delegated via seek-write-restore. Not atomic (single-threaded safe only). Rejects pipes/sockets with ESPIPE. |
+| `lseek()` | Full | SEEK_SET, SEEK_CUR, SEEK_END all implemented. SEEK_END delegates to host for file size calculation. |
 | `dup()` | Full | Lowest available fd. FD_CLOEXEC cleared. Shares OFD with original. |
 | `dup2()` | Full | Atomic close-and-dup. Same-fd no-op. FD_CLOEXEC cleared. |
 | `pipe()` | Partial | Kernel-space ring buffer (64KB). PIPE_BUF=4096. Blocking read/write not yet implemented (needs cross-worker IPC). |
