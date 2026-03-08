@@ -48,14 +48,14 @@ This document tracks the implementation status of POSIX APIs in the wasm-posix-k
 
 | Function | Status | Notes |
 |----------|--------|-------|
-| `fork()` | Planned | Requires Wasm linear memory snapshot. Complex. |
-| `exec()` | Planned | Load new Wasm module into existing process context. |
-| `waitpid()` | Planned | Kernel-space process table coordination. |
-| `exit()` / `_exit()` | Planned | Cleanup fds, notify parent. |
-| `getpid()` | Planned | Trivial once process table exists. |
-| `getppid()` | Planned | |
-| `getuid()` / `geteuid()` | Planned | Simulated; single-user environment. |
-| `getgid()` / `getegid()` | Planned | Simulated; single-user environment. |
+| `fork()` | Planned | Requires Wasm linear memory snapshot + multi-worker coordination. Deferred to Phase 3b. |
+| `exec()` | Planned | Load new Wasm module into existing process context. Deferred to Phase 3b. |
+| `waitpid()` | Planned | Requires cross-worker IPC. Deferred to Phase 3b. |
+| `exit()` / `_exit()` | Partial | Closes all fds and dir streams, sets ProcessState::Exited. No parent notification yet (needs waitpid). |
+| `getpid()` | Full | Returns pid from Process struct. |
+| `getppid()` | Full | Returns ppid (0 for init process). |
+| `getuid()` / `geteuid()` | Full | Simulated; defaults to uid=1000. Configurable at init. |
+| `getgid()` / `getegid()` | Full | Simulated; defaults to gid=1000. Configurable at init. |
 
 ## Signals
 
@@ -172,8 +172,9 @@ These features require SharedArrayBuffer (and cross-origin isolation headers in 
 
 1. **Phase 1 (Complete):** File descriptors & basic I/O — open, close, read, write, lseek, dup, dup2, pipe, fstat, fcntl (flags)
 2. **Phase 2 (Complete):** Directory operations — stat, lstat, mkdir, rmdir, unlink, link, symlink, readlink, rename, chmod, chown, access, opendir, readdir, closedir, chdir, getcwd
-3. **Phase 3 (Next):** Process management — fork, exec, waitpid, exit, getpid
-4. **Phase 4:** Signals — kill, sigaction, sigprocmask
+3. **Phase 3a (Complete):** Process identity & lifecycle — getpid, getppid, getuid/geteuid, getgid/getegid, exit/_exit
+3b. **Phase 3b (Deferred):** Multi-process — fork, exec, waitpid (requires multi-worker architecture)
+4. **Phase 4 (Next):** Signals — kill, sigaction, sigprocmask
 5. **Phase 5:** fcntl locking — F_GETLK, F_SETLK, F_SETLKW
 6. **Phase 6:** Sockets — socket, bind, listen, accept, connect
 7. **Phase 7:** Time, TTY, environment
