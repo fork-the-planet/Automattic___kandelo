@@ -1187,4 +1187,96 @@ export class WasmPosixKernel {
     if (result < 0) throw new Error(`signal failed: errno ${-result}`);
     return result;
   }
+
+  // ---- Public API: Phase 10 Extended POSIX ----
+
+  /**
+   * Set file creation mask. Returns previous mask.
+   */
+  umask(mask: number): number {
+    const fn = this.instance!.exports.kernel_umask as (mask: number) => number;
+    return fn(mask);
+  }
+
+  /**
+   * Get system identification. Returns object with sysname, nodename, release, version, machine.
+   */
+  uname(): { sysname: string; nodename: string; release: string; version: string; machine: string } {
+    const fn = this.instance!.exports.kernel_uname as (bufPtr: number, bufLen: number) => number;
+    const tmpPtr = 16;
+    const result = fn(tmpPtr, 325);
+    if (result < 0) throw new Error(`uname failed: errno ${-result}`);
+    const mem = this.getMemoryBuffer();
+    const decoder = new TextDecoder();
+    const readField = (offset: number): string => {
+      const start = tmpPtr + offset;
+      let end = start;
+      while (end < start + 65 && mem[end] !== 0) end++;
+      return decoder.decode(mem.slice(start, end));
+    };
+    return {
+      sysname: readField(0),
+      nodename: readField(65),
+      release: readField(130),
+      version: readField(195),
+      machine: readField(260),
+    };
+  }
+
+  /**
+   * Get configurable system variable value.
+   */
+  sysconf(name: number): number {
+    const fn = this.instance!.exports.kernel_sysconf as (name: number) => bigint;
+    const result = fn(name);
+    return Number(result);
+  }
+
+  /**
+   * Duplicate fd with flags. Unlike dup2, returns error if oldfd == newfd.
+   */
+  dup3(oldfd: number, newfd: number, flags: number): number {
+    const fn = this.instance!.exports.kernel_dup3 as (
+      oldfd: number, newfd: number, flags: number
+    ) => number;
+    const result = fn(oldfd, newfd, flags);
+    if (result < 0) throw new Error(`dup3 failed: errno ${-result}`);
+    return result;
+  }
+
+  /**
+   * Create pipe with flags (O_NONBLOCK, O_CLOEXEC). Returns [readFd, writeFd].
+   */
+  pipe2(flags: number): [number, number] {
+    const fn = this.instance!.exports.kernel_pipe2 as (
+      flags: number, fdPtr: number
+    ) => number;
+    const dv = this.getMemoryDataView();
+    const scratchPtr = 4;
+    const result = fn(flags, scratchPtr);
+    if (result < 0) throw new Error(`pipe2 failed: errno ${-result}`);
+    return [dv.getInt32(scratchPtr, true), dv.getInt32(scratchPtr + 4, true)];
+  }
+
+  /**
+   * Truncate file to specified length.
+   */
+  ftruncate(fd: number, length: number): void {
+    const fn = this.instance!.exports.kernel_ftruncate as (
+      fd: number, lengthLo: number, lengthHi: number
+    ) => number;
+    const lo = length & 0xFFFFFFFF;
+    const hi = Math.floor(length / 0x100000000);
+    const result = fn(fd, lo, hi);
+    if (result < 0) throw new Error(`ftruncate failed: errno ${-result}`);
+  }
+
+  /**
+   * Synchronize file state to storage.
+   */
+  fsync(fd: number): void {
+    const fn = this.instance!.exports.kernel_fsync as (fd: number) => number;
+    const result = fn(fd);
+    if (result < 0) throw new Error(`fsync failed: errno ${-result}`);
+  }
 }

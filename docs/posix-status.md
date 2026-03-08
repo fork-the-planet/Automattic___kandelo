@@ -15,7 +15,7 @@ This document tracks the implementation status of POSIX APIs in the wasm-posix-k
 
 | Function | Status | Notes |
 |----------|--------|-------|
-| `open()` | Partial | Host-delegated. O_CREAT, O_EXCL, O_TRUNC, O_APPEND, O_NONBLOCK, O_CLOEXEC, O_DIRECTORY, O_NOFOLLOW flags handled. |
+| `open()` | Partial | Host-delegated. O_CREAT, O_EXCL, O_TRUNC, O_APPEND, O_NONBLOCK, O_CLOEXEC, O_DIRECTORY, O_NOFOLLOW flags handled. umask applied to mode on O_CREAT. |
 | `openat()` | Partial | AT_FDCWD delegates to open(). Absolute paths handled. Relative paths with non-AT_FDCWD dirfd return ENOSYS (requires directory path resolution). |
 | `close()` | Partial | Ref-counted OFD cleanup. Host handle closed when last ref dropped. EINTR not yet handled. |
 | `read()` | Partial | Host-delegated for files. Pipe/socket reads from kernel ring buffer. Short reads permitted. O_NONBLOCK returns EAGAIN when no data available. |
@@ -25,8 +25,14 @@ This document tracks the implementation status of POSIX APIs in the wasm-posix-k
 | `lseek()` | Full | SEEK_SET, SEEK_CUR, SEEK_END all implemented. SEEK_END delegates to host for file size calculation. |
 | `dup()` | Full | Lowest available fd. FD_CLOEXEC cleared. Shares OFD with original. |
 | `dup2()` | Full | Atomic close-and-dup. Same-fd no-op. FD_CLOEXEC cleared. |
+| `dup3()` | Full | Like dup2 but returns EINVAL if oldfd==newfd. Supports O_CLOEXEC flag. |
 | `pipe()` | Partial | Kernel-space ring buffer (64KB). PIPE_BUF=4096. O_NONBLOCK enforced (EAGAIN). Blocking read/write not yet implemented (needs cross-worker IPC). |
+| `pipe2()` | Full | Like pipe with O_NONBLOCK and O_CLOEXEC flag support. |
+| `readv()` | Full | Scatter read. Iterates over iovec array calling sys_read for each buffer. Stops on short read or EOF. |
+| `writev()` | Full | Gather write. Iterates over iovec array calling sys_write for each buffer. Stops on short write. |
 | `fstat()` | Partial | Host-delegated for regular files. Pipe returns S_IFIFO | 0o600. Full struct stat populated. |
+| `ftruncate()` | Partial | Host-delegated for regular files with write access. Validates length >= 0. Rejects non-regular fds. |
+| `fsync()` | Partial | Host-delegated for regular files. Rejects non-regular fds (pipes, sockets). |
 
 ## fcntl()
 
@@ -85,7 +91,7 @@ This document tracks the implementation status of POSIX APIs in the wasm-posix-k
 | `opendir()` | Partial | Host-delegated via DirStream table. Entry-at-a-time iteration. |
 | `readdir()` | Partial | Returns WasmDirent (d_ino, d_type, d_namlen) + name buffer. |
 | `closedir()` | Full | Frees DirStream slot, delegates to host. |
-| `mkdir()` | Partial | Host-delegated. Relative paths resolved via kernel cwd. |
+| `mkdir()` | Partial | Host-delegated. Relative paths resolved via kernel cwd. umask applied to mode. |
 | `rmdir()` | Partial | Host-delegated. Relative paths resolved via kernel cwd. |
 | `chdir()` / `getcwd()` | Partial | Kernel-maintained cwd. chdir validates via host_stat that target is S_IFDIR. getcwd returns ERANGE if buffer too small. |
 | `link()` / `unlink()` | Partial | Host-delegated. Relative paths resolved via kernel cwd. |
@@ -138,6 +144,16 @@ This document tracks the implementation status of POSIX APIs in the wasm-posix-k
 | `setenv()` / `unsetenv()` | Full | Kernel-managed. setenv supports overwrite flag. Rejects empty name or name containing '='. |
 | `environ` | Partial | Stored as Vec of KEY=VALUE entries in Process. No C-style char** environ pointer yet. |
 
+## System Information
+
+| Function | Status | Notes |
+|----------|--------|-------|
+| `uname()` | Full | Returns sysname="wasm-posix", nodename="localhost", release="1.0.0", version="wasm-posix-kernel", machine="wasm32". 5 x 65-byte null-terminated strings. |
+| `sysconf()` | Partial | Returns _SC_PAGE_SIZE=65536 (Wasm page), _SC_OPEN_MAX=1024, _SC_NPROCESSORS_ONLN=1, _SC_CLK_TCK=100. Unknown names return EINVAL. |
+| `umask()` | Full | Set file creation mask, returns previous mask. Default 0o022. Applied in open() and mkdir(). Masked to 0o777. |
+| `getrlimit()` | Full | Returns (soft, hard) resource limits. Defaults: NOFILE=(1024,4096), STACK=(8MB,infinity), others infinity. |
+| `setrlimit()` | Full | Sets resource limits (advisory, not enforced). Validates soft <= hard. |
+
 ---
 
 ## Environment-Specific Tradeoffs
@@ -181,3 +197,4 @@ These features require SharedArrayBuffer (and cross-origin isolation headers in 
 7. **Phase 7 (Complete):** Time, TTY, environment — clock_gettime, nanosleep, isatty, getenv/setenv/unsetenv
 8. **Phase 8 (Complete):** Memory management — mmap (anonymous), munmap, brk, mprotect (stub)
 9. **Phase 9 (Complete):** Polish & gaps — tcgetattr/tcsetattr, ioctl (TIOCGWINSZ/TIOCSWINSZ), signal(), fcntl F_GETOWN/F_SETOWN, MSG_PEEK, O_NONBLOCK pipe enforcement, O_NOFOLLOW, time/gettimeofday/usleep/openat wrappers
+10. **Phase 10 (Complete):** Extended POSIX — umask, uname, sysconf, dup3, pipe2, ftruncate, fsync, writev, readv, getrlimit, setrlimit

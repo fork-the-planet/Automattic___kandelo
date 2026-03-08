@@ -56,6 +56,10 @@ export interface PlatformIO {
   ): Promise<{ name: string; type: number; ino: number } | null>;
   closedir(handle: number): Promise<void>;
 
+  // File operations
+  ftruncate(handle: number, length: number): Promise<void>;
+  fsync(handle: number): Promise<void>;
+
   // Time
   clockGettime(clockId: number): Promise<{ sec: number; nsec: number }>;
   nanosleep(sec: number, nsec: number): Promise<void>;
