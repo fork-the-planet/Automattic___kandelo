@@ -1716,6 +1716,33 @@ pub fn sys_umask(proc: &mut Process, mask: u32) -> u32 {
     old
 }
 
+/// uname — get system identification
+/// Writes 5 null-terminated strings of 65 bytes each (325 bytes total):
+/// sysname, nodename, release, version, machine
+pub fn sys_uname(buf: &mut [u8]) -> Result<(), Errno> {
+    if buf.len() < 325 {
+        return Err(Errno::EINVAL);
+    }
+    // Zero out buffer first
+    for b in buf[..325].iter_mut() {
+        *b = 0;
+    }
+    let fields: [&[u8]; 5] = [
+        b"wasm-posix",        // sysname
+        b"localhost",         // nodename
+        b"1.0.0",             // release
+        b"wasm-posix-kernel", // version
+        b"wasm32",            // machine
+    ];
+    for (i, field) in fields.iter().enumerate() {
+        let offset = i * 65;
+        let len = field.len().min(64);
+        buf[offset..offset + len].copy_from_slice(&field[..len]);
+        // null terminator already set by zeroing
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3298,5 +3325,28 @@ mod tests {
         let old = sys_umask(&mut proc, 0o7777); // only 0o777 stored
         assert_eq!(old, 0o022);
         assert_eq!(proc.umask, 0o777);
+    }
+
+    // ---- uname tests ----
+
+    #[test]
+    fn test_uname_returns_fields() {
+        let mut buf = [0u8; 325];
+        let result = sys_uname(&mut buf);
+        assert!(result.is_ok());
+        // sysname at offset 0
+        assert_eq!(&buf[0..10], b"wasm-posix");
+        assert_eq!(buf[10], 0); // null terminated
+        // nodename at offset 65
+        assert_eq!(&buf[65..74], b"localhost");
+        // machine at offset 260
+        assert_eq!(&buf[260..266], b"wasm32");
+    }
+
+    #[test]
+    fn test_uname_buffer_too_small() {
+        let mut buf = [0u8; 100];
+        let result = sys_uname(&mut buf);
+        assert_eq!(result, Err(Errno::EINVAL));
     }
 }

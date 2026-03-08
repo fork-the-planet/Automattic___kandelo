@@ -78,6 +78,7 @@ pub enum Syscall {
     Ioctl = 72,
     Signal = 73,
     Umask = 74,
+    Uname = 75,
 }
 
 impl Syscall {
@@ -158,6 +159,7 @@ impl Syscall {
             72 => Some(Syscall::Ioctl),
             73 => Some(Syscall::Signal),
             74 => Some(Syscall::Umask),
+            75 => Some(Syscall::Uname),
             _ => None,
         }
     }

@@ -1294,3 +1294,13 @@ pub extern "C" fn kernel_umask(mask: u32) -> u32 {
     let proc = unsafe { get_process() };
     syscalls::sys_umask(proc, mask)
 }
+
+/// Get system identification. Returns 0 on success, or negative errno on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_uname(buf_ptr: *mut u8, buf_len: u32) -> i32 {
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, buf_len as usize) };
+    match syscalls::sys_uname(buf) {
+        Ok(()) => 0,
+        Err(e) => -(e as i32),
+    }
+}
