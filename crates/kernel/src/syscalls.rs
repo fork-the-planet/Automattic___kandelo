@@ -7,7 +7,7 @@ use wasm_posix_shared::fcntl_cmd::*;
 use wasm_posix_shared::lock_type::*;
 use wasm_posix_shared::seek::*;
 use wasm_posix_shared::mode::S_IFIFO;
-use wasm_posix_shared::{WasmFlock, WasmStat};
+use wasm_posix_shared::{WasmFlock, WasmStat, WasmTimespec};
 
 use crate::fd::OpenFileDescRef;
 use crate::lock::FileLock;
@@ -793,6 +793,104 @@ pub fn sys_exit(proc: &mut Process, host: &mut dyn HostIO, status: i32) {
     proc.exit_status = status;
 }
 
+/// Get the current time from the specified clock.
+pub fn sys_clock_gettime(
+    _proc: &Process,
+    host: &mut dyn HostIO,
+    clock_id: u32,
+) -> Result<WasmTimespec, Errno> {
+    let (sec, nsec) = host.host_clock_gettime(clock_id)?;
+    Ok(WasmTimespec { tv_sec: sec, tv_nsec: nsec })
+}
+
+/// Sleep for the specified duration.
+pub fn sys_nanosleep(
+    _proc: &Process,
+    host: &mut dyn HostIO,
+    req: &WasmTimespec,
+) -> Result<(), Errno> {
+    if req.tv_sec < 0 || req.tv_nsec < 0 || req.tv_nsec >= 1_000_000_000 {
+        return Err(Errno::EINVAL);
+    }
+    host.host_nanosleep(req.tv_sec, req.tv_nsec)
+}
+
+/// Check if a file descriptor refers to a terminal.
+/// Returns 1 if it's a terminal (CharDevice), Err(ENOTTY) otherwise.
+pub fn sys_isatty(proc: &Process, fd: i32) -> Result<i32, Errno> {
+    let entry = proc.fd_table.get(fd)?;
+    let ofd_idx = entry.ofd_ref.0;
+    let ofd = proc.ofd_table.get(ofd_idx).ok_or(Errno::EBADF)?;
+
+    if ofd.file_type == FileType::CharDevice {
+        Ok(1)
+    } else {
+        Err(Errno::ENOTTY)
+    }
+}
+
+/// Get an environment variable by name.
+/// Returns the value (not including "KEY=") or Err(ENOENT) if not found.
+pub fn sys_getenv(proc: &Process, name: &[u8], buf: &mut [u8]) -> Result<usize, Errno> {
+    for entry in &proc.environ {
+        if let Some(eq_pos) = entry.iter().position(|&b| b == b'=') {
+            if &entry[..eq_pos] == name {
+                let value = &entry[eq_pos + 1..];
+                if buf.len() < value.len() {
+                    return Err(Errno::ERANGE);
+                }
+                buf[..value.len()].copy_from_slice(value);
+                return Ok(value.len());
+            }
+        }
+    }
+    Err(Errno::ENOENT)
+}
+
+/// Set an environment variable. If `overwrite` is true, replace existing.
+pub fn sys_setenv(proc: &mut Process, name: &[u8], value: &[u8], overwrite: bool) -> Result<(), Errno> {
+    if name.is_empty() || name.contains(&b'=') {
+        return Err(Errno::EINVAL);
+    }
+
+    // Check if it already exists
+    for entry in proc.environ.iter_mut() {
+        if let Some(eq_pos) = entry.iter().position(|&b| b == b'=') {
+            if &entry[..eq_pos] == name {
+                if overwrite {
+                    let mut new_entry = name.to_vec();
+                    new_entry.push(b'=');
+                    new_entry.extend_from_slice(value);
+                    *entry = new_entry;
+                }
+                return Ok(());
+            }
+        }
+    }
+
+    // Not found - add new
+    let mut new_entry = name.to_vec();
+    new_entry.push(b'=');
+    new_entry.extend_from_slice(value);
+    proc.environ.push(new_entry);
+    Ok(())
+}
+
+/// Remove an environment variable.
+pub fn sys_unsetenv(proc: &mut Process, name: &[u8]) -> Result<(), Errno> {
+    if name.is_empty() || name.contains(&b'=') {
+        return Err(Errno::EINVAL);
+    }
+    proc.environ.retain(|entry| {
+        if let Some(eq_pos) = entry.iter().position(|&b| b == b'=') {
+            &entry[..eq_pos] != name
+        } else {
+            true
+        }
+    });
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -923,6 +1021,14 @@ mod tests {
         }
 
         fn host_closedir(&mut self, _handle: i64) -> Result<(), Errno> { Ok(()) }
+
+        fn host_clock_gettime(&mut self, _clock_id: u32) -> Result<(i64, i64), Errno> {
+            Ok((1234567890, 123456789))
+        }
+
+        fn host_nanosleep(&mut self, _seconds: i64, _nanoseconds: i64) -> Result<(), Errno> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -1528,5 +1634,115 @@ mod tests {
         };
         let result = sys_fcntl_lock(&mut proc, fd, F_SETLK, &mut flock);
         assert_eq!(result, Err(Errno::EBADF));
+    }
+
+    #[test]
+    fn test_clock_gettime() {
+        let proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let ts = sys_clock_gettime(&proc, &mut host, 0).unwrap();
+        assert_eq!(ts.tv_sec, 1234567890);
+        assert_eq!(ts.tv_nsec, 123456789);
+    }
+
+    #[test]
+    fn test_nanosleep_rejects_negative() {
+        let proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let req = WasmTimespec { tv_sec: -1, tv_nsec: 0 };
+        assert_eq!(sys_nanosleep(&proc, &mut host, &req), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn test_nanosleep_rejects_invalid_nsec() {
+        let proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let req = WasmTimespec { tv_sec: 0, tv_nsec: 1_000_000_000 };
+        assert_eq!(sys_nanosleep(&proc, &mut host, &req), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn test_nanosleep_valid() {
+        let proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let req = WasmTimespec { tv_sec: 1, tv_nsec: 500_000_000 };
+        assert_eq!(sys_nanosleep(&proc, &mut host, &req), Ok(()));
+    }
+
+    #[test]
+    fn test_isatty_stdin() {
+        let proc = Process::new(1);
+        assert_eq!(sys_isatty(&proc, 0), Ok(1));
+    }
+
+    #[test]
+    fn test_isatty_regular_file() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_open(&mut proc, &mut host, b"/tmp/test", O_RDONLY, 0o644).unwrap();
+        assert_eq!(sys_isatty(&proc, fd), Err(Errno::ENOTTY));
+    }
+
+    #[test]
+    fn test_isatty_invalid_fd() {
+        let proc = Process::new(1);
+        assert_eq!(sys_isatty(&proc, 99), Err(Errno::EBADF));
+    }
+
+    #[test]
+    fn test_setenv_getenv() {
+        let mut proc = Process::new(1);
+        sys_setenv(&mut proc, b"HOME", b"/home/user", true).unwrap();
+        let mut buf = [0u8; 256];
+        let n = sys_getenv(&proc, b"HOME", &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"/home/user");
+    }
+
+    #[test]
+    fn test_setenv_no_overwrite() {
+        let mut proc = Process::new(1);
+        sys_setenv(&mut proc, b"HOME", b"/home/user", true).unwrap();
+        sys_setenv(&mut proc, b"HOME", b"/other", false).unwrap();
+        let mut buf = [0u8; 256];
+        let n = sys_getenv(&proc, b"HOME", &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"/home/user");
+    }
+
+    #[test]
+    fn test_setenv_overwrite() {
+        let mut proc = Process::new(1);
+        sys_setenv(&mut proc, b"HOME", b"/home/user", true).unwrap();
+        sys_setenv(&mut proc, b"HOME", b"/other", true).unwrap();
+        let mut buf = [0u8; 256];
+        let n = sys_getenv(&proc, b"HOME", &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"/other");
+    }
+
+    #[test]
+    fn test_unsetenv() {
+        let mut proc = Process::new(1);
+        sys_setenv(&mut proc, b"HOME", b"/home/user", true).unwrap();
+        sys_unsetenv(&mut proc, b"HOME").unwrap();
+        let mut buf = [0u8; 256];
+        assert_eq!(sys_getenv(&proc, b"HOME", &mut buf), Err(Errno::ENOENT));
+    }
+
+    #[test]
+    fn test_getenv_not_found() {
+        let proc = Process::new(1);
+        let mut buf = [0u8; 256];
+        assert_eq!(sys_getenv(&proc, b"NONEXIST", &mut buf), Err(Errno::ENOENT));
+    }
+
+    #[test]
+    fn test_setenv_rejects_empty_name() {
+        let mut proc = Process::new(1);
+        assert_eq!(sys_setenv(&mut proc, b"", b"value", true), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn test_setenv_rejects_name_with_equals() {
+        let mut proc = Process::new(1);
+        assert_eq!(sys_setenv(&mut proc, b"A=B", b"value", true), Err(Errno::EINVAL));
     }
 }
