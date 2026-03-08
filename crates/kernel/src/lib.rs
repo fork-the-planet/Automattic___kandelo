@@ -5,6 +5,7 @@ extern crate alloc;
 extern crate wasm_posix_shared;
 
 pub mod fd;
+pub mod lock;
 pub mod ofd;
 pub mod path;
 pub mod pipe;
