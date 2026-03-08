@@ -58,7 +58,7 @@ describe("ProcessManager", () => {
     expect(pm.getProcessCount()).toBe(2);
   });
 
-  it("should reject spawn if worker sends error", async () => {
+  it("should reject spawn if worker sends error and clean up process entry", async () => {
     const { pm, adapter } = createTestPM();
     const spawnPromise = pm.spawn();
     adapter.lastWorker!.simulateMessage({
@@ -67,20 +67,26 @@ describe("ProcessManager", () => {
       message: "wasm init failed",
     });
     await expect(spawnPromise).rejects.toThrow("wasm init failed");
+    expect(pm.getProcess(1)).toBeUndefined();
+    expect(pm.getProcessCount()).toBe(0);
   });
 
-  it("should reject spawn if worker exits during init", async () => {
+  it("should reject spawn if worker exits during init and clean up", async () => {
     const { pm, adapter } = createTestPM();
     const spawnPromise = pm.spawn();
     adapter.lastWorker!.simulateExit(1);
     await expect(spawnPromise).rejects.toThrow("Worker exited with code 1");
+    expect(pm.getProcess(1)).toBeUndefined();
+    expect(pm.getProcessCount()).toBe(0);
   });
 
-  it("should reject spawn if worker throws error event", async () => {
+  it("should reject spawn if worker throws error event and clean up", async () => {
     const { pm, adapter } = createTestPM();
     const spawnPromise = pm.spawn();
     adapter.lastWorker!.simulateError(new Error("thread crashed"));
     await expect(spawnPromise).rejects.toThrow("thread crashed");
+    expect(pm.getProcess(1)).toBeUndefined();
+    expect(pm.getProcessCount()).toBe(0);
   });
 
   it("should transition to zombie state on exit message", async () => {

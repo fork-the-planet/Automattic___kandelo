@@ -63,8 +63,14 @@ export class ProcessManager {
 
     this.processes.set(pid, info);
 
+    const cleanup = () => {
+      this.processes.delete(pid);
+      worker.terminate().catch(() => {});
+    };
+
     return new Promise<number>((resolve, reject) => {
       const timeout = setTimeout(() => {
+        cleanup();
         reject(new Error(`Process ${pid} timed out during initialization`));
       }, 10_000);
 
@@ -81,14 +87,17 @@ export class ProcessManager {
           case "exit":
             if (info.state === "starting") {
               clearTimeout(timeout);
+              cleanup();
               reject(new Error(`Worker exited with status ${m.status}`));
+            } else {
+              info.state = "zombie";
+              info.exitStatus = m.status;
             }
-            info.state = "zombie";
-            info.exitStatus = m.status;
             break;
           case "error":
             if (info.state === "starting") {
               clearTimeout(timeout);
+              cleanup();
               reject(new Error(m.message));
             }
             break;
@@ -98,6 +107,7 @@ export class ProcessManager {
       worker.on("error", (err: Error) => {
         if (info.state === "starting") {
           clearTimeout(timeout);
+          cleanup();
           reject(err);
         }
       });
@@ -105,6 +115,7 @@ export class ProcessManager {
       worker.on("exit", (code: number) => {
         if (info.state === "starting") {
           clearTimeout(timeout);
+          cleanup();
           reject(new Error(`Worker exited with code ${code} during init`));
         }
       });
