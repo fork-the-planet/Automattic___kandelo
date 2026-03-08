@@ -841,6 +841,16 @@ pub extern "C" fn kernel_sigaction(sig: u32, handler: u32) -> i32 {
     }
 }
 
+/// signal() — set signal handler (legacy API). Returns old handler or negative errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_signal(signum: u32, handler: u32) -> i32 {
+    let proc = unsafe { get_process() };
+    match syscalls::sys_signal(proc, signum, handler) {
+        Ok(old) => old,
+        Err(e) => -(e as i32),
+    }
+}
+
 /// Manipulate the signal mask. The 64-bit set is passed as two 32-bit halves.
 /// Returns old mask as i64 (>= 0) or negative errno.
 #[unsafe(no_mangle)]

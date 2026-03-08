@@ -874,6 +874,27 @@ pub fn sys_sigaction(proc: &mut Process, sig: u32, handler_val: u32) -> Result<u
     Ok(old_val)
 }
 
+/// signal() — set signal handler (legacy API, wraps sigaction semantics)
+/// Returns previous handler value: SIG_DFL=0, SIG_IGN=1, or function pointer
+pub fn sys_signal(proc: &mut Process, signum: u32, handler_val: u32) -> Result<i32, Errno> {
+    let new_handler = match handler_val {
+        SIG_DFL => SignalHandler::Default,
+        SIG_IGN => SignalHandler::Ignore,
+        ptr => SignalHandler::Handler(ptr),
+    };
+
+    let old = proc.signals.set_handler(signum, new_handler)
+        .map_err(|_| Errno::EINVAL)?;
+
+    let old_val = match old {
+        SignalHandler::Default => SIG_DFL as i32,
+        SignalHandler::Ignore => SIG_IGN as i32,
+        SignalHandler::Handler(ptr) => ptr as i32,
+    };
+
+    Ok(old_val)
+}
+
 /// Manipulate the signal mask.
 /// how: SIG_BLOCK, SIG_UNBLOCK, or SIG_SETMASK
 /// set: bitmask of signals to modify
@@ -2297,6 +2318,39 @@ mod tests {
     fn test_sigaction_cannot_change_sigkill() {
         let mut proc = Process::new(1);
         let result = sys_sigaction(&mut proc, 9, 1); // SIGKILL, SIG_IGN
+        assert_eq!(result, Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn test_signal_set_ignore() {
+        let mut proc = Process::new(1);
+        // signal(SIGUSR1, SIG_IGN) — returns old handler (SIG_DFL=0)
+        let result = sys_signal(&mut proc, 10, 1); // SIGUSR1=10, SIG_IGN=1
+        assert_eq!(result, Ok(0)); // Was SIG_DFL
+    }
+
+    #[test]
+    fn test_signal_set_handler() {
+        let mut proc = Process::new(1);
+        // Set handler to function pointer 42
+        let result = sys_signal(&mut proc, 10, 42); // SIGUSR1=10
+        assert_eq!(result, Ok(0)); // Was SIG_DFL
+        // Set back to default, should return 42
+        let result = sys_signal(&mut proc, 10, 0); // SIG_DFL
+        assert_eq!(result, Ok(42));
+    }
+
+    #[test]
+    fn test_signal_sigkill_immutable() {
+        let mut proc = Process::new(1);
+        let result = sys_signal(&mut proc, 9, 1); // SIGKILL, SIG_IGN
+        assert_eq!(result, Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn test_signal_sigstop_immutable() {
+        let mut proc = Process::new(1);
+        let result = sys_signal(&mut proc, 19, 1); // SIGSTOP=19, SIG_IGN
         assert_eq!(result, Err(Errno::EINVAL));
     }
 
