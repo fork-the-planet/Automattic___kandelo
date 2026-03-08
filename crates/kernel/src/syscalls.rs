@@ -1257,6 +1257,80 @@ pub fn sys_setsockopt(
     }
 }
 
+/// Bind a socket to an address. Stub — returns ENOSYS.
+pub fn sys_bind(proc: &mut Process, fd: i32, _addr: &[u8]) -> Result<(), Errno> {
+    let entry = proc.fd_table.get(fd)?;
+    let ofd = proc.ofd_table.get(entry.ofd_ref.0).ok_or(Errno::EBADF)?;
+    if ofd.file_type != FileType::Socket {
+        return Err(Errno::ENOTSOCK);
+    }
+    Err(Errno::ENOSYS)
+}
+
+/// Listen for connections on a socket. Stub — returns ENOSYS.
+pub fn sys_listen(proc: &mut Process, fd: i32, _backlog: u32) -> Result<(), Errno> {
+    let entry = proc.fd_table.get(fd)?;
+    let ofd = proc.ofd_table.get(entry.ofd_ref.0).ok_or(Errno::EBADF)?;
+    if ofd.file_type != FileType::Socket {
+        return Err(Errno::ENOTSOCK);
+    }
+    Err(Errno::ENOSYS)
+}
+
+/// Accept a connection on a listening socket. Stub — returns ENOSYS.
+pub fn sys_accept(proc: &mut Process, _host: &mut dyn HostIO, fd: i32) -> Result<i32, Errno> {
+    let entry = proc.fd_table.get(fd)?;
+    let ofd = proc.ofd_table.get(entry.ofd_ref.0).ok_or(Errno::EBADF)?;
+    if ofd.file_type != FileType::Socket {
+        return Err(Errno::ENOTSOCK);
+    }
+    Err(Errno::ENOSYS)
+}
+
+/// Connect a socket to an address. Stub — returns ENOSYS.
+pub fn sys_connect(proc: &mut Process, _host: &mut dyn HostIO, fd: i32, _addr: &[u8]) -> Result<(), Errno> {
+    let entry = proc.fd_table.get(fd)?;
+    let ofd = proc.ofd_table.get(entry.ofd_ref.0).ok_or(Errno::EBADF)?;
+    if ofd.file_type != FileType::Socket {
+        return Err(Errno::ENOTSOCK);
+    }
+    Err(Errno::ENOSYS)
+}
+
+/// Send a message on a socket to a specific address. Stub — returns ENOSYS.
+pub fn sys_sendto(
+    proc: &mut Process,
+    _host: &mut dyn HostIO,
+    fd: i32,
+    _buf: &[u8],
+    _flags: u32,
+    _addr: &[u8],
+) -> Result<usize, Errno> {
+    let entry = proc.fd_table.get(fd)?;
+    let ofd = proc.ofd_table.get(entry.ofd_ref.0).ok_or(Errno::EBADF)?;
+    if ofd.file_type != FileType::Socket {
+        return Err(Errno::ENOTSOCK);
+    }
+    Err(Errno::ENOSYS)
+}
+
+/// Receive a message from a socket with sender address. Stub — returns ENOSYS.
+pub fn sys_recvfrom(
+    proc: &mut Process,
+    _host: &mut dyn HostIO,
+    fd: i32,
+    _buf: &mut [u8],
+    _flags: u32,
+    _addr_buf: &mut [u8],
+) -> Result<(usize, usize), Errno> {
+    let entry = proc.fd_table.get(fd)?;
+    let ofd = proc.ofd_table.get(entry.ofd_ref.0).ok_or(Errno::EBADF)?;
+    if ofd.file_type != FileType::Socket {
+        return Err(Errno::ENOTSOCK);
+    }
+    Err(Errno::ENOSYS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2321,5 +2395,52 @@ mod tests {
         use wasm_posix_shared::socket::*;
         let result = sys_shutdown(&mut proc, 0, SHUT_RDWR);
         assert_eq!(result, Err(Errno::ENOTSOCK));
+    }
+
+    #[test]
+    fn test_bind_enosys_for_inet() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::socket::*;
+        let fd = sys_socket(&mut proc, &mut host, AF_INET, SOCK_STREAM, 0).unwrap();
+        let result = sys_bind(&mut proc, fd, &[0u8; 16]);
+        assert_eq!(result, Err(Errno::ENOSYS));
+    }
+
+    #[test]
+    fn test_bind_enotsock() {
+        let mut proc = Process::new(1);
+        let result = sys_bind(&mut proc, 0, &[0u8; 16]);
+        assert_eq!(result, Err(Errno::ENOTSOCK));
+    }
+
+    #[test]
+    fn test_listen_enosys() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::socket::*;
+        let fd = sys_socket(&mut proc, &mut host, AF_INET, SOCK_STREAM, 0).unwrap();
+        let result = sys_listen(&mut proc, fd, 5);
+        assert_eq!(result, Err(Errno::ENOSYS));
+    }
+
+    #[test]
+    fn test_accept_enosys() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::socket::*;
+        let fd = sys_socket(&mut proc, &mut host, AF_INET, SOCK_STREAM, 0).unwrap();
+        let result = sys_accept(&mut proc, &mut host, fd);
+        assert_eq!(result, Err(Errno::ENOSYS));
+    }
+
+    #[test]
+    fn test_connect_enosys() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::socket::*;
+        let fd = sys_socket(&mut proc, &mut host, AF_INET, SOCK_STREAM, 0).unwrap();
+        let result = sys_connect(&mut proc, &mut host, fd, &[0u8; 16]);
+        assert_eq!(result, Err(Errno::ENOSYS));
     }
 }
