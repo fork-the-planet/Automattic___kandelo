@@ -1490,6 +1490,77 @@ pub fn sys_poll(
     Ok(ready_count)
 }
 
+/// Get current time in seconds since epoch.
+pub fn sys_time(
+    _proc: &mut Process,
+    host: &mut dyn HostIO,
+) -> Result<i64, Errno> {
+    let (sec, _nsec) = host.host_clock_gettime(0)?; // CLOCK_REALTIME = 0
+    Ok(sec)
+}
+
+/// Get current time with microsecond precision.
+/// Returns (seconds, microseconds).
+pub fn sys_gettimeofday(
+    _proc: &mut Process,
+    host: &mut dyn HostIO,
+) -> Result<(i64, i64), Errno> {
+    let (sec, nsec) = host.host_clock_gettime(0)?; // CLOCK_REALTIME = 0
+    let usec = nsec / 1000; // nanoseconds to microseconds
+    Ok((sec, usec))
+}
+
+/// Sleep for a specified number of microseconds.
+pub fn sys_usleep(
+    _proc: &mut Process,
+    host: &mut dyn HostIO,
+    usec: u32,
+) -> Result<(), Errno> {
+    let sec = (usec / 1_000_000) as i64;
+    let nsec = ((usec % 1_000_000) * 1000) as i64;
+    host.host_nanosleep(sec, nsec)
+}
+
+/// Open a file relative to a directory file descriptor.
+///
+/// If dirfd is AT_FDCWD, the path is resolved relative to the process cwd
+/// (same as open()). If dirfd is a valid directory fd, the path is resolved
+/// relative to that directory. Absolute paths ignore dirfd.
+pub fn sys_openat(
+    proc: &mut Process,
+    host: &mut dyn HostIO,
+    dirfd: i32,
+    path: &[u8],
+    oflags: u32,
+    mode: u32,
+) -> Result<i32, Errno> {
+    use wasm_posix_shared::flags::AT_FDCWD;
+
+    // If path is absolute, dirfd is ignored
+    if !path.is_empty() && path[0] == b'/' {
+        return sys_open(proc, host, path, oflags, mode);
+    }
+
+    if dirfd == AT_FDCWD {
+        // Resolve relative to cwd (same as open())
+        return sys_open(proc, host, path, oflags, mode);
+    }
+
+    // dirfd must refer to a directory
+    let entry = proc.fd_table.get(dirfd)?;
+    let ofd = proc.ofd_table.get(entry.ofd_ref.0).ok_or(Errno::EBADF)?;
+    if ofd.file_type != FileType::Directory {
+        return Err(Errno::ENOTDIR);
+    }
+
+    // For now, since we can't easily get the directory path from the host handle,
+    // return ENOSYS for non-AT_FDCWD dirfd with relative paths.
+    // This is a limitation: full openat() would need to resolve the directory path
+    // from the host handle, which the current HostIO interface doesn't support.
+    // AT_FDCWD (the most common usage) works fully.
+    Err(Errno::ENOSYS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2765,5 +2836,61 @@ mod tests {
         let mut buf = [0u8; 4];
         let result = sys_pread(&mut proc, &mut host, fd, &mut buf, 0);
         assert_eq!(result, Err(Errno::ESPIPE));
+    }
+
+    #[test]
+    fn test_time_returns_positive() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let t = sys_time(&mut proc, &mut host).unwrap();
+        // MockHostIO returns (1234567890, 123456789) for clock_gettime
+        assert_eq!(t, 1234567890);
+    }
+
+    #[test]
+    fn test_gettimeofday() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let (sec, usec) = sys_gettimeofday(&mut proc, &mut host).unwrap();
+        assert_eq!(sec, 1234567890);
+        assert_eq!(usec, 123456); // 123456789 nsec / 1000 = 123456 usec
+    }
+
+    #[test]
+    fn test_usleep() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        // MockHostIO nanosleep is a no-op, so this should succeed
+        sys_usleep(&mut proc, &mut host, 1000).unwrap();
+    }
+
+    #[test]
+    fn test_openat_at_fdcwd() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::flags::AT_FDCWD;
+        // AT_FDCWD should work like open()
+        let result = sys_openat(&mut proc, &mut host, AT_FDCWD, b"/tmp/test", O_RDONLY, 0);
+        // MockHostIO.host_open returns Ok(100), so we get a valid fd
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_openat_absolute_path_ignores_dirfd() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        // Absolute path should ignore dirfd
+        let result = sys_openat(&mut proc, &mut host, 999, b"/tmp/test", O_RDONLY, 0);
+        // Even with invalid dirfd, absolute path works
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_openat_dirfd_enotdir() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        // fd 0 is stdin (CharDevice, not Directory)
+        let result = sys_openat(&mut proc, &mut host, 0, b"relative", O_RDONLY, 0);
+        assert_eq!(result, Err(Errno::ENOTDIR));
     }
 }

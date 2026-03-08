@@ -69,6 +69,10 @@ pub enum Syscall {
     Recvfrom = 63,
     Pread = 64,
     Pwrite = 65,
+    Time = 66,
+    Gettimeofday = 67,
+    Usleep = 68,
+    Openat = 69,
 }
 
 impl Syscall {
@@ -140,6 +144,10 @@ impl Syscall {
             63 => Some(Syscall::Recvfrom),
             64 => Some(Syscall::Pread),
             65 => Some(Syscall::Pwrite),
+            66 => Some(Syscall::Time),
+            67 => Some(Syscall::Gettimeofday),
+            68 => Some(Syscall::Usleep),
+            69 => Some(Syscall::Openat),
             _ => None,
         }
     }
@@ -292,6 +300,7 @@ pub mod flags {
     pub const O_NONBLOCK: u32 = 0o4000;
     pub const O_DIRECTORY: u32 = 0o200000;
     pub const O_CLOEXEC: u32 = 0o2000000;
+    pub const AT_FDCWD: i32 = -100;
 }
 
 /// File descriptor flags (FD_*).

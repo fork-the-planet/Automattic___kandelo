@@ -1186,3 +1186,57 @@ pub extern "C" fn kernel_recvfrom(
         Err(e) => -(e as i32),
     }
 }
+
+/// time() - returns seconds since epoch as i64.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_time() -> i64 {
+    let proc = unsafe { get_process() };
+    let mut host = WasmHostIO;
+    match syscalls::sys_time(proc, &mut host) {
+        Ok(t) => t,
+        Err(e) => -(e as i64),
+    }
+}
+
+/// gettimeofday() - writes sec and usec to the given pointers.
+/// Returns 0 on success, negative errno on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_gettimeofday(sec_ptr: *mut i64, usec_ptr: *mut i64) -> i32 {
+    let proc = unsafe { get_process() };
+    let mut host = WasmHostIO;
+    match syscalls::sys_gettimeofday(proc, &mut host) {
+        Ok((sec, usec)) => {
+            unsafe {
+                *sec_ptr = sec;
+                *usec_ptr = usec;
+            }
+            0
+        }
+        Err(e) => -(e as i32),
+    }
+}
+
+/// usleep() - sleep for usec microseconds.
+/// Returns 0 on success, negative errno on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_usleep(usec: u32) -> i32 {
+    let proc = unsafe { get_process() };
+    let mut host = WasmHostIO;
+    match syscalls::sys_usleep(proc, &mut host, usec) {
+        Ok(()) => 0,
+        Err(e) => -(e as i32),
+    }
+}
+
+/// openat() - open relative to directory fd.
+/// Returns fd on success, negative errno on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_openat(dirfd: i32, path_ptr: *const u8, path_len: u32, flags: u32, mode: u32) -> i32 {
+    let proc = unsafe { get_process() };
+    let mut host = WasmHostIO;
+    let path = unsafe { slice::from_raw_parts(path_ptr, path_len as usize) };
+    match syscalls::sys_openat(proc, &mut host, dirfd, path, flags, mode) {
+        Ok(fd) => fd,
+        Err(e) => -(e as i32),
+    }
+}
