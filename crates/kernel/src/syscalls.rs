@@ -7,7 +7,7 @@ use wasm_posix_shared::fcntl_cmd::*;
 use wasm_posix_shared::lock_type::*;
 use wasm_posix_shared::seek::*;
 use wasm_posix_shared::mode::S_IFIFO;
-use wasm_posix_shared::{WasmFlock, WasmStat, WasmTimespec};
+use wasm_posix_shared::{WasmFlock, WasmPollFd, WasmStat, WasmTimespec};
 
 use crate::fd::OpenFileDescRef;
 use crate::lock::FileLock;
@@ -1331,6 +1331,99 @@ pub fn sys_recvfrom(
     Err(Errno::ENOSYS)
 }
 
+/// Poll file descriptors for I/O readiness.
+pub fn sys_poll(
+    proc: &mut Process,
+    fds: &mut [WasmPollFd],
+    _timeout_ms: i32,
+) -> Result<i32, Errno> {
+    use wasm_posix_shared::poll::*;
+
+    let mut ready_count = 0i32;
+
+    for pollfd in fds.iter_mut() {
+        pollfd.revents = 0;
+
+        // Check if fd is valid
+        let entry = match proc.fd_table.get(pollfd.fd) {
+            Ok(e) => e,
+            Err(_) => {
+                pollfd.revents = POLLNVAL;
+                ready_count += 1;
+                continue;
+            }
+        };
+
+        let ofd = match proc.ofd_table.get(entry.ofd_ref.0) {
+            Some(o) => o,
+            None => {
+                pollfd.revents = POLLNVAL;
+                ready_count += 1;
+                continue;
+            }
+        };
+
+        let mut revents: i16 = 0;
+
+        match ofd.file_type {
+            FileType::Regular | FileType::CharDevice | FileType::Directory => {
+                // Regular files and char devices are always ready
+                if pollfd.events & POLLIN != 0 {
+                    revents |= POLLIN;
+                }
+                if pollfd.events & POLLOUT != 0 {
+                    revents |= POLLOUT;
+                }
+            }
+            FileType::Pipe => {
+                let pipe_idx = (-(ofd.host_handle + 1)) as usize;
+                if let Some(Some(pipe)) = proc.pipes.get(pipe_idx) {
+                    if pollfd.events & POLLIN != 0 && pipe.available() > 0 {
+                        revents |= POLLIN;
+                    }
+                    if pollfd.events & POLLOUT != 0 && pipe.free_space() > 0 {
+                        revents |= POLLOUT;
+                    }
+                    if !pipe.is_write_end_open() {
+                        revents |= POLLHUP;
+                    }
+                }
+            }
+            FileType::Socket => {
+                let sock_idx = (-(ofd.host_handle + 1)) as usize;
+                if let Some(sock) = proc.sockets.get(sock_idx) {
+                    // Check recv buffer for readability
+                    if let Some(recv_idx) = sock.recv_buf_idx {
+                        if let Some(Some(pipe)) = proc.pipes.get(recv_idx) {
+                            if pollfd.events & POLLIN != 0 && pipe.available() > 0 {
+                                revents |= POLLIN;
+                            }
+                            if !pipe.is_write_end_open() {
+                                revents |= POLLHUP;
+                            }
+                        }
+                    }
+                    // Check send buffer for writability
+                    if let Some(send_idx) = sock.send_buf_idx {
+                        if let Some(Some(pipe)) = proc.pipes.get(send_idx) {
+                            if pollfd.events & POLLOUT != 0 && pipe.free_space() > 0 {
+                                revents |= POLLOUT;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        pollfd.revents = revents;
+        if revents != 0 {
+            ready_count += 1;
+        }
+    }
+
+    Ok(ready_count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2442,5 +2535,128 @@ mod tests {
         let fd = sys_socket(&mut proc, &mut host, AF_INET, SOCK_STREAM, 0).unwrap();
         let result = sys_connect(&mut proc, &mut host, fd, &[0u8; 16]);
         assert_eq!(result, Err(Errno::ENOSYS));
+    }
+
+    #[test]
+    fn test_poll_regular_file_always_ready() {
+        let mut proc = Process::new(1);
+        use wasm_posix_shared::WasmPollFd;
+        use wasm_posix_shared::poll::*;
+        // stdout (fd 1) should be ready for writing
+        let mut pollfd = WasmPollFd { fd: 1, events: POLLOUT, revents: 0 };
+        let n = sys_poll(&mut proc, core::slice::from_mut(&mut pollfd), 0).unwrap();
+        assert_eq!(n, 1);
+        assert_ne!(pollfd.revents & POLLOUT, 0);
+    }
+
+    #[test]
+    fn test_poll_pipe_readable() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::WasmPollFd;
+        use wasm_posix_shared::poll::*;
+        let (read_fd, write_fd) = sys_pipe(&mut proc).unwrap();
+
+        // Pipe is empty — not readable yet
+        let mut pollfd = WasmPollFd { fd: read_fd, events: POLLIN, revents: 0 };
+        let n = sys_poll(&mut proc, core::slice::from_mut(&mut pollfd), 0).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(pollfd.revents, 0);
+
+        // Write data into pipe
+        sys_write(&mut proc, &mut host, write_fd, b"data").unwrap();
+
+        // Now pipe should be readable
+        let mut pollfd = WasmPollFd { fd: read_fd, events: POLLIN, revents: 0 };
+        let n = sys_poll(&mut proc, core::slice::from_mut(&mut pollfd), 0).unwrap();
+        assert_eq!(n, 1);
+        assert_ne!(pollfd.revents & POLLIN, 0);
+    }
+
+    #[test]
+    fn test_poll_pipe_writable() {
+        let mut proc = Process::new(1);
+        use wasm_posix_shared::WasmPollFd;
+        use wasm_posix_shared::poll::*;
+        let (_read_fd, write_fd) = sys_pipe(&mut proc).unwrap();
+
+        let mut pollfd = WasmPollFd { fd: write_fd, events: POLLOUT, revents: 0 };
+        let n = sys_poll(&mut proc, core::slice::from_mut(&mut pollfd), 0).unwrap();
+        assert_eq!(n, 1);
+        assert_ne!(pollfd.revents & POLLOUT, 0);
+    }
+
+    #[test]
+    fn test_poll_pipe_hangup() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::WasmPollFd;
+        use wasm_posix_shared::poll::*;
+        let (read_fd, write_fd) = sys_pipe(&mut proc).unwrap();
+
+        sys_close(&mut proc, &mut host, write_fd).unwrap();
+
+        let mut pollfd = WasmPollFd { fd: read_fd, events: POLLIN, revents: 0 };
+        let n = sys_poll(&mut proc, core::slice::from_mut(&mut pollfd), 0).unwrap();
+        assert_eq!(n, 1);
+        assert_ne!(pollfd.revents & POLLHUP, 0);
+    }
+
+    #[test]
+    fn test_poll_invalid_fd() {
+        let mut proc = Process::new(1);
+        use wasm_posix_shared::WasmPollFd;
+        use wasm_posix_shared::poll::*;
+        let mut pollfd = WasmPollFd { fd: 99, events: POLLIN, revents: 0 };
+        let n = sys_poll(&mut proc, core::slice::from_mut(&mut pollfd), 0).unwrap();
+        assert_eq!(n, 1);
+        assert_ne!(pollfd.revents & POLLNVAL, 0);
+    }
+
+    #[test]
+    fn test_poll_socket_pair() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::WasmPollFd;
+        use wasm_posix_shared::poll::*;
+        use wasm_posix_shared::socket::*;
+        let (fd0, fd1) = sys_socketpair(&mut proc, &mut host, AF_UNIX, SOCK_STREAM, 0).unwrap();
+
+        // Socket is writable (send buffer has space)
+        let mut pollfd = WasmPollFd { fd: fd0, events: POLLOUT, revents: 0 };
+        let n = sys_poll(&mut proc, core::slice::from_mut(&mut pollfd), 0).unwrap();
+        assert_eq!(n, 1);
+        assert_ne!(pollfd.revents & POLLOUT, 0);
+
+        // Socket is not readable (no data yet)
+        let mut pollfd = WasmPollFd { fd: fd0, events: POLLIN, revents: 0 };
+        let n = sys_poll(&mut proc, core::slice::from_mut(&mut pollfd), 0).unwrap();
+        assert_eq!(n, 0);
+
+        // Write to fd1, now fd0 is readable
+        sys_write(&mut proc, &mut host, fd1, b"x").unwrap();
+        let mut pollfd = WasmPollFd { fd: fd0, events: POLLIN, revents: 0 };
+        let n = sys_poll(&mut proc, core::slice::from_mut(&mut pollfd), 0).unwrap();
+        assert_eq!(n, 1);
+        assert_ne!(pollfd.revents & POLLIN, 0);
+    }
+
+    #[test]
+    fn test_poll_multiple_fds() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::WasmPollFd;
+        use wasm_posix_shared::poll::*;
+        use wasm_posix_shared::socket::*;
+        let (fd0, _fd1) = sys_socketpair(&mut proc, &mut host, AF_UNIX, SOCK_STREAM, 0).unwrap();
+
+        let mut pollfds = [
+            WasmPollFd { fd: 1, events: POLLOUT, revents: 0 },
+            WasmPollFd { fd: fd0, events: POLLIN, revents: 0 },
+        ];
+        let n = sys_poll(&mut proc, &mut pollfds, 0).unwrap();
+        assert_eq!(n, 1); // Only stdout ready
+        assert_ne!(pollfds[0].revents & POLLOUT, 0);
+        assert_eq!(pollfds[1].revents, 0);
     }
 }
