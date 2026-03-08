@@ -5,6 +5,7 @@ use wasm_posix_shared::{Errno, WasmStat};
 
 use crate::fd::FdTable;
 use crate::lock::LockTable;
+use crate::memory::MemoryManager;
 use crate::ofd::OfdTable;
 use crate::pipe::PipeBuffer;
 use crate::signal::SignalState;
@@ -65,6 +66,7 @@ pub struct Process {
     pub cwd: Vec<u8>,
     pub dir_streams: Vec<Option<DirStream>>,
     pub signals: SignalState,
+    pub memory: MemoryManager,
     pub environ: Vec<Vec<u8>>,
 }
 
@@ -102,6 +104,7 @@ impl Process {
             cwd: alloc::vec![b'/'],
             dir_streams: Vec::new(),
             signals: SignalState::new(),
+            memory: MemoryManager::new(),
             environ: Vec::new(),
         }
     }
