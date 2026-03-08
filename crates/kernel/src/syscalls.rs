@@ -1100,6 +1100,163 @@ pub fn sys_socketpair(
     Ok((fd0, fd1))
 }
 
+/// Shut down part of a full-duplex socket connection.
+pub fn sys_shutdown(proc: &mut Process, fd: i32, how: u32) -> Result<(), Errno> {
+    use wasm_posix_shared::socket::*;
+
+    let entry = proc.fd_table.get(fd)?;
+    let ofd = proc.ofd_table.get(entry.ofd_ref.0).ok_or(Errno::EBADF)?;
+
+    if ofd.file_type != FileType::Socket {
+        return Err(Errno::ENOTSOCK);
+    }
+
+    let sock_idx = (-(ofd.host_handle + 1)) as usize;
+    let sock = proc.sockets.get_mut(sock_idx).ok_or(Errno::EBADF)?;
+
+    match how {
+        SHUT_RD => {
+            sock.shut_rd = true;
+        }
+        SHUT_WR => {
+            sock.shut_wr = true;
+            if let Some(send_idx) = sock.send_buf_idx {
+                if let Some(Some(pipe)) = proc.pipes.get_mut(send_idx) {
+                    pipe.close_write_end();
+                }
+            }
+        }
+        SHUT_RDWR => {
+            sock.shut_rd = true;
+            sock.shut_wr = true;
+            if let Some(send_idx) = sock.send_buf_idx {
+                if let Some(Some(pipe)) = proc.pipes.get_mut(send_idx) {
+                    pipe.close_write_end();
+                }
+            }
+            if let Some(recv_idx) = sock.recv_buf_idx {
+                if let Some(Some(pipe)) = proc.pipes.get_mut(recv_idx) {
+                    pipe.close_read_end();
+                }
+            }
+        }
+        _ => return Err(Errno::EINVAL),
+    }
+    Ok(())
+}
+
+/// Send data on a connected socket.
+pub fn sys_send(
+    proc: &mut Process,
+    host: &mut dyn HostIO,
+    fd: i32,
+    buf: &[u8],
+    _flags: u32,
+) -> Result<usize, Errno> {
+    use crate::socket::SocketState;
+
+    let entry = proc.fd_table.get(fd)?;
+    let ofd = proc.ofd_table.get(entry.ofd_ref.0).ok_or(Errno::EBADF)?;
+    if ofd.file_type != FileType::Socket {
+        return Err(Errno::ENOTSOCK);
+    }
+    let sock_idx = (-(ofd.host_handle + 1)) as usize;
+    let sock = proc.sockets.get(sock_idx).ok_or(Errno::EBADF)?;
+    if sock.state != SocketState::Connected {
+        return Err(Errno::ENOTCONN);
+    }
+    sys_write(proc, host, fd, buf)
+}
+
+/// Receive data from a connected socket.
+pub fn sys_recv(
+    proc: &mut Process,
+    host: &mut dyn HostIO,
+    fd: i32,
+    buf: &mut [u8],
+    _flags: u32,
+) -> Result<usize, Errno> {
+    use crate::socket::SocketState;
+
+    let entry = proc.fd_table.get(fd)?;
+    let ofd = proc.ofd_table.get(entry.ofd_ref.0).ok_or(Errno::EBADF)?;
+    if ofd.file_type != FileType::Socket {
+        return Err(Errno::ENOTSOCK);
+    }
+    let sock_idx = (-(ofd.host_handle + 1)) as usize;
+    let sock = proc.sockets.get(sock_idx).ok_or(Errno::EBADF)?;
+    if sock.state != SocketState::Connected {
+        return Err(Errno::ENOTCONN);
+    }
+    sys_read(proc, host, fd, buf)
+}
+
+/// Get socket option value.
+pub fn sys_getsockopt(
+    proc: &mut Process,
+    fd: i32,
+    level: u32,
+    optname: u32,
+) -> Result<u32, Errno> {
+    use crate::socket::{SocketDomain, SocketState, SocketType};
+    use wasm_posix_shared::socket::*;
+
+    let entry = proc.fd_table.get(fd)?;
+    let ofd = proc.ofd_table.get(entry.ofd_ref.0).ok_or(Errno::EBADF)?;
+    if ofd.file_type != FileType::Socket {
+        return Err(Errno::ENOTSOCK);
+    }
+
+    let sock_idx = (-(ofd.host_handle + 1)) as usize;
+    let sock = proc.sockets.get(sock_idx).ok_or(Errno::EBADF)?;
+
+    if level != SOL_SOCKET {
+        return Err(Errno::ENOPROTOOPT);
+    }
+
+    match optname {
+        SO_TYPE => Ok(match sock.sock_type {
+            SocketType::Stream => SOCK_STREAM,
+            SocketType::Dgram => SOCK_DGRAM,
+        }),
+        SO_DOMAIN => Ok(match sock.domain {
+            SocketDomain::Unix => AF_UNIX,
+            SocketDomain::Inet => AF_INET,
+            SocketDomain::Inet6 => AF_INET6,
+        }),
+        SO_ERROR => Ok(0),
+        SO_ACCEPTCONN => Ok(if sock.state == SocketState::Listening { 1 } else { 0 }),
+        SO_RCVBUF | SO_SNDBUF => Ok(DEFAULT_PIPE_CAPACITY as u32),
+        _ => Err(Errno::ENOPROTOOPT),
+    }
+}
+
+/// Set socket option value.
+pub fn sys_setsockopt(
+    proc: &mut Process,
+    fd: i32,
+    level: u32,
+    optname: u32,
+    _value: u32,
+) -> Result<(), Errno> {
+    use wasm_posix_shared::socket::*;
+
+    let entry = proc.fd_table.get(fd)?;
+    let ofd = proc.ofd_table.get(entry.ofd_ref.0).ok_or(Errno::EBADF)?;
+    if ofd.file_type != FileType::Socket {
+        return Err(Errno::ENOTSOCK);
+    }
+
+    if level != SOL_SOCKET {
+        return Err(Errno::ENOPROTOOPT);
+    }
+
+    match optname {
+        SO_REUSEADDR | SO_KEEPALIVE | SO_RCVBUF | SO_SNDBUF => Ok(()),
+        _ => Err(Errno::ENOPROTOOPT),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2079,5 +2236,90 @@ mod tests {
         use wasm_posix_shared::socket::*;
         let result = sys_socketpair(&mut proc, &mut host, AF_INET, SOCK_STREAM, 0);
         assert_eq!(result, Err(Errno::EAFNOSUPPORT));
+    }
+
+    #[test]
+    fn test_shutdown_read() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::socket::*;
+        let (fd0, _fd1) = sys_socketpair(&mut proc, &mut host, AF_UNIX, SOCK_STREAM, 0).unwrap();
+        sys_shutdown(&mut proc, fd0, SHUT_RD).unwrap();
+        let mut buf = [0u8; 4];
+        let n = sys_read(&mut proc, &mut host, fd0, &mut buf).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_shutdown_write() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::socket::*;
+        let (fd0, _fd1) = sys_socketpair(&mut proc, &mut host, AF_UNIX, SOCK_STREAM, 0).unwrap();
+        sys_shutdown(&mut proc, fd0, SHUT_WR).unwrap();
+        let result = sys_write(&mut proc, &mut host, fd0, b"test");
+        assert_eq!(result, Err(Errno::EPIPE));
+    }
+
+    #[test]
+    fn test_send_recv() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::socket::*;
+        let (fd0, fd1) = sys_socketpair(&mut proc, &mut host, AF_UNIX, SOCK_STREAM, 0).unwrap();
+
+        let n = sys_send(&mut proc, &mut host, fd0, b"test", 0).unwrap();
+        assert_eq!(n, 4);
+
+        let mut buf = [0u8; 4];
+        let n = sys_recv(&mut proc, &mut host, fd1, &mut buf, 0).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(&buf, b"test");
+    }
+
+    #[test]
+    fn test_send_not_connected() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::socket::*;
+        let fd = sys_socket(&mut proc, &mut host, AF_UNIX, SOCK_STREAM, 0).unwrap();
+        let result = sys_send(&mut proc, &mut host, fd, b"test", 0);
+        assert_eq!(result, Err(Errno::ENOTCONN));
+    }
+
+    #[test]
+    fn test_getsockopt_so_type() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::socket::*;
+        let fd = sys_socket(&mut proc, &mut host, AF_UNIX, SOCK_STREAM, 0).unwrap();
+        let val = sys_getsockopt(&mut proc, fd, SOL_SOCKET, SO_TYPE).unwrap();
+        assert_eq!(val, SOCK_STREAM);
+    }
+
+    #[test]
+    fn test_getsockopt_so_domain() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::socket::*;
+        let fd = sys_socket(&mut proc, &mut host, AF_UNIX, SOCK_STREAM, 0).unwrap();
+        let val = sys_getsockopt(&mut proc, fd, SOL_SOCKET, SO_DOMAIN).unwrap();
+        assert_eq!(val, AF_UNIX);
+    }
+
+    #[test]
+    fn test_getsockopt_not_socket() {
+        let mut proc = Process::new(1);
+        use wasm_posix_shared::socket::*;
+        let result = sys_getsockopt(&mut proc, 0, SOL_SOCKET, SO_TYPE);
+        assert_eq!(result, Err(Errno::ENOTSOCK));
+    }
+
+    #[test]
+    fn test_shutdown_not_socket() {
+        let mut proc = Process::new(1);
+        use wasm_posix_shared::socket::*;
+        let result = sys_shutdown(&mut proc, 0, SHUT_RDWR);
+        assert_eq!(result, Err(Errno::ENOTSOCK));
     }
 }
