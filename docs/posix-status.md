@@ -38,9 +38,9 @@ This document tracks the implementation status of POSIX APIs in the wasm-posix-k
 | `F_SETFD` | Full | Sets FD_CLOEXEC flag. Per-fd, not per-OFD. |
 | `F_GETFL` | Full | Returns status flags + access mode. Use O_ACCMODE mask. |
 | `F_SETFL` | Full | Only O_APPEND, O_NONBLOCK modifiable. Access mode bits preserved. |
-| `F_GETLK` | Planned | Advisory record locking. Requires kernel lock table. |
-| `F_SETLK` | Planned | Non-blocking lock acquisition. |
-| `F_SETLKW` | Planned | Blocking lock acquisition. Requires cross-worker coordination. |
+| `F_GETLK` | Full | Advisory record locking. Returns blocking lock info or F_UNLCK if no conflict. |
+| `F_SETLK` | Full | Non-blocking lock acquisition. Returns EAGAIN on conflict. Read/write access mode validated. |
+| `F_SETLKW` | Partial | Blocking lock acquisition. In single-process mode, behaves like F_SETLK (no contention possible). Multi-process blocking deferred to Phase 3b. |
 | `F_GETOWN` | Planned | Requires signals subsystem. |
 | `F_SETOWN` | Planned | Requires signals subsystem. |
 
@@ -175,7 +175,7 @@ These features require SharedArrayBuffer (and cross-origin isolation headers in 
 3. **Phase 3a (Complete):** Process identity & lifecycle — getpid, getppid, getuid/geteuid, getgid/getegid, exit/_exit
 3b. **Phase 3b (Deferred):** Multi-process — fork, exec, waitpid (requires multi-worker architecture)
 4. **Phase 4 (Complete):** Signals — kill, raise, sigaction, sigprocmask. Signal delivery mechanism deferred (needs Asyncify).
-5. **Phase 5 (Next):** fcntl locking — F_GETLK, F_SETLK, F_SETLKW
+5. **Phase 5 (Complete):** fcntl locking — F_GETLK, F_SETLK, F_SETLKW with byte-range granularity
 6. **Phase 6:** Sockets — socket, bind, listen, accept, connect
 7. **Phase 7:** Time, TTY, environment
 8. **Phase 8:** Memory management — mmap (anonymous), brk
