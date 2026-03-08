@@ -864,6 +864,43 @@ pub extern "C" fn kernel_getegid() -> u32 {
     syscalls::sys_getegid(proc)
 }
 
+/// Get the process group ID.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_getpgrp() -> u32 {
+    let proc = unsafe { get_process() };
+    syscalls::sys_getpgrp(proc)
+}
+
+/// Set the process group ID. Returns 0 on success, or negative errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_setpgid(pid: u32, pgid: u32) -> i32 {
+    let proc = unsafe { get_process() };
+    match syscalls::sys_setpgid(proc, pid, pgid) {
+        Ok(()) => 0,
+        Err(e) => -(e as i32),
+    }
+}
+
+/// Get the session ID. Returns session ID on success, or negative errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_getsid(pid: u32) -> i32 {
+    let proc = unsafe { get_process() };
+    match syscalls::sys_getsid(proc, pid) {
+        Ok(sid) => sid as i32,
+        Err(e) => -(e as i32),
+    }
+}
+
+/// Create a new session. Returns session ID on success, or negative errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_setsid() -> i32 {
+    let proc = unsafe { get_process() };
+    match syscalls::sys_setsid(proc) {
+        Ok(sid) => sid as i32,
+        Err(e) => -(e as i32),
+    }
+}
+
 /// Send a signal to a process. Returns 0 on success, or negative errno.
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_kill(pid: i32, sig: u32) -> i32 {

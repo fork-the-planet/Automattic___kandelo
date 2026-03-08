@@ -904,6 +904,40 @@ pub fn sys_getegid(proc: &Process) -> u32 {
     proc.egid
 }
 
+/// getpgrp -- get process group ID.
+pub fn sys_getpgrp(proc: &Process) -> u32 {
+    proc.pgid
+}
+
+/// setpgid -- set process group ID.
+/// pid=0 means current process, pgid=0 means use pid as pgid.
+pub fn sys_setpgid(proc: &mut Process, pid: u32, pgid: u32) -> Result<(), Errno> {
+    // Only support setting own pgid (single-process)
+    if pid != 0 && pid != proc.pid {
+        return Err(Errno::ESRCH);
+    }
+    let new_pgid = if pgid == 0 { proc.pid } else { pgid };
+    proc.pgid = new_pgid;
+    Ok(())
+}
+
+/// getsid -- get session ID.
+pub fn sys_getsid(proc: &Process, pid: u32) -> Result<u32, Errno> {
+    if pid != 0 && pid != proc.pid {
+        return Err(Errno::ESRCH);
+    }
+    Ok(proc.sid)
+}
+
+/// setsid -- create session and set process group ID.
+pub fn sys_setsid(proc: &mut Process) -> Result<u32, Errno> {
+    // In a real OS, would fail if already session leader
+    // In our single-process environment, always succeeds
+    proc.sid = proc.pid;
+    proc.pgid = proc.pid;
+    Ok(proc.sid)
+}
+
 /// Send a signal to the current process (since we only have one process).
 /// Returns Ok(()) on success, Err(EINVAL) for invalid signal.
 pub fn sys_kill(proc: &mut Process, _pid: i32, sig: u32) -> Result<(), Errno> {
@@ -3938,5 +3972,60 @@ mod tests {
         let fd = sys_open(&mut proc, &mut host, b"/tmp/test", O_WRONLY | O_CREAT, 0o644).unwrap();
         let result = sys_fchown(&mut proc, &mut host, fd, 1000, 1000);
         assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Process group and session tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_getpgrp_default() {
+        let proc = Process::new(1);
+        assert_eq!(sys_getpgrp(&proc), 1); // pgid == pid
+    }
+
+    #[test]
+    fn test_setpgid_self() {
+        let mut proc = Process::new(1);
+        let result = sys_setpgid(&mut proc, 0, 42); // pid=0 means self
+        assert!(result.is_ok());
+        assert_eq!(proc.pgid, 42);
+    }
+
+    #[test]
+    fn test_setpgid_zero_pgid() {
+        let mut proc = Process::new(1);
+        let result = sys_setpgid(&mut proc, 0, 0); // pgid=0 means use pid
+        assert!(result.is_ok());
+        assert_eq!(proc.pgid, 1); // pgid set to pid
+    }
+
+    #[test]
+    fn test_setpgid_other_process_esrch() {
+        let mut proc = Process::new(1);
+        let result = sys_setpgid(&mut proc, 999, 42); // pid != self
+        assert_eq!(result, Err(Errno::ESRCH));
+    }
+
+    #[test]
+    fn test_getsid_self() {
+        let proc = Process::new(1);
+        assert_eq!(sys_getsid(&proc, 0), Ok(1)); // sid == pid
+    }
+
+    #[test]
+    fn test_getsid_other_esrch() {
+        let proc = Process::new(1);
+        assert_eq!(sys_getsid(&proc, 999), Err(Errno::ESRCH));
+    }
+
+    #[test]
+    fn test_setsid() {
+        let mut proc = Process::new(1);
+        proc.pgid = 42; // Change pgid first
+        let result = sys_setsid(&mut proc);
+        assert_eq!(result, Ok(1)); // Returns pid
+        assert_eq!(proc.sid, 1);
+        assert_eq!(proc.pgid, 1);
     }
 }
