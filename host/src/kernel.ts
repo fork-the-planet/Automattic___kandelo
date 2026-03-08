@@ -1116,4 +1116,75 @@ export class WasmPosixKernel {
     const result = fn(fd, level, optname, value);
     if (result < 0) throw new Error(`setsockopt failed: errno ${-result}`);
   }
+
+  // ---- Public API: Terminal operations ----
+
+  /**
+   * Get terminal attributes (48 bytes: c_iflag, c_oflag, c_cflag, c_lflag + c_cc).
+   */
+  tcgetattr(fd: number): Uint8Array {
+    const fn = this.instance!.exports.kernel_tcgetattr as (
+      fd: number,
+      bufPtr: number,
+      bufLen: number,
+    ) => number;
+    const tmpPtr = 16;
+    const result = fn(fd, tmpPtr, 48);
+    if (result < 0) throw new Error(`tcgetattr failed: errno ${-result}`);
+    const mem = this.getMemoryBuffer();
+    return mem.slice(tmpPtr, tmpPtr + 48);
+  }
+
+  /**
+   * Set terminal attributes.
+   * action: 0=TCSANOW, 1=TCSADRAIN, 2=TCSAFLUSH
+   */
+  tcsetattr(fd: number, action: number, attrs: Uint8Array): void {
+    const fn = this.instance!.exports.kernel_tcsetattr as (
+      fd: number,
+      action: number,
+      bufPtr: number,
+      bufLen: number,
+    ) => number;
+    const mem = this.getMemoryBuffer();
+    const tmpPtr = 16;
+    mem.set(attrs, tmpPtr);
+    const result = fn(fd, action, tmpPtr, attrs.length);
+    if (result < 0) throw new Error(`tcsetattr failed: errno ${-result}`);
+  }
+
+  /**
+   * Perform an ioctl operation.
+   * For TIOCGWINSZ (0x5413): returns 8-byte buffer (ws_row, ws_col, ws_xpixel, ws_ypixel as u16 LE)
+   * For TIOCSWINSZ (0x5414): pass 8-byte buffer to set window size
+   */
+  ioctl(fd: number, request: number, buf?: Uint8Array): Uint8Array {
+    const fn = this.instance!.exports.kernel_ioctl as (
+      fd: number,
+      request: number,
+      bufPtr: number,
+      bufLen: number,
+    ) => number;
+    const mem = this.getMemoryBuffer();
+    const tmpPtr = 16;
+    const bufLen = buf ? buf.length : 8;
+    if (buf) mem.set(buf, tmpPtr);
+    const result = fn(fd, request, tmpPtr, bufLen);
+    if (result < 0) throw new Error(`ioctl failed: errno ${-result}`);
+    return mem.slice(tmpPtr, tmpPtr + bufLen);
+  }
+
+  /**
+   * Set signal handler (legacy API). Returns previous handler value.
+   * handler: 0=SIG_DFL, 1=SIG_IGN, or function pointer index
+   */
+  signal(signum: number, handler: number): number {
+    const fn = this.instance!.exports.kernel_signal as (
+      signum: number,
+      handler: number,
+    ) => number;
+    const result = fn(signum, handler);
+    if (result < 0) throw new Error(`signal failed: errno ${-result}`);
+    return result;
+  }
 }

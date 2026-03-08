@@ -15,17 +15,17 @@ This document tracks the implementation status of POSIX APIs in the wasm-posix-k
 
 | Function | Status | Notes |
 |----------|--------|-------|
-| `open()` | Partial | Host-delegated. O_CREAT, O_EXCL, O_TRUNC, O_APPEND, O_NONBLOCK, O_CLOEXEC, O_DIRECTORY flags handled. O_NOFOLLOW not yet supported. |
+| `open()` | Partial | Host-delegated. O_CREAT, O_EXCL, O_TRUNC, O_APPEND, O_NONBLOCK, O_CLOEXEC, O_DIRECTORY, O_NOFOLLOW flags handled. |
 | `openat()` | Partial | AT_FDCWD delegates to open(). Absolute paths handled. Relative paths with non-AT_FDCWD dirfd return ENOSYS (requires directory path resolution). |
 | `close()` | Partial | Ref-counted OFD cleanup. Host handle closed when last ref dropped. EINTR not yet handled. |
-| `read()` | Partial | Host-delegated for files. Pipe reads from kernel ring buffer. Short reads permitted. O_NONBLOCK not yet enforced. |
+| `read()` | Partial | Host-delegated for files. Pipe/socket reads from kernel ring buffer. Short reads permitted. O_NONBLOCK returns EAGAIN when no data available. |
 | `pread()` | Partial | Host-delegated via seek-read-restore. Not atomic (single-threaded safe only). Rejects pipes/sockets with ESPIPE. |
 | `write()` | Partial | Host-delegated for files. Pipe writes to kernel ring buffer. EPIPE on closed read end. O_APPEND seek-to-end not yet atomic. |
 | `pwrite()` | Partial | Host-delegated via seek-write-restore. Not atomic (single-threaded safe only). Rejects pipes/sockets with ESPIPE. |
 | `lseek()` | Full | SEEK_SET, SEEK_CUR, SEEK_END all implemented. SEEK_END delegates to host for file size calculation. |
 | `dup()` | Full | Lowest available fd. FD_CLOEXEC cleared. Shares OFD with original. |
 | `dup2()` | Full | Atomic close-and-dup. Same-fd no-op. FD_CLOEXEC cleared. |
-| `pipe()` | Partial | Kernel-space ring buffer (64KB). PIPE_BUF=4096. Blocking read/write not yet implemented (needs cross-worker IPC). |
+| `pipe()` | Partial | Kernel-space ring buffer (64KB). PIPE_BUF=4096. O_NONBLOCK enforced (EAGAIN). Blocking read/write not yet implemented (needs cross-worker IPC). |
 | `fstat()` | Partial | Host-delegated for regular files. Pipe returns S_IFIFO | 0o600. Full struct stat populated. |
 
 ## fcntl()
@@ -41,8 +41,8 @@ This document tracks the implementation status of POSIX APIs in the wasm-posix-k
 | `F_GETLK` | Full | Advisory record locking. Returns blocking lock info or F_UNLCK if no conflict. |
 | `F_SETLK` | Full | Non-blocking lock acquisition. Returns EAGAIN on conflict. Read/write access mode validated. |
 | `F_SETLKW` | Partial | Blocking lock acquisition. In single-process mode, behaves like F_SETLK (no contention possible). Multi-process blocking deferred to Phase 3b. |
-| `F_GETOWN` | Planned | Requires signals subsystem. |
-| `F_SETOWN` | Planned | Requires signals subsystem. |
+| `F_GETOWN` | Full | Returns async I/O owner PID from OFD. Default 0. |
+| `F_SETOWN` | Full | Sets async I/O owner PID on OFD. SIGIO delivery deferred to signal delivery phase. |
 
 ## Process Management
 
@@ -62,7 +62,7 @@ This document tracks the implementation status of POSIX APIs in the wasm-posix-k
 | Function | Status | Notes |
 |----------|--------|-------|
 | `kill()` | Partial | Marks signal as pending. sig=0 validity check. Single-process only (no cross-process delivery yet). |
-| `signal()` | Planned | Legacy API. Use sigaction() instead. |
+| `signal()` | Full | Legacy API. Returns previous handler. Wraps sigaction() semantics. SIGKILL/SIGSTOP immutable. |
 | `sigaction()` | Partial | Sets handler disposition (SIG_DFL, SIG_IGN, or function pointer). SIGKILL/SIGSTOP immutable. Actual handler invocation deferred (requires Asyncify or syscall-entry checking). |
 | `sigprocmask()` | Full | Block/unblock/setmask operations on 64-bit signal mask. SIGKILL and SIGSTOP cannot be blocked per POSIX. |
 | `sigsuspend()` | Planned | Requires blocking + signal delivery mechanism. |
@@ -106,7 +106,7 @@ This document tracks the implementation status of POSIX APIs in the wasm-posix-k
 | `listen()` | Stub | Returns ENOSYS. Requires host network stack. |
 | `accept()` | Stub | Returns ENOSYS. Requires host network stack. |
 | `connect()` | Stub | Returns ENOSYS. Requires host network stack. |
-| `send()` / `recv()` | Partial | Works for connected Unix domain sockets (via socketpair). Delegates to read/write. MSG_PEEK not yet implemented. |
+| `send()` / `recv()` | Partial | Works for connected Unix domain sockets (via socketpair). MSG_PEEK supported for non-consuming reads. |
 | `sendto()` / `recvfrom()` | Stub | Returns ENOSYS. Requires host network stack for UDP. |
 | `setsockopt()` / `getsockopt()` | Partial | SOL_SOCKET level: SO_TYPE, SO_DOMAIN, SO_ERROR, SO_ACCEPTCONN, SO_RCVBUF, SO_SNDBUF readable. SO_REUSEADDR, SO_KEEPALIVE accepted (no-op). |
 | `shutdown()` | Full | SHUT_RD, SHUT_WR, SHUT_RDWR. Properly closes buffer endpoints. |
@@ -127,8 +127,8 @@ This document tracks the implementation status of POSIX APIs in the wasm-posix-k
 | Function | Status | Notes |
 |----------|--------|-------|
 | `isatty()` | Full | Returns 1 for CharDevice fds (stdin/stdout/stderr), ENOTTY for others. |
-| `tcgetattr()` / `tcsetattr()` | Planned | Virtual terminal state in kernel. |
-| `ioctl()` (TIOC*) | Planned | Terminal ioctls only. |
+| `tcgetattr()` / `tcsetattr()` | Partial | Kernel-simulated terminal state (c_iflag, c_oflag, c_cflag, c_lflag, c_cc). Does not affect actual host I/O. TCSANOW/TCSADRAIN/TCSAFLUSH all treated the same. |
+| `ioctl()` (TIOC*) | Partial | TIOCGWINSZ and TIOCSWINSZ supported. Default 24x80. Other ioctls return ENOTTY. |
 
 ## Environment
 
@@ -180,3 +180,4 @@ These features require SharedArrayBuffer (and cross-origin isolation headers in 
 6. **Phase 6 (Complete):** Sockets & I/O multiplexing — socket, socketpair, shutdown, send/recv, getsockopt/setsockopt, poll. TCP stubs (bind/listen/accept/connect return ENOSYS).
 7. **Phase 7 (Complete):** Time, TTY, environment — clock_gettime, nanosleep, isatty, getenv/setenv/unsetenv
 8. **Phase 8 (Complete):** Memory management — mmap (anonymous), munmap, brk, mprotect (stub)
+9. **Phase 9 (Complete):** Polish & gaps — tcgetattr/tcsetattr, ioctl (TIOCGWINSZ/TIOCSWINSZ), signal(), fcntl F_GETOWN/F_SETOWN, MSG_PEEK, O_NONBLOCK pipe enforcement, O_NOFOLLOW, time/gettimeofday/usleep/openat wrappers
