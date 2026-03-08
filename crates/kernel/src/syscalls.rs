@@ -405,6 +405,8 @@ pub fn sys_fcntl(
     }
 }
 
+use wasm_posix_shared::WasmDirent;
+use crate::process::DirStream;
 use crate::path::resolve_path;
 
 pub fn sys_stat(proc: &mut Process, host: &mut dyn HostIO, path: &[u8]) -> Result<WasmStat, Errno> {
@@ -495,6 +497,76 @@ pub fn sys_getcwd(proc: &Process, buf: &mut [u8]) -> Result<usize, Errno> {
     Ok(proc.cwd.len())
 }
 
+/// Open a directory for reading. Returns a directory stream handle.
+pub fn sys_opendir(proc: &mut Process, host: &mut dyn HostIO, path: &[u8]) -> Result<i32, Errno> {
+    let resolved = crate::path::resolve_path(path, &proc.cwd);
+    let host_handle = host.host_opendir(&resolved)?;
+    let stream = DirStream { host_handle };
+
+    // Find a free slot or append
+    for (i, slot) in proc.dir_streams.iter().enumerate() {
+        if slot.is_none() {
+            proc.dir_streams[i] = Some(stream);
+            return Ok(i as i32);
+        }
+    }
+    let idx = proc.dir_streams.len();
+    proc.dir_streams.push(Some(stream));
+    Ok(idx as i32)
+}
+
+/// Read the next directory entry. Returns:
+/// - 1 if an entry was written to dirent_buf and name_buf
+/// - 0 if end of directory
+/// - Err(errno) on error
+pub fn sys_readdir(
+    proc: &mut Process,
+    host: &mut dyn HostIO,
+    dir_handle: i32,
+    dirent_buf: &mut [u8],
+    name_buf: &mut [u8],
+) -> Result<i32, Errno> {
+    let idx = dir_handle as usize;
+    let stream = proc.dir_streams
+        .get(idx)
+        .and_then(|s| s.as_ref())
+        .ok_or(Errno::EBADF)?;
+    let host_handle = stream.host_handle;
+
+    match host.host_readdir(host_handle, name_buf)? {
+        Some((d_ino, d_type, name_len)) => {
+            // Write WasmDirent to dirent_buf if it fits
+            let dirent = WasmDirent {
+                d_ino,
+                d_type,
+                d_namlen: name_len as u32,
+            };
+            let dirent_size = core::mem::size_of::<WasmDirent>();
+            if dirent_buf.len() >= dirent_size {
+                let dirent_bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        &dirent as *const WasmDirent as *const u8,
+                        dirent_size,
+                    )
+                };
+                dirent_buf[..dirent_size].copy_from_slice(dirent_bytes);
+            }
+            Ok(1)
+        }
+        None => Ok(0),
+    }
+}
+
+/// Close a directory stream.
+pub fn sys_closedir(proc: &mut Process, host: &mut dyn HostIO, dir_handle: i32) -> Result<(), Errno> {
+    let idx = dir_handle as usize;
+    if idx >= proc.dir_streams.len() {
+        return Err(Errno::EBADF);
+    }
+    let stream = proc.dir_streams[idx].take().ok_or(Errno::EBADF)?;
+    host.host_closedir(stream.host_handle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,11 +575,12 @@ mod tests {
     /// Mock host I/O for testing.
     struct MockHostIO {
         next_handle: i64,
+        dir_entry_returned: bool,
     }
 
     impl MockHostIO {
         fn new() -> Self {
-            MockHostIO { next_handle: 100 }
+            MockHostIO { next_handle: 100, dir_entry_returned: false }
         }
     }
 
@@ -610,8 +683,16 @@ mod tests {
 
         fn host_opendir(&mut self, _path: &[u8]) -> Result<i64, Errno> { Ok(200) }
 
-        fn host_readdir(&mut self, _handle: i64, _name_buf: &mut [u8]) -> Result<Option<(u64, u32, usize)>, Errno> {
-            Ok(None) // empty directory
+        fn host_readdir(&mut self, _handle: i64, name_buf: &mut [u8]) -> Result<Option<(u64, u32, usize)>, Errno> {
+            if !self.dir_entry_returned {
+                self.dir_entry_returned = true;
+                let name = b"test.txt";
+                let n = name_buf.len().min(name.len());
+                name_buf[..n].copy_from_slice(&name[..n]);
+                Ok(Some((42, 8, n))) // d_ino=42, d_type=DT_REG=8, name_len
+            } else {
+                Ok(None) // end of directory
+            }
         }
 
         fn host_closedir(&mut self, _handle: i64) -> Result<(), Errno> { Ok(()) }
@@ -946,5 +1027,77 @@ mod tests {
         let mut buf = [0u8; 2]; // too small for "/tmp"
         let result = sys_getcwd(&proc, &mut buf);
         assert_eq!(result, Err(Errno::ERANGE));
+    }
+
+    #[test]
+    fn test_opendir_closedir_cycle() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let dh = sys_opendir(&mut proc, &mut host, b"/tmp").unwrap();
+        assert!(dh >= 0);
+        sys_closedir(&mut proc, &mut host, dh).unwrap();
+    }
+
+    #[test]
+    fn test_closedir_invalid_handle() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let result = sys_closedir(&mut proc, &mut host, 99);
+        assert_eq!(result, Err(Errno::EBADF));
+    }
+
+    #[test]
+    fn test_closedir_already_closed() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let dh = sys_opendir(&mut proc, &mut host, b"/tmp").unwrap();
+        sys_closedir(&mut proc, &mut host, dh).unwrap();
+        // Double close should fail
+        let result = sys_closedir(&mut proc, &mut host, dh);
+        assert_eq!(result, Err(Errno::EBADF));
+    }
+
+    #[test]
+    fn test_readdir_returns_entry_then_done() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let dh = sys_opendir(&mut proc, &mut host, b"/tmp").unwrap();
+
+        let mut dirent_buf = [0u8; 16]; // WasmDirent is 16 bytes
+        let mut name_buf = [0u8; 256];
+
+        // First call should return entry
+        let result = sys_readdir(&mut proc, &mut host, dh, &mut dirent_buf, &mut name_buf).unwrap();
+        assert_eq!(result, 1);
+        assert_eq!(&name_buf[..8], b"test.txt");
+
+        // Second call should return end-of-directory
+        let result = sys_readdir(&mut proc, &mut host, dh, &mut dirent_buf, &mut name_buf).unwrap();
+        assert_eq!(result, 0);
+
+        sys_closedir(&mut proc, &mut host, dh).unwrap();
+    }
+
+    #[test]
+    fn test_readdir_invalid_handle() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let mut dirent_buf = [0u8; 16];
+        let mut name_buf = [0u8; 256];
+        let result = sys_readdir(&mut proc, &mut host, 99, &mut dirent_buf, &mut name_buf);
+        assert_eq!(result, Err(Errno::EBADF));
+    }
+
+    #[test]
+    fn test_dir_stream_slot_reuse() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let dh0 = sys_opendir(&mut proc, &mut host, b"/tmp").unwrap();
+        assert_eq!(dh0, 0);
+        sys_closedir(&mut proc, &mut host, dh0).unwrap();
+        // Reopen should reuse slot 0
+        let dh1 = sys_opendir(&mut proc, &mut host, b"/tmp").unwrap();
+        assert_eq!(dh1, 0);
+        sys_closedir(&mut proc, &mut host, dh1).unwrap();
     }
 }
