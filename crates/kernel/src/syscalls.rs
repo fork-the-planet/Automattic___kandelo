@@ -112,25 +112,43 @@ pub fn sys_read(
     }
 
     let host_handle = ofd.host_handle;
+    let file_type = ofd.file_type;
 
-    if host_handle < 0 {
-        // Pipe read
-        let pipe_idx = (-(host_handle + 1)) as usize;
-        let pipe = proc
-            .pipes
-            .get_mut(pipe_idx)
-            .and_then(|p| p.as_mut())
-            .ok_or(Errno::EBADF)?;
-        let n = pipe.read(buf);
-        Ok(n)
-    } else {
-        // Host file read
-        let n = host.host_read(host_handle, buf)?;
-        // Update offset
-        if let Some(ofd) = proc.ofd_table.get_mut(ofd_idx) {
-            ofd.offset += n as i64;
+    match file_type {
+        FileType::Pipe => {
+            let pipe_idx = (-(host_handle + 1)) as usize;
+            let pipe = proc
+                .pipes
+                .get_mut(pipe_idx)
+                .and_then(|p| p.as_mut())
+                .ok_or(Errno::EBADF)?;
+            Ok(pipe.read(buf))
         }
-        Ok(n)
+        FileType::Socket => {
+            let sock_idx = (-(host_handle + 1)) as usize;
+            let sock = proc.sockets.get(sock_idx).ok_or(Errno::EBADF)?;
+            if sock.shut_rd {
+                return Ok(0);
+            }
+            let recv_buf_idx = sock.recv_buf_idx.ok_or(Errno::ENOTCONN)?;
+            let pipe = proc
+                .pipes
+                .get_mut(recv_buf_idx)
+                .and_then(|p| p.as_mut())
+                .ok_or(Errno::EBADF)?;
+            let n = pipe.read(buf);
+            if n == 0 && !pipe.is_write_end_open() {
+                return Ok(0);
+            }
+            Ok(n)
+        }
+        _ => {
+            let n = host.host_read(host_handle, buf)?;
+            if let Some(ofd) = proc.ofd_table.get_mut(ofd_idx) {
+                ofd.offset += n as i64;
+            }
+            Ok(n)
+        }
     }
 }
 
@@ -153,31 +171,45 @@ pub fn sys_write(
     }
 
     let host_handle = ofd.host_handle;
+    let file_type = ofd.file_type;
 
-    if host_handle < 0 {
-        // Pipe write
-        let pipe_idx = (-(host_handle + 1)) as usize;
-        let pipe = proc
-            .pipes
-            .get_mut(pipe_idx)
-            .and_then(|p| p.as_mut())
-            .ok_or(Errno::EBADF)?;
-
-        // If read end is closed, return EPIPE.
-        if !pipe.is_read_end_open() {
-            return Err(Errno::EPIPE);
+    match file_type {
+        FileType::Pipe => {
+            let pipe_idx = (-(host_handle + 1)) as usize;
+            let pipe = proc
+                .pipes
+                .get_mut(pipe_idx)
+                .and_then(|p| p.as_mut())
+                .ok_or(Errno::EBADF)?;
+            if !pipe.is_read_end_open() {
+                return Err(Errno::EPIPE);
+            }
+            Ok(pipe.write(buf))
         }
-
-        let n = pipe.write(buf);
-        Ok(n)
-    } else {
-        // Host file write
-        let n = host.host_write(host_handle, buf)?;
-        // Update offset
-        if let Some(ofd) = proc.ofd_table.get_mut(ofd_idx) {
-            ofd.offset += n as i64;
+        FileType::Socket => {
+            let sock_idx = (-(host_handle + 1)) as usize;
+            let sock = proc.sockets.get(sock_idx).ok_or(Errno::EBADF)?;
+            if sock.shut_wr {
+                return Err(Errno::EPIPE);
+            }
+            let send_buf_idx = sock.send_buf_idx.ok_or(Errno::ENOTCONN)?;
+            let pipe = proc
+                .pipes
+                .get_mut(send_buf_idx)
+                .and_then(|p| p.as_mut())
+                .ok_or(Errno::EBADF)?;
+            if !pipe.is_read_end_open() {
+                return Err(Errno::EPIPE);
+            }
+            Ok(pipe.write(buf))
         }
-        Ok(n)
+        _ => {
+            let n = host.host_write(host_handle, buf)?;
+            if let Some(ofd) = proc.ofd_table.get_mut(ofd_idx) {
+                ofd.offset += n as i64;
+            }
+            Ok(n)
+        }
     }
 }
 
@@ -194,7 +226,7 @@ pub fn sys_lseek(
     let ofd = proc.ofd_table.get_mut(ofd_idx).ok_or(Errno::EBADF)?;
 
     // Pipes are not seekable.
-    if ofd.file_type == FileType::Pipe {
+    if ofd.file_type == FileType::Pipe || ofd.file_type == FileType::Socket {
         return Err(Errno::ESPIPE);
     }
 

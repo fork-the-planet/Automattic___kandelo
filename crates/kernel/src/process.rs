@@ -9,6 +9,7 @@ use crate::memory::MemoryManager;
 use crate::ofd::OfdTable;
 use crate::pipe::PipeBuffer;
 use crate::signal::SignalState;
+use crate::socket::SocketTable;
 
 /// A handle to an open directory stream for readdir iteration.
 pub struct DirStream {
@@ -63,6 +64,7 @@ pub struct Process {
     pub ofd_table: OfdTable,
     pub lock_table: LockTable,
     pub pipes: Vec<Option<PipeBuffer>>,
+    pub sockets: SocketTable,
     pub cwd: Vec<u8>,
     pub dir_streams: Vec<Option<DirStream>>,
     pub signals: SignalState,
@@ -101,6 +103,7 @@ impl Process {
             ofd_table,
             lock_table: LockTable::new(),
             pipes: Vec::new(),
+            sockets: SocketTable::new(),
             cwd: alloc::vec![b'/'],
             dir_streams: Vec::new(),
             signals: SignalState::new(),
