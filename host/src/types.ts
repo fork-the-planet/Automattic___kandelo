@@ -34,4 +34,25 @@ export interface PlatformIO {
   ): Promise<number>;
   seek(handle: number, offset: number, whence: number): Promise<number>;
   fstat(handle: number): Promise<StatResult>;
+
+  // Path-based operations
+  stat(path: string): Promise<StatResult>;
+  lstat(path: string): Promise<StatResult>;
+  mkdir(path: string, mode: number): Promise<void>;
+  rmdir(path: string): Promise<void>;
+  unlink(path: string): Promise<void>;
+  rename(oldPath: string, newPath: string): Promise<void>;
+  link(existingPath: string, newPath: string): Promise<void>;
+  symlink(target: string, path: string): Promise<void>;
+  readlink(path: string): Promise<string>;
+  chmod(path: string, mode: number): Promise<void>;
+  chown(path: string, uid: number, gid: number): Promise<void>;
+  access(path: string, mode: number): Promise<void>;
+
+  // Directory iteration
+  opendir(path: string): Promise<number>;
+  readdir(
+    handle: number,
+  ): Promise<{ name: string; type: number; ino: number } | null>;
+  closedir(handle: number): Promise<void>;
 }

@@ -18,6 +18,9 @@ import type { KernelConfig, PlatformIO, StatResult } from "./types";
 /** Size of the WasmStat struct in bytes (repr(C) layout). */
 const WASM_STAT_SIZE = 88;
 
+/** Size of the WasmDirent struct: d_ino(u64) + d_type(u32) + d_namlen(u32). */
+const WASM_DIRENT_SIZE = 16;
+
 export class WasmPosixKernel {
   private config: KernelConfig;
   private io: PlatformIO;
@@ -83,6 +86,101 @@ export class WasmPosixKernel {
         },
         host_fstat: (handle: bigint, statPtr: number): number => {
           return this.hostFstat(handle, statPtr);
+        },
+        host_stat: (
+          pathPtr: number,
+          pathLen: number,
+          statPtr: number,
+        ): number => {
+          return this.hostStat(pathPtr, pathLen, statPtr);
+        },
+        host_lstat: (
+          pathPtr: number,
+          pathLen: number,
+          statPtr: number,
+        ): number => {
+          return this.hostLstat(pathPtr, pathLen, statPtr);
+        },
+        host_mkdir: (
+          pathPtr: number,
+          pathLen: number,
+          mode: number,
+        ): number => {
+          return this.hostMkdir(pathPtr, pathLen, mode);
+        },
+        host_rmdir: (pathPtr: number, pathLen: number): number => {
+          return this.hostRmdir(pathPtr, pathLen);
+        },
+        host_unlink: (pathPtr: number, pathLen: number): number => {
+          return this.hostUnlink(pathPtr, pathLen);
+        },
+        host_rename: (
+          oldPtr: number,
+          oldLen: number,
+          newPtr: number,
+          newLen: number,
+        ): number => {
+          return this.hostRename(oldPtr, oldLen, newPtr, newLen);
+        },
+        host_link: (
+          oldPtr: number,
+          oldLen: number,
+          newPtr: number,
+          newLen: number,
+        ): number => {
+          return this.hostLink(oldPtr, oldLen, newPtr, newLen);
+        },
+        host_symlink: (
+          targetPtr: number,
+          targetLen: number,
+          linkPtr: number,
+          linkLen: number,
+        ): number => {
+          return this.hostSymlink(targetPtr, targetLen, linkPtr, linkLen);
+        },
+        host_readlink: (
+          pathPtr: number,
+          pathLen: number,
+          bufPtr: number,
+          bufLen: number,
+        ): number => {
+          return this.hostReadlink(pathPtr, pathLen, bufPtr, bufLen);
+        },
+        host_chmod: (
+          pathPtr: number,
+          pathLen: number,
+          mode: number,
+        ): number => {
+          return this.hostChmod(pathPtr, pathLen, mode);
+        },
+        host_chown: (
+          pathPtr: number,
+          pathLen: number,
+          uid: number,
+          gid: number,
+        ): number => {
+          return this.hostChown(pathPtr, pathLen, uid, gid);
+        },
+        host_access: (
+          pathPtr: number,
+          pathLen: number,
+          amode: number,
+        ): number => {
+          return this.hostAccess(pathPtr, pathLen, amode);
+        },
+        host_opendir: (pathPtr: number, pathLen: number): bigint => {
+          return this.hostOpendir(pathPtr, pathLen);
+        },
+        host_readdir: (
+          dirHandle: bigint,
+          direntPtr: number,
+          namePtr: number,
+          nameLen: number,
+        ): number => {
+          return this.hostReaddir(dirHandle, direntPtr, namePtr, nameLen);
+        },
+        host_closedir: (dirHandle: bigint): number => {
+          return this.hostClosedir(dirHandle);
         },
       },
     };
@@ -378,5 +476,425 @@ export class WasmPosixKernel {
     dv.setBigUint64(ptr + 72, BigInt(ctimeSec), true); // st_ctime_sec
     dv.setUint32(ptr + 80, ctimeNsec, true); // st_ctime_nsec
     // _pad at offset 84 already zeroed
+  }
+
+  // ---- Phase 2: Path-based and directory host imports ----
+
+  /**
+   * Read a UTF-8 path string from Wasm memory.
+   */
+  private readPathFromMemory(ptr: number, len: number): string {
+    const mem = this.getMemoryBuffer();
+    const pathBytes = mem.slice(ptr, ptr + len);
+    return new TextDecoder().decode(pathBytes);
+  }
+
+  /**
+   * host_stat(path_ptr, path_len, stat_ptr) -> i32
+   */
+  private hostStat(
+    pathPtr: number,
+    pathLen: number,
+    statPtr: number,
+  ): number {
+    try {
+      const path = this.readPathFromMemory(pathPtr, pathLen);
+      let stat: StatResult | null = null;
+      let failed = false;
+      this.io
+        .stat(path)
+        .then((s) => {
+          stat = s;
+        })
+        .catch(() => {
+          failed = true;
+        });
+      if (failed || !stat) return -1;
+      this.writeStatToMemory(statPtr, stat);
+      return 0;
+    } catch {
+      return -1;
+    }
+  }
+
+  /**
+   * host_lstat(path_ptr, path_len, stat_ptr) -> i32
+   */
+  private hostLstat(
+    pathPtr: number,
+    pathLen: number,
+    statPtr: number,
+  ): number {
+    try {
+      const path = this.readPathFromMemory(pathPtr, pathLen);
+      let stat: StatResult | null = null;
+      let failed = false;
+      this.io
+        .lstat(path)
+        .then((s) => {
+          stat = s;
+        })
+        .catch(() => {
+          failed = true;
+        });
+      if (failed || !stat) return -1;
+      this.writeStatToMemory(statPtr, stat);
+      return 0;
+    } catch {
+      return -1;
+    }
+  }
+
+  /**
+   * host_mkdir(path_ptr, path_len, mode) -> i32
+   */
+  private hostMkdir(
+    pathPtr: number,
+    pathLen: number,
+    mode: number,
+  ): number {
+    try {
+      const path = this.readPathFromMemory(pathPtr, pathLen);
+      let result = 0;
+      this.io
+        .mkdir(path, mode)
+        .then(() => {
+          result = 0;
+        })
+        .catch(() => {
+          result = -1;
+        });
+      return result;
+    } catch {
+      return -1;
+    }
+  }
+
+  /**
+   * host_rmdir(path_ptr, path_len) -> i32
+   */
+  private hostRmdir(pathPtr: number, pathLen: number): number {
+    try {
+      const path = this.readPathFromMemory(pathPtr, pathLen);
+      let result = 0;
+      this.io
+        .rmdir(path)
+        .then(() => {
+          result = 0;
+        })
+        .catch(() => {
+          result = -1;
+        });
+      return result;
+    } catch {
+      return -1;
+    }
+  }
+
+  /**
+   * host_unlink(path_ptr, path_len) -> i32
+   */
+  private hostUnlink(pathPtr: number, pathLen: number): number {
+    try {
+      const path = this.readPathFromMemory(pathPtr, pathLen);
+      let result = 0;
+      this.io
+        .unlink(path)
+        .then(() => {
+          result = 0;
+        })
+        .catch(() => {
+          result = -1;
+        });
+      return result;
+    } catch {
+      return -1;
+    }
+  }
+
+  /**
+   * host_rename(old_ptr, old_len, new_ptr, new_len) -> i32
+   */
+  private hostRename(
+    oldPtr: number,
+    oldLen: number,
+    newPtr: number,
+    newLen: number,
+  ): number {
+    try {
+      const oldPath = this.readPathFromMemory(oldPtr, oldLen);
+      const newPath = this.readPathFromMemory(newPtr, newLen);
+      let result = 0;
+      this.io
+        .rename(oldPath, newPath)
+        .then(() => {
+          result = 0;
+        })
+        .catch(() => {
+          result = -1;
+        });
+      return result;
+    } catch {
+      return -1;
+    }
+  }
+
+  /**
+   * host_link(old_ptr, old_len, new_ptr, new_len) -> i32
+   */
+  private hostLink(
+    oldPtr: number,
+    oldLen: number,
+    newPtr: number,
+    newLen: number,
+  ): number {
+    try {
+      const existingPath = this.readPathFromMemory(oldPtr, oldLen);
+      const newPath = this.readPathFromMemory(newPtr, newLen);
+      let result = 0;
+      this.io
+        .link(existingPath, newPath)
+        .then(() => {
+          result = 0;
+        })
+        .catch(() => {
+          result = -1;
+        });
+      return result;
+    } catch {
+      return -1;
+    }
+  }
+
+  /**
+   * host_symlink(target_ptr, target_len, link_ptr, link_len) -> i32
+   */
+  private hostSymlink(
+    targetPtr: number,
+    targetLen: number,
+    linkPtr: number,
+    linkLen: number,
+  ): number {
+    try {
+      const target = this.readPathFromMemory(targetPtr, targetLen);
+      const linkPath = this.readPathFromMemory(linkPtr, linkLen);
+      let result = 0;
+      this.io
+        .symlink(target, linkPath)
+        .then(() => {
+          result = 0;
+        })
+        .catch(() => {
+          result = -1;
+        });
+      return result;
+    } catch {
+      return -1;
+    }
+  }
+
+  /**
+   * host_readlink(path_ptr, path_len, buf_ptr, buf_len) -> i32
+   *
+   * Returns the number of bytes written to the buffer, or -1 on error.
+   */
+  private hostReadlink(
+    pathPtr: number,
+    pathLen: number,
+    bufPtr: number,
+    bufLen: number,
+  ): number {
+    try {
+      const path = this.readPathFromMemory(pathPtr, pathLen);
+      let target: string | null = null;
+      let failed = false;
+      this.io
+        .readlink(path)
+        .then((t) => {
+          target = t;
+        })
+        .catch(() => {
+          failed = true;
+        });
+      if (failed || target === null) return -1;
+      const encoded = new TextEncoder().encode(target);
+      const n = Math.min(encoded.length, bufLen);
+      const mem = this.getMemoryBuffer();
+      mem.set(encoded.subarray(0, n), bufPtr);
+      return n;
+    } catch {
+      return -1;
+    }
+  }
+
+  /**
+   * host_chmod(path_ptr, path_len, mode) -> i32
+   */
+  private hostChmod(
+    pathPtr: number,
+    pathLen: number,
+    mode: number,
+  ): number {
+    try {
+      const path = this.readPathFromMemory(pathPtr, pathLen);
+      let result = 0;
+      this.io
+        .chmod(path, mode)
+        .then(() => {
+          result = 0;
+        })
+        .catch(() => {
+          result = -1;
+        });
+      return result;
+    } catch {
+      return -1;
+    }
+  }
+
+  /**
+   * host_chown(path_ptr, path_len, uid, gid) -> i32
+   */
+  private hostChown(
+    pathPtr: number,
+    pathLen: number,
+    uid: number,
+    gid: number,
+  ): number {
+    try {
+      const path = this.readPathFromMemory(pathPtr, pathLen);
+      let result = 0;
+      this.io
+        .chown(path, uid, gid)
+        .then(() => {
+          result = 0;
+        })
+        .catch(() => {
+          result = -1;
+        });
+      return result;
+    } catch {
+      return -1;
+    }
+  }
+
+  /**
+   * host_access(path_ptr, path_len, amode) -> i32
+   */
+  private hostAccess(
+    pathPtr: number,
+    pathLen: number,
+    amode: number,
+  ): number {
+    try {
+      const path = this.readPathFromMemory(pathPtr, pathLen);
+      let result = 0;
+      this.io
+        .access(path, amode)
+        .then(() => {
+          result = 0;
+        })
+        .catch(() => {
+          result = -1;
+        });
+      return result;
+    } catch {
+      return -1;
+    }
+  }
+
+  /**
+   * host_opendir(path_ptr, path_len) -> i64
+   *
+   * Returns a directory handle as i64, or -1 on error.
+   */
+  private hostOpendir(pathPtr: number, pathLen: number): bigint {
+    try {
+      const path = this.readPathFromMemory(pathPtr, pathLen);
+      let handle = -1;
+      this.io
+        .opendir(path)
+        .then((h) => {
+          handle = h;
+        })
+        .catch(() => {
+          handle = -1;
+        });
+      return BigInt(handle);
+    } catch {
+      return BigInt(-1);
+    }
+  }
+
+  /**
+   * host_readdir(dir_handle: i64, dirent_ptr, name_ptr, name_len) -> i32
+   *
+   * Writes a WasmDirent struct and the entry name to Wasm memory.
+   * Returns 1 if an entry was written, 0 at end-of-directory, -1 on error.
+   */
+  private hostReaddir(
+    dirHandle: bigint,
+    direntPtr: number,
+    namePtr: number,
+    nameLen: number,
+  ): number {
+    try {
+      const h = Number(dirHandle);
+      type DirEntry = { name: string; type: number; ino: number };
+      let entry: DirEntry | null | undefined = undefined;
+      let failed = false;
+      this.io
+        .readdir(h)
+        .then((e) => {
+          entry = e;
+        })
+        .catch(() => {
+          failed = true;
+        });
+      if (failed) return -1;
+      // The .then() callback runs synchronously for NodePlatformIO,
+      // so entry is populated by this point.
+      const dirEntry = entry as DirEntry | null | undefined;
+      if (dirEntry === null || dirEntry === undefined) return 0; // end of directory
+
+      const dv = this.getMemoryDataView();
+      const mem = this.getMemoryBuffer();
+
+      // Write WasmDirent: d_ino(u64) + d_type(u32) + d_namlen(u32)
+      const encoded = new TextEncoder().encode(dirEntry.name);
+      const n = Math.min(encoded.length, nameLen);
+
+      dv.setBigUint64(direntPtr, BigInt(dirEntry.ino), true);
+      dv.setUint32(direntPtr + 8, dirEntry.type, true);
+      dv.setUint32(direntPtr + 12, n, true);
+
+      // Write name
+      mem.set(encoded.subarray(0, n), namePtr);
+
+      return 1;
+    } catch {
+      return -1;
+    }
+  }
+
+  /**
+   * host_closedir(dir_handle: i64) -> i32
+   */
+  private hostClosedir(dirHandle: bigint): number {
+    try {
+      const h = Number(dirHandle);
+      let result = 0;
+      this.io
+        .closedir(h)
+        .then(() => {
+          result = 0;
+        })
+        .catch(() => {
+          result = -1;
+        });
+      return result;
+    } catch {
+      return -1;
+    }
   }
 }
