@@ -9,6 +9,7 @@ pub mod ofd;
 pub mod path;
 pub mod pipe;
 pub mod process;
+pub mod signal;
 pub mod syscalls;
 
 #[cfg(target_arch = "wasm32")]
