@@ -12,6 +12,8 @@ use crate::fd::OpenFileDescRef;
 use crate::ofd::FileType;
 use crate::pipe::{PipeBuffer, DEFAULT_PIPE_CAPACITY};
 use crate::process::{HostIO, Process};
+use crate::signal::SignalHandler;
+use wasm_posix_shared::signal::{SIG_DFL, SIG_IGN, SIG_BLOCK, SIG_UNBLOCK, SIG_SETMASK, SIGKILL, SIGSTOP, NSIG};
 
 /// Creation flags that are stripped from status_flags after open.
 const CREATION_FLAGS: u32 = O_CREAT | O_EXCL | O_TRUNC | O_CLOEXEC | O_DIRECTORY;
@@ -595,6 +597,79 @@ pub fn sys_getgid(proc: &Process) -> u32 {
 /// Get the effective group ID.
 pub fn sys_getegid(proc: &Process) -> u32 {
     proc.egid
+}
+
+/// Send a signal to the current process (since we only have one process).
+/// Returns Ok(()) on success, Err(EINVAL) for invalid signal.
+pub fn sys_kill(proc: &mut Process, _pid: i32, sig: u32) -> Result<(), Errno> {
+    if sig == 0 {
+        // sig=0 is a validity check -- just return success
+        return Ok(());
+    }
+    if sig >= NSIG {
+        return Err(Errno::EINVAL);
+    }
+    proc.signals.raise(sig);
+    Ok(())
+}
+
+/// Send a signal to the current process.
+pub fn sys_raise(proc: &mut Process, sig: u32) -> Result<(), Errno> {
+    sys_kill(proc, proc.pid as i32, sig)
+}
+
+/// Set signal handler. Returns the previous handler disposition as a u32.
+/// handler_val: 0=SIG_DFL, 1=SIG_IGN, anything else=function pointer (future use)
+pub fn sys_sigaction(proc: &mut Process, sig: u32, handler_val: u32) -> Result<u32, Errno> {
+    if sig == 0 || sig >= NSIG {
+        return Err(Errno::EINVAL);
+    }
+    if sig == SIGKILL || sig == SIGSTOP {
+        return Err(Errno::EINVAL);
+    }
+
+    let new_handler = match handler_val {
+        SIG_DFL => SignalHandler::Default,
+        SIG_IGN => SignalHandler::Ignore,
+        ptr => SignalHandler::Handler(ptr),
+    };
+
+    let old = proc.signals.set_handler(sig, new_handler)
+        .map_err(|_| Errno::EINVAL)?;
+
+    let old_val = match old {
+        SignalHandler::Default => SIG_DFL,
+        SignalHandler::Ignore => SIG_IGN,
+        SignalHandler::Handler(ptr) => ptr,
+    };
+
+    Ok(old_val)
+}
+
+/// Manipulate the signal mask.
+/// how: SIG_BLOCK, SIG_UNBLOCK, or SIG_SETMASK
+/// set: bitmask of signals to modify
+/// Returns the old signal mask.
+pub fn sys_sigprocmask(proc: &mut Process, how: u32, set: u64) -> Result<u64, Errno> {
+    let old_mask = proc.signals.blocked;
+
+    match how {
+        SIG_BLOCK => {
+            proc.signals.blocked |= set;
+        }
+        SIG_UNBLOCK => {
+            proc.signals.blocked &= !set;
+        }
+        SIG_SETMASK => {
+            proc.signals.blocked = set;
+        }
+        _ => return Err(Errno::EINVAL),
+    }
+
+    // SIGKILL and SIGSTOP cannot be blocked (POSIX)
+    proc.signals.blocked &= !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
+
+    Ok(old_mask)
 }
 
 /// Exit the process. Closes all fds and dir streams, sets state to Exited.
@@ -1216,5 +1291,66 @@ mod tests {
         sys_exit(&mut proc, &mut host, 0);
         assert_eq!(proc.state, ProcessState::Exited);
         assert_eq!(proc.exit_status, 0);
+    }
+
+    #[test]
+    fn test_kill_marks_signal_pending() {
+        let mut proc = Process::new(1);
+        let mut _host = MockHostIO::new();
+        sys_kill(&mut proc, 1, 2).unwrap(); // SIGINT=2
+        assert!(proc.signals.is_pending(2));
+    }
+
+    #[test]
+    fn test_kill_sig_zero_is_noop() {
+        let mut proc = Process::new(1);
+        sys_kill(&mut proc, 1, 0).unwrap();
+        assert_eq!(proc.signals.pending, 0);
+    }
+
+    #[test]
+    fn test_kill_invalid_signal() {
+        let mut proc = Process::new(1);
+        let result = sys_kill(&mut proc, 1, 100);
+        assert_eq!(result, Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn test_sigaction_set_ignore() {
+        let mut proc = Process::new(1);
+        let old = sys_sigaction(&mut proc, 2, 1).unwrap(); // SIGINT, SIG_IGN
+        assert_eq!(old, 0); // was SIG_DFL
+        let old = sys_sigaction(&mut proc, 2, 0).unwrap(); // back to SIG_DFL
+        assert_eq!(old, 1); // was SIG_IGN
+    }
+
+    #[test]
+    fn test_sigaction_cannot_change_sigkill() {
+        let mut proc = Process::new(1);
+        let result = sys_sigaction(&mut proc, 9, 1); // SIGKILL, SIG_IGN
+        assert_eq!(result, Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn test_sigprocmask_block() {
+        let mut proc = Process::new(1);
+        let old = sys_sigprocmask(&mut proc, 0, 1u64 << 2).unwrap(); // SIG_BLOCK SIGINT
+        assert_eq!(old, 0);
+        assert!(proc.signals.is_blocked(2));
+    }
+
+    #[test]
+    fn test_sigprocmask_cannot_block_sigkill() {
+        let mut proc = Process::new(1);
+        sys_sigprocmask(&mut proc, 2, (1u64 << 9) | (1u64 << 2)).unwrap(); // SIG_SETMASK SIGKILL+SIGINT
+        assert!(!proc.signals.is_blocked(9)); // SIGKILL cannot be blocked
+        assert!(proc.signals.is_blocked(2)); // SIGINT can be blocked
+    }
+
+    #[test]
+    fn test_raise_is_kill_to_self() {
+        let mut proc = Process::new(42);
+        sys_raise(&mut proc, 15).unwrap(); // SIGTERM
+        assert!(proc.signals.is_pending(15));
     }
 }
