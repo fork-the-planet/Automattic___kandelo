@@ -35,10 +35,13 @@ export class WasmPosixKernel {
    * @param wasmBytes - The compiled kernel Wasm binary
    */
   async init(wasmBytes: BufferSource): Promise<void> {
+    // The Wasm binary compiled with atomics requires shared memory.
+    // The initial/maximum page counts must match the Wasm import declaration
+    // (initial=17, max=16384 as emitted by the Rust toolchain).
     const memory = new WebAssembly.Memory({
-      initial: 16, // 1 MiB
-      maximum: 256, // 16 MiB
-      shared: this.config.useSharedMemory,
+      initial: 17,
+      maximum: 16384,
+      shared: true,
     });
     this.memory = memory;
 
