@@ -74,7 +74,8 @@ export class MockWorkerAdapter implements WorkerAdapter {
 // --- Node.js implementation ---
 
 import { Worker } from "node:worker_threads";
-import { fileURLToPath } from "node:url";
+import { pathToFileURL } from "node:url";
+import { createRequire } from "node:module";
 
 export class NodeWorkerAdapter implements WorkerAdapter {
   private entryUrl: URL;
@@ -85,9 +86,26 @@ export class NodeWorkerAdapter implements WorkerAdapter {
   }
 
   createWorker(workerData: unknown): WorkerHandle {
-    const worker = new Worker(fileURLToPath(this.entryUrl), {
+    // Resolve tsx/esm/api to an absolute file URL so the eval'd worker
+    // can import it without relying on bare-specifier resolution.
+    const require = createRequire(import.meta.url);
+    const tsxApiPath = require.resolve("tsx/esm/api");
+    const tsxApiUrl = pathToFileURL(tsxApiPath).href;
+    const entryUrl = this.entryUrl.href;
+
+    // Workers cannot use `--import tsx` because Node.js customisation
+    // hooks registered via `module.register()` do not propagate to
+    // worker threads.  Instead we use an eval bootstrap that registers
+    // tsx inside the worker and then dynamically imports the real entry.
+    const bootstrap = [
+      `import { register } from '${tsxApiUrl}';`,
+      `register();`,
+      `await import('${entryUrl}');`,
+    ].join("\n");
+
+    const worker = new Worker(bootstrap, {
+      eval: true,
       workerData,
-      execArgv: ["--import", "tsx"],
     });
     return new NodeWorkerHandle(worker);
   }
