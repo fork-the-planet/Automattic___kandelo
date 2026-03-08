@@ -21,6 +21,7 @@ pub struct OpenFileDesc {
     pub host_handle: i64,
     pub offset: i64,
     pub ref_count: u32,
+    pub owner_pid: u32,
 }
 
 pub struct OfdTable {
@@ -43,6 +44,7 @@ impl OfdTable {
             host_handle,
             offset: 0,
             ref_count: 1,
+            owner_pid: 0,
         };
 
         // Search for a free (None) slot to reuse.

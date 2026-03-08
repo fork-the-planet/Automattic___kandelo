@@ -520,6 +520,19 @@ pub fn sys_fcntl(
             proc.ofd_table.set_status_flags(ofd_idx, arg);
             Ok(0)
         }
+        F_SETOWN => {
+            let entry = proc.fd_table.get(fd)?;
+            let ofd_idx = entry.ofd_ref.0;
+            let ofd = proc.ofd_table.get_mut(ofd_idx).ok_or(Errno::EBADF)?;
+            ofd.owner_pid = arg;
+            Ok(0)
+        }
+        F_GETOWN => {
+            let entry = proc.fd_table.get(fd)?;
+            let ofd_idx = entry.ofd_ref.0;
+            let ofd = proc.ofd_table.get(ofd_idx).ok_or(Errno::EBADF)?;
+            Ok(ofd.owner_pid as i32)
+        }
         F_GETLK | F_SETLK | F_SETLKW => {
             // Lock operations need the flock struct - use sys_fcntl_lock instead
             Err(Errno::EINVAL)
@@ -3048,5 +3061,23 @@ mod tests {
         let mut buf = [0u8; 8];
         let result = sys_ioctl(&mut proc, 0, 0x9999, &mut buf);
         assert_eq!(result, Err(Errno::ENOTTY));
+    }
+
+    #[test]
+    fn test_fcntl_f_getown_default_zero() {
+        let mut proc = Process::new(1);
+        let result = sys_fcntl(&mut proc, 0, 9, 0); // F_GETOWN
+        assert_eq!(result, Ok(0));
+    }
+
+    #[test]
+    fn test_fcntl_f_setown_and_getown() {
+        let mut proc = Process::new(1);
+        // Set owner to pid 42
+        let result = sys_fcntl(&mut proc, 0, 8, 42); // F_SETOWN
+        assert_eq!(result, Ok(0));
+        // Get owner
+        let result = sys_fcntl(&mut proc, 0, 9, 0); // F_GETOWN
+        assert_eq!(result, Ok(42));
     }
 }

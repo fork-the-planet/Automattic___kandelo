@@ -326,6 +326,8 @@ pub mod fcntl_cmd {
     pub const F_GETLK: u32 = 5;
     pub const F_SETLK: u32 = 6;
     pub const F_SETLKW: u32 = 7;
+    pub const F_SETOWN: u32 = 8;
+    pub const F_GETOWN: u32 = 9;
     pub const F_DUPFD_CLOEXEC: u32 = 1030;
 }
 
