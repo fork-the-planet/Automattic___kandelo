@@ -44,6 +44,8 @@ unsafe extern "C" {
     fn host_closedir(dir_handle: i64) -> i32;
     fn host_clock_gettime(clock_id: u32, sec_ptr: *mut i64, nsec_ptr: *mut i64) -> i32;
     fn host_nanosleep(sec: i64, nsec: i64) -> i32;
+    fn host_ftruncate(handle: i64, length: i64) -> i32;
+    fn host_fsync(handle: i64) -> i32;
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +293,16 @@ impl HostIO for WasmHostIO {
         let result = unsafe { host_nanosleep(seconds, nanoseconds) };
         i32_to_result(result)
     }
+
+    fn host_ftruncate(&mut self, handle: i64, length: i64) -> Result<(), Errno> {
+        let result = unsafe { host_ftruncate(handle, length) };
+        i32_to_result(result)
+    }
+
+    fn host_fsync(&mut self, handle: i64) -> Result<(), Errno> {
+        let result = unsafe { host_fsync(handle) };
+        i32_to_result(result)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -459,6 +471,35 @@ pub extern "C" fn kernel_pipe(fildes_ptr: *mut i32) -> i32 {
             unsafe {
                 *fildes_ptr = read_fd;
                 *fildes_ptr.add(1) = write_fd;
+            }
+            0
+        }
+        Err(e) => -(e as i32),
+    }
+}
+
+/// Duplicate a file descriptor to a specific target fd with flags.
+/// Returns newfd (>= 0) or negative errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_dup3(oldfd: i32, newfd: i32, flags: u32) -> i32 {
+    let proc = unsafe { get_process() };
+    let mut host = WasmHostIO;
+    match syscalls::sys_dup3(proc, &mut host, oldfd, newfd, flags) {
+        Ok(fd) => fd,
+        Err(e) => -(e as i32),
+    }
+}
+
+/// Create a pipe with flags. Writes [read_fd, write_fd] to the pointer.
+/// Returns 0 on success, or negative errno on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_pipe2(flags: u32, fd_ptr: *mut i32) -> i32 {
+    let proc = unsafe { get_process() };
+    match syscalls::sys_pipe2(proc, flags) {
+        Ok((r, w)) => {
+            unsafe {
+                *fd_ptr = r;
+                *fd_ptr.add(1) = w;
             }
             0
         }
@@ -1311,5 +1352,29 @@ pub extern "C" fn kernel_sysconf(name: i32) -> i64 {
     match syscalls::sys_sysconf(name) {
         Ok(val) => val,
         Err(e) => -(e as i64),
+    }
+}
+
+/// Truncate a file to a specified length. Returns 0 on success, or negative errno on error.
+/// The 64-bit length is passed as two 32-bit halves for Wasm compatibility.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_ftruncate(fd: i32, length_lo: u32, length_hi: u32) -> i32 {
+    let proc = unsafe { get_process() };
+    let mut host = WasmHostIO;
+    let length = ((length_hi as i64) << 32) | (length_lo as u64 as i64);
+    match syscalls::sys_ftruncate(proc, &mut host, fd, length) {
+        Ok(()) => 0,
+        Err(e) => -(e as i32),
+    }
+}
+
+/// Synchronize file state to storage. Returns 0 on success, or negative errno on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_fsync(fd: i32) -> i32 {
+    let proc = unsafe { get_process() };
+    let mut host = WasmHostIO;
+    match syscalls::sys_fsync(proc, &mut host, fd) {
+        Ok(()) => 0,
+        Err(e) => -(e as i32),
     }
 }

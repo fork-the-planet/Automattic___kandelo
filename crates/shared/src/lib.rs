@@ -80,6 +80,10 @@ pub enum Syscall {
     Umask = 74,
     Uname = 75,
     Sysconf = 76,
+    Dup3 = 77,
+    Pipe2 = 78,
+    Ftruncate = 79,
+    Fsync = 80,
 }
 
 impl Syscall {
@@ -162,6 +166,10 @@ impl Syscall {
             74 => Some(Syscall::Umask),
             75 => Some(Syscall::Uname),
             76 => Some(Syscall::Sysconf),
+            77 => Some(Syscall::Dup3),
+            78 => Some(Syscall::Pipe2),
+            79 => Some(Syscall::Ftruncate),
+            80 => Some(Syscall::Fsync),
             _ => None,
         }
     }

@@ -402,6 +402,32 @@ pub fn sys_dup2(
     }
 }
 
+/// Duplicate a file descriptor to a specific fd number with flags.
+/// Unlike dup2, returns EINVAL if oldfd == newfd.
+pub fn sys_dup3(
+    proc: &mut Process,
+    host: &mut dyn HostIO,
+    oldfd: i32,
+    newfd: i32,
+    flags: u32,
+) -> Result<i32, Errno> {
+    if oldfd == newfd {
+        return Err(Errno::EINVAL);
+    }
+
+    // Reuse dup2 logic: close newfd if open, then dup oldfd to newfd.
+    let result = sys_dup2(proc, host, oldfd, newfd)?;
+
+    // Apply O_CLOEXEC flag to the new fd.
+    if flags & O_CLOEXEC != 0 {
+        if let Ok(entry) = proc.fd_table.get_mut(newfd) {
+            entry.fd_flags = FD_CLOEXEC;
+        }
+    }
+
+    Ok(result)
+}
+
 /// Create a pipe, returning (read_fd, write_fd).
 pub fn sys_pipe(proc: &mut Process) -> Result<(i32, i32), Errno> {
     let pipe = PipeBuffer::new(DEFAULT_PIPE_CAPACITY);
@@ -454,6 +480,33 @@ pub fn sys_pipe(proc: &mut Process) -> Result<(i32, i32), Errno> {
             return Err(e);
         }
     };
+
+    Ok((read_fd, write_fd))
+}
+
+/// Create a pipe with flags (O_NONBLOCK, O_CLOEXEC).
+pub fn sys_pipe2(proc: &mut Process, flags: u32) -> Result<(i32, i32), Errno> {
+    let (read_fd, write_fd) = sys_pipe(proc)?;
+
+    if flags & O_CLOEXEC != 0 {
+        if let Ok(entry) = proc.fd_table.get_mut(read_fd) {
+            entry.fd_flags = FD_CLOEXEC;
+        }
+        if let Ok(entry) = proc.fd_table.get_mut(write_fd) {
+            entry.fd_flags = FD_CLOEXEC;
+        }
+    }
+
+    if flags & O_NONBLOCK != 0 {
+        let read_ofd_idx = proc.fd_table.get(read_fd)?.ofd_ref.0;
+        let write_ofd_idx = proc.fd_table.get(write_fd)?.ofd_ref.0;
+        if let Some(ofd) = proc.ofd_table.get_mut(read_ofd_idx) {
+            ofd.status_flags |= O_NONBLOCK;
+        }
+        if let Some(ofd) = proc.ofd_table.get_mut(write_ofd_idx) {
+            ofd.status_flags |= O_NONBLOCK;
+        }
+    }
 
     Ok((read_fd, write_fd))
 }
@@ -1758,6 +1811,52 @@ pub fn sys_sysconf(name: i32) -> Result<i64, Errno> {
     }
 }
 
+/// ftruncate -- truncate a file to a specified length.
+pub fn sys_ftruncate(
+    proc: &mut Process,
+    host: &mut dyn HostIO,
+    fd: i32,
+    length: i64,
+) -> Result<(), Errno> {
+    if length < 0 {
+        return Err(Errno::EINVAL);
+    }
+    let entry = proc.fd_table.get(fd)?;
+    let ofd_idx = entry.ofd_ref.0;
+    let ofd = proc.ofd_table.get(ofd_idx).ok_or(Errno::EBADF)?;
+
+    // Must be a regular file
+    if ofd.file_type != FileType::Regular {
+        return Err(Errno::EINVAL);
+    }
+
+    // Must be writable (O_WRONLY or O_RDWR)
+    let access = ofd.status_flags & O_ACCMODE;
+    if access == O_RDONLY {
+        return Err(Errno::EINVAL);
+    }
+
+    host.host_ftruncate(ofd.host_handle, length)
+}
+
+/// fsync -- synchronize file state to storage.
+pub fn sys_fsync(
+    proc: &mut Process,
+    host: &mut dyn HostIO,
+    fd: i32,
+) -> Result<(), Errno> {
+    let entry = proc.fd_table.get(fd)?;
+    let ofd_idx = entry.ofd_ref.0;
+    let ofd = proc.ofd_table.get(ofd_idx).ok_or(Errno::EBADF)?;
+
+    // Must be a regular file
+    if ofd.file_type != FileType::Regular {
+        return Err(Errno::EINVAL);
+    }
+
+    host.host_fsync(ofd.host_handle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1894,6 +1993,14 @@ mod tests {
         }
 
         fn host_nanosleep(&mut self, _seconds: i64, _nanoseconds: i64) -> Result<(), Errno> {
+            Ok(())
+        }
+
+        fn host_ftruncate(&mut self, _handle: i64, _length: i64) -> Result<(), Errno> {
+            Ok(())
+        }
+
+        fn host_fsync(&mut self, _handle: i64) -> Result<(), Errno> {
             Ok(())
         }
     }
@@ -3386,5 +3493,144 @@ mod tests {
     #[test]
     fn test_sysconf_invalid() {
         assert_eq!(sys_sysconf(9999), Err(Errno::EINVAL));
+    }
+
+    // ---- ftruncate tests ----
+
+    #[test]
+    fn test_ftruncate_regular_file() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_open(&mut proc, &mut host, b"/tmp/test", O_WRONLY | O_CREAT, 0o644).unwrap();
+        let result = sys_ftruncate(&mut proc, &mut host, fd, 100);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_ftruncate_negative_length() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_open(&mut proc, &mut host, b"/tmp/test", O_WRONLY | O_CREAT, 0o644).unwrap();
+        let result = sys_ftruncate(&mut proc, &mut host, fd, -1);
+        assert_eq!(result, Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn test_ftruncate_bad_fd() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let result = sys_ftruncate(&mut proc, &mut host, 99, 0);
+        assert_eq!(result, Err(Errno::EBADF));
+    }
+
+    #[test]
+    fn test_ftruncate_pipe_einval() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let (r, _w) = sys_pipe(&mut proc).unwrap();
+        let result = sys_ftruncate(&mut proc, &mut host, r, 0);
+        assert_eq!(result, Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn test_ftruncate_rdonly_einval() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_open(&mut proc, &mut host, b"/tmp/test", O_RDONLY, 0o644).unwrap();
+        let result = sys_ftruncate(&mut proc, &mut host, fd, 0);
+        assert_eq!(result, Err(Errno::EINVAL));
+    }
+
+    // ---- fsync tests ----
+
+    #[test]
+    fn test_fsync_regular_file() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_open(&mut proc, &mut host, b"/tmp/test", O_WRONLY | O_CREAT, 0o644).unwrap();
+        let result = sys_fsync(&mut proc, &mut host, fd);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_fsync_bad_fd() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let result = sys_fsync(&mut proc, &mut host, 99);
+        assert_eq!(result, Err(Errno::EBADF));
+    }
+
+    #[test]
+    fn test_fsync_pipe_einval() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let (r, _w) = sys_pipe(&mut proc).unwrap();
+        let result = sys_fsync(&mut proc, &mut host, r);
+        assert_eq!(result, Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn test_dup3_with_cloexec() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        // dup3 fd 0 to fd 5 with O_CLOEXEC
+        let result = sys_dup3(&mut proc, &mut host, 0, 5, O_CLOEXEC);
+        assert_eq!(result, Ok(5));
+        let entry = proc.fd_table.get(5).unwrap();
+        assert_eq!(entry.fd_flags, FD_CLOEXEC);
+    }
+
+    #[test]
+    fn test_dup3_without_cloexec() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let result = sys_dup3(&mut proc, &mut host, 0, 5, 0);
+        assert_eq!(result, Ok(5));
+        let entry = proc.fd_table.get(5).unwrap();
+        assert_eq!(entry.fd_flags, 0);
+    }
+
+    #[test]
+    fn test_dup3_same_fd_einval() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let result = sys_dup3(&mut proc, &mut host, 0, 0, 0);
+        assert_eq!(result, Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn test_pipe2_cloexec() {
+        let mut proc = Process::new(1);
+        let (r, w) = sys_pipe2(&mut proc, O_CLOEXEC).unwrap();
+        let r_entry = proc.fd_table.get(r).unwrap();
+        let w_entry = proc.fd_table.get(w).unwrap();
+        assert_eq!(r_entry.fd_flags, FD_CLOEXEC);
+        assert_eq!(w_entry.fd_flags, FD_CLOEXEC);
+    }
+
+    #[test]
+    fn test_pipe2_nonblock() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let (r, _w) = sys_pipe2(&mut proc, O_NONBLOCK).unwrap();
+        // Verify O_NONBLOCK is set — read empty pipe should return EAGAIN
+        let mut buf = [0u8; 16];
+        let result = sys_read(&mut proc, &mut host, r, &mut buf);
+        assert_eq!(result, Err(Errno::EAGAIN));
+    }
+
+    #[test]
+    fn test_pipe2_both_flags() {
+        let mut proc = Process::new(1);
+        let (r, w) = sys_pipe2(&mut proc, O_CLOEXEC | O_NONBLOCK).unwrap();
+        let r_entry = proc.fd_table.get(r).unwrap();
+        let w_entry = proc.fd_table.get(w).unwrap();
+        assert_eq!(r_entry.fd_flags, FD_CLOEXEC);
+        assert_eq!(w_entry.fd_flags, FD_CLOEXEC);
+        // Verify O_NONBLOCK is set on the OFDs
+        let r_ofd = proc.ofd_table.get(r_entry.ofd_ref.0).unwrap();
+        let w_ofd = proc.ofd_table.get(w_entry.ofd_ref.0).unwrap();
+        assert_ne!(r_ofd.status_flags & O_NONBLOCK, 0);
+        assert_ne!(w_ofd.status_flags & O_NONBLOCK, 0);
     }
 }

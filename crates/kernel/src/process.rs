@@ -42,6 +42,8 @@ pub trait HostIO {
     fn host_closedir(&mut self, handle: i64) -> Result<(), Errno>;
     fn host_clock_gettime(&mut self, clock_id: u32) -> Result<(i64, i64), Errno>;
     fn host_nanosleep(&mut self, seconds: i64, nanoseconds: i64) -> Result<(), Errno>;
+    fn host_ftruncate(&mut self, handle: i64, length: i64) -> Result<(), Errno>;
+    fn host_fsync(&mut self, handle: i64) -> Result<(), Errno>;
 }
 
 /// Process lifecycle state.
