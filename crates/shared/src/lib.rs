@@ -73,6 +73,10 @@ pub enum Syscall {
     Gettimeofday = 67,
     Usleep = 68,
     Openat = 69,
+    Tcgetattr = 70,
+    Tcsetattr = 71,
+    Ioctl = 72,
+    Signal = 73,
 }
 
 impl Syscall {
@@ -148,6 +152,10 @@ impl Syscall {
             67 => Some(Syscall::Gettimeofday),
             68 => Some(Syscall::Usleep),
             69 => Some(Syscall::Openat),
+            70 => Some(Syscall::Tcgetattr),
+            71 => Some(Syscall::Tcsetattr),
+            72 => Some(Syscall::Ioctl),
+            73 => Some(Syscall::Signal),
             _ => None,
         }
     }

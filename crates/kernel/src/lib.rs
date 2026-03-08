@@ -14,6 +14,7 @@ pub mod process;
 pub mod signal;
 pub mod socket;
 pub mod syscalls;
+pub mod terminal;
 
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_api;
