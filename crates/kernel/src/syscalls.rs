@@ -197,6 +197,7 @@ pub fn sys_write(
 
     let host_handle = ofd.host_handle;
     let file_type = ofd.file_type;
+    let status_flags = ofd.status_flags;
 
     match file_type {
         FileType::Pipe => {
@@ -209,7 +210,11 @@ pub fn sys_write(
             if !pipe.is_read_end_open() {
                 return Err(Errno::EPIPE);
             }
-            Ok(pipe.write(buf))
+            let n = pipe.write(buf);
+            if n == 0 && status_flags & O_NONBLOCK != 0 {
+                return Err(Errno::EAGAIN);
+            }
+            Ok(n)
         }
         FileType::Socket => {
             let sock_idx = (-(host_handle + 1)) as usize;
@@ -226,7 +231,11 @@ pub fn sys_write(
             if !pipe.is_read_end_open() {
                 return Err(Errno::EPIPE);
             }
-            Ok(pipe.write(buf))
+            let n = pipe.write(buf);
+            if n == 0 && status_flags & O_NONBLOCK != 0 {
+                return Err(Errno::EAGAIN);
+            }
+            Ok(n)
         }
         _ => {
             let n = host.host_write(host_handle, buf)?;
@@ -3194,5 +3203,62 @@ mod tests {
         let entry = proc.fd_table.get(fd).unwrap();
         let ofd = proc.ofd_table.get(entry.ofd_ref.0).unwrap();
         assert_eq!(ofd.status_flags & O_NOFOLLOW, 0); // Not in status flags
+    }
+
+    #[test]
+    fn test_pipe_read_nonblock_eagain() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let (read_fd, _write_fd) = sys_pipe(&mut proc).unwrap();
+        // Set read end to non-blocking
+        sys_fcntl(&mut proc, read_fd, F_SETFL, O_NONBLOCK).unwrap();
+        // Read with nothing in pipe — should get EAGAIN
+        let mut buf = [0u8; 16];
+        let result = sys_read(&mut proc, &mut host, read_fd, &mut buf);
+        assert_eq!(result, Err(Errno::EAGAIN));
+    }
+
+    #[test]
+    fn test_pipe_read_nonblock_with_data() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let (read_fd, write_fd) = sys_pipe(&mut proc).unwrap();
+        sys_fcntl(&mut proc, read_fd, F_SETFL, O_NONBLOCK).unwrap();
+        // Write some data
+        sys_write(&mut proc, &mut host, write_fd, b"hello").unwrap();
+        // Read — should succeed
+        let mut buf = [0u8; 16];
+        let n = sys_read(&mut proc, &mut host, read_fd, &mut buf).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&buf[..5], b"hello");
+    }
+
+    #[test]
+    fn test_pipe_read_eof_when_write_end_closed() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let (read_fd, write_fd) = sys_pipe(&mut proc).unwrap();
+        sys_fcntl(&mut proc, read_fd, F_SETFL, O_NONBLOCK).unwrap();
+        // Close write end
+        sys_close(&mut proc, &mut host, write_fd).unwrap();
+        // Read — should get 0 (EOF), not EAGAIN
+        let mut buf = [0u8; 16];
+        let n = sys_read(&mut proc, &mut host, read_fd, &mut buf).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_pipe_write_nonblock_eagain_when_full() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let (_read_fd, write_fd) = sys_pipe(&mut proc).unwrap();
+        sys_fcntl(&mut proc, write_fd, F_SETFL, O_NONBLOCK).unwrap();
+        // Fill pipe buffer (64KB)
+        let big = [0u8; 65536];
+        let n = sys_write(&mut proc, &mut host, write_fd, &big).unwrap();
+        assert_eq!(n, 65536);
+        // Next write should get EAGAIN
+        let result = sys_write(&mut proc, &mut host, write_fd, b"x");
+        assert_eq!(result, Err(Errno::EAGAIN));
     }
 }
