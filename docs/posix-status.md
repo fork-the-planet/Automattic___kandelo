@@ -100,16 +100,17 @@ This document tracks the implementation status of POSIX APIs in the wasm-posix-k
 
 | Function | Status | Notes |
 |----------|--------|-------|
-| `socket()` | Planned | Requires host network stack. |
-| `bind()` | Planned | |
-| `listen()` | Planned | |
-| `accept()` | Planned | |
-| `connect()` | Planned | |
-| `send()` / `recv()` | Planned | |
-| `sendto()` / `recvfrom()` | Planned | |
-| `setsockopt()` / `getsockopt()` | Planned | |
-| `shutdown()` | Planned | |
-| `select()` / `poll()` | Planned | Kernel-space fd readiness tracking. |
+| `socket()` | Partial | AF_UNIX (kernel-internal) and AF_INET (creation only) supported. SOCK_STREAM and SOCK_DGRAM types. SOCK_NONBLOCK and SOCK_CLOEXEC flags handled. |
+| `socketpair()` | Full | AF_UNIX SOCK_STREAM. Bidirectional ring buffers (64KB each). Returns pre-connected pair. |
+| `bind()` | Stub | Returns ENOSYS. Requires host network stack for AF_INET. |
+| `listen()` | Stub | Returns ENOSYS. Requires host network stack. |
+| `accept()` | Stub | Returns ENOSYS. Requires host network stack. |
+| `connect()` | Stub | Returns ENOSYS. Requires host network stack. |
+| `send()` / `recv()` | Partial | Works for connected Unix domain sockets (via socketpair). Delegates to read/write. MSG_PEEK not yet implemented. |
+| `sendto()` / `recvfrom()` | Stub | Returns ENOSYS. Requires host network stack for UDP. |
+| `setsockopt()` / `getsockopt()` | Partial | SOL_SOCKET level: SO_TYPE, SO_DOMAIN, SO_ERROR, SO_ACCEPTCONN, SO_RCVBUF, SO_SNDBUF readable. SO_REUSEADDR, SO_KEEPALIVE accepted (no-op). |
+| `shutdown()` | Full | SHUT_RD, SHUT_WR, SHUT_RDWR. Properly closes buffer endpoints. |
+| `select()` / `poll()` | Partial | poll() implemented. Checks readiness for regular files, pipes, and sockets. Timeout ignored (non-blocking only). select() can be userspace on top of poll(). |
 
 ## Time
 
@@ -176,6 +177,6 @@ These features require SharedArrayBuffer (and cross-origin isolation headers in 
 3b. **Phase 3b (Deferred):** Multi-process — fork, exec, waitpid (requires multi-worker architecture)
 4. **Phase 4 (Complete):** Signals — kill, raise, sigaction, sigprocmask. Signal delivery mechanism deferred (needs Asyncify).
 5. **Phase 5 (Complete):** fcntl locking — F_GETLK, F_SETLK, F_SETLKW with byte-range granularity
-6. **Phase 6 (Next):** Sockets — socket, bind, listen, accept, connect, select/poll
+6. **Phase 6 (Complete):** Sockets & I/O multiplexing — socket, socketpair, shutdown, send/recv, getsockopt/setsockopt, poll. TCP stubs (bind/listen/accept/connect return ENOSYS).
 7. **Phase 7 (Complete):** Time, TTY, environment — clock_gettime, nanosleep, isatty, getenv/setenv/unsetenv
 8. **Phase 8 (Complete):** Memory management — mmap (anonymous), munmap, brk, mprotect (stub)
