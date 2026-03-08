@@ -712,3 +712,53 @@ pub extern "C" fn kernel_closedir(dir_handle: i32) -> i32 {
         Err(e) => -(e as i32),
     }
 }
+
+/// Get the process ID.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_getpid() -> i32 {
+    let proc = unsafe { get_process() };
+    syscalls::sys_getpid(proc)
+}
+
+/// Get the parent process ID.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_getppid() -> i32 {
+    let proc = unsafe { get_process() };
+    syscalls::sys_getppid(proc)
+}
+
+/// Get the real user ID.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_getuid() -> u32 {
+    let proc = unsafe { get_process() };
+    syscalls::sys_getuid(proc)
+}
+
+/// Get the effective user ID.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_geteuid() -> u32 {
+    let proc = unsafe { get_process() };
+    syscalls::sys_geteuid(proc)
+}
+
+/// Get the real group ID.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_getgid() -> u32 {
+    let proc = unsafe { get_process() };
+    syscalls::sys_getgid(proc)
+}
+
+/// Get the effective group ID.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_getegid() -> u32 {
+    let proc = unsafe { get_process() };
+    syscalls::sys_getegid(proc)
+}
+
+/// Exit the process. Closes all fds and dir streams, sets state to Exited.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_exit(status: i32) {
+    let proc = unsafe { get_process() };
+    let mut host = WasmHostIO;
+    syscalls::sys_exit(proc, &mut host, status);
+}
