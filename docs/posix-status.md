@@ -73,10 +73,10 @@ This document tracks the implementation status of POSIX APIs in the wasm-posix-k
 
 | Function | Status | Notes |
 |----------|--------|-------|
-| `mmap()` | Planned | Can map to Wasm linear memory regions. Anonymous mappings simpler than file-backed. |
-| `munmap()` | Planned | |
-| `brk()` / `sbrk()` | Planned | Often handled by guest libc (dlmalloc). May not need kernel support. |
-| `mprotect()` | N/A | Wasm linear memory has no page-level protection. |
+| `mmap()` | Partial | Anonymous mappings only (MAP_ANONYMOUS). Page-aligned (64KB Wasm pages). File-backed mappings not yet supported. MAP_FIXED not yet supported. |
+| `munmap()` | Full | Removes tracked region. Page-aligned address required. |
+| `brk()` / `sbrk()` | Partial | Kernel-managed program break. Initial break at 0x01000000. Only increases supported; shrinking not yet implemented. |
+| `mprotect()` | Stub | Returns ENOSYS. Wasm linear memory has no page-level protection. |
 
 ## Directory Operations
 
@@ -176,6 +176,6 @@ These features require SharedArrayBuffer (and cross-origin isolation headers in 
 3b. **Phase 3b (Deferred):** Multi-process — fork, exec, waitpid (requires multi-worker architecture)
 4. **Phase 4 (Complete):** Signals — kill, raise, sigaction, sigprocmask. Signal delivery mechanism deferred (needs Asyncify).
 5. **Phase 5 (Complete):** fcntl locking — F_GETLK, F_SETLK, F_SETLKW with byte-range granularity
-6. **Phase 6 (Next):** Sockets — socket, bind, listen, accept, connect
+6. **Phase 6 (Next):** Sockets — socket, bind, listen, accept, connect, select/poll
 7. **Phase 7 (Complete):** Time, TTY, environment — clock_gettime, nanosleep, isatty, getenv/setenv/unsetenv
-8. **Phase 8:** Memory management — mmap (anonymous), brk
+8. **Phase 8 (Complete):** Memory management — mmap (anonymous), munmap, brk, mprotect (stub)
