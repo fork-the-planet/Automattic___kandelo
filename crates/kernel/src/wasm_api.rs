@@ -1304,3 +1304,12 @@ pub extern "C" fn kernel_uname(buf_ptr: *mut u8, buf_len: u32) -> i32 {
         Err(e) => -(e as i32),
     }
 }
+
+/// Get configurable system variables. Returns the value on success, or negative errno on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sysconf(name: i32) -> i64 {
+    match syscalls::sys_sysconf(name) {
+        Ok(val) => val,
+        Err(e) => -(e as i64),
+    }
+}

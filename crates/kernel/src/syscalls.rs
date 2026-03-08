@@ -1743,6 +1743,21 @@ pub fn sys_uname(buf: &mut [u8]) -> Result<(), Errno> {
     Ok(())
 }
 
+/// sysconf — get configurable system variables
+pub fn sys_sysconf(name: i32) -> Result<i64, Errno> {
+    match name {
+        0 => Ok(4096),   // _SC_ARG_MAX
+        1 => Ok(0),      // _SC_CHILD_MAX (no fork)
+        2 => Ok(100),    // _SC_CLK_TCK
+        4 => Ok(1024),   // _SC_OPEN_MAX
+        6 => Ok(1),      // _SC_NPROCESSORS_ONLN
+        8 => Ok(1),      // _SC_NPROCESSORS_CONF
+        11 => Ok(65536), // _SC_PAGESIZE (Wasm page = 64KB)
+        30 => Ok(65536), // _SC_PAGE_SIZE (alias)
+        _ => Err(Errno::EINVAL),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3348,5 +3363,28 @@ mod tests {
         let mut buf = [0u8; 100];
         let result = sys_uname(&mut buf);
         assert_eq!(result, Err(Errno::EINVAL));
+    }
+
+    // ---- sysconf tests ----
+
+    #[test]
+    fn test_sysconf_page_size() {
+        assert_eq!(sys_sysconf(30), Ok(65536)); // _SC_PAGE_SIZE
+        assert_eq!(sys_sysconf(11), Ok(65536)); // _SC_PAGESIZE
+    }
+
+    #[test]
+    fn test_sysconf_open_max() {
+        assert_eq!(sys_sysconf(4), Ok(1024)); // _SC_OPEN_MAX
+    }
+
+    #[test]
+    fn test_sysconf_nprocessors() {
+        assert_eq!(sys_sysconf(6), Ok(1)); // _SC_NPROCESSORS_ONLN
+    }
+
+    #[test]
+    fn test_sysconf_invalid() {
+        assert_eq!(sys_sysconf(9999), Err(Errno::EINVAL));
     }
 }
