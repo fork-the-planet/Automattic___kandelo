@@ -406,7 +406,7 @@ pub fn sys_fcntl(
 }
 
 use wasm_posix_shared::WasmDirent;
-use crate::process::DirStream;
+use crate::process::{DirStream, ProcessState};
 use crate::path::resolve_path;
 
 pub fn sys_stat(proc: &mut Process, host: &mut dyn HostIO, path: &[u8]) -> Result<WasmStat, Errno> {
@@ -567,9 +567,61 @@ pub fn sys_closedir(proc: &mut Process, host: &mut dyn HostIO, dir_handle: i32) 
     host.host_closedir(stream.host_handle)
 }
 
+/// Get the process ID.
+pub fn sys_getpid(proc: &Process) -> i32 {
+    proc.pid as i32
+}
+
+/// Get the parent process ID.
+pub fn sys_getppid(proc: &Process) -> i32 {
+    proc.ppid as i32
+}
+
+/// Get the real user ID.
+pub fn sys_getuid(proc: &Process) -> u32 {
+    proc.uid
+}
+
+/// Get the effective user ID.
+pub fn sys_geteuid(proc: &Process) -> u32 {
+    proc.euid
+}
+
+/// Get the real group ID.
+pub fn sys_getgid(proc: &Process) -> u32 {
+    proc.gid
+}
+
+/// Get the effective group ID.
+pub fn sys_getegid(proc: &Process) -> u32 {
+    proc.egid
+}
+
+/// Exit the process. Closes all fds and dir streams, sets state to Exited.
+pub fn sys_exit(proc: &mut Process, host: &mut dyn HostIO, status: i32) {
+    // Close all file descriptors
+    let max_fd = 1024; // Use a reasonable upper bound
+    for fd in 0..max_fd {
+        let _ = sys_close(proc, host, fd);
+    }
+
+    // Close all directory streams
+    let num_streams = proc.dir_streams.len();
+    for i in 0..num_streams {
+        if proc.dir_streams[i].is_some() {
+            let stream = proc.dir_streams[i].take().unwrap();
+            let _ = host.host_closedir(stream.host_handle);
+        }
+    }
+
+    proc.state = ProcessState::Exited;
+    proc.exit_status = status;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process::ProcessState;
     use wasm_posix_shared::mode::{S_IFDIR, S_IFREG, S_IFLNK};
 
     /// Mock host I/O for testing.
@@ -1099,5 +1151,70 @@ mod tests {
         let dh1 = sys_opendir(&mut proc, &mut host, b"/tmp").unwrap();
         assert_eq!(dh1, 0);
         sys_closedir(&mut proc, &mut host, dh1).unwrap();
+    }
+
+    #[test]
+    fn test_getpid_returns_pid() {
+        let proc = Process::new(42);
+        assert_eq!(sys_getpid(&proc), 42);
+    }
+
+    #[test]
+    fn test_getppid_returns_zero_for_init() {
+        let proc = Process::new(1);
+        assert_eq!(sys_getppid(&proc), 0);
+    }
+
+    #[test]
+    fn test_getuid_returns_default() {
+        let proc = Process::new(1);
+        assert_eq!(sys_getuid(&proc), 1000);
+    }
+
+    #[test]
+    fn test_geteuid_returns_default() {
+        let proc = Process::new(1);
+        assert_eq!(sys_geteuid(&proc), 1000);
+    }
+
+    #[test]
+    fn test_getgid_returns_default() {
+        let proc = Process::new(1);
+        assert_eq!(sys_getgid(&proc), 1000);
+    }
+
+    #[test]
+    fn test_getegid_returns_default() {
+        let proc = Process::new(1);
+        assert_eq!(sys_getegid(&proc), 1000);
+    }
+
+    #[test]
+    fn test_exit_closes_fds_and_sets_state() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+
+        // Open a file to ensure there's something to close
+        let fd = sys_open(&mut proc, &mut host, b"/tmp/test", O_RDWR | O_CREAT, 0o644).unwrap();
+        assert!(fd >= 3); // After stdio
+
+        sys_exit(&mut proc, &mut host, 42);
+
+        assert_eq!(proc.state, ProcessState::Exited);
+        assert_eq!(proc.exit_status, 42);
+
+        // All fds should be closed - trying to read from fd should fail
+        let mut buf = [0u8; 10];
+        let result = sys_read(&mut proc, &mut host, fd, &mut buf);
+        assert_eq!(result, Err(Errno::EBADF));
+    }
+
+    #[test]
+    fn test_exit_with_zero_status() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        sys_exit(&mut proc, &mut host, 0);
+        assert_eq!(proc.state, ProcessState::Exited);
+        assert_eq!(proc.exit_status, 0);
     }
 }
