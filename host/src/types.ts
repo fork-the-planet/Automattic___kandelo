@@ -55,4 +55,8 @@ export interface PlatformIO {
     handle: number,
   ): Promise<{ name: string; type: number; ino: number } | null>;
   closedir(handle: number): Promise<void>;
+
+  // Time
+  clockGettime(clockId: number): Promise<{ sec: number; nsec: number }>;
+  nanosleep(sec: number, nsec: number): Promise<void>;
 }

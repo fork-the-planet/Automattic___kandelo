@@ -188,4 +188,30 @@ export class NodePlatformIO implements PlatformIO {
     dir.closeSync();
     this.dirHandles.delete(handle);
   }
+
+  async clockGettime(
+    clockId: number,
+  ): Promise<{ sec: number; nsec: number }> {
+    if (clockId === 1) {
+      // CLOCK_MONOTONIC: use process.hrtime.bigint()
+      const ns = process.hrtime.bigint();
+      const sec = Number(ns / 1000000000n);
+      const nsec = Number(ns % 1000000000n);
+      return { sec, nsec };
+    }
+    // CLOCK_REALTIME
+    const now = Date.now();
+    const sec = Math.floor(now / 1000);
+    const nsec = (now % 1000) * 1_000_000;
+    return { sec, nsec };
+  }
+
+  async nanosleep(sec: number, nsec: number): Promise<void> {
+    const ms = sec * 1000 + Math.floor(nsec / 1_000_000);
+    if (ms > 0) {
+      const sab = new SharedArrayBuffer(4);
+      const arr = new Int32Array(sab);
+      Atomics.wait(arr, 0, 0, ms);
+    }
+  }
 }

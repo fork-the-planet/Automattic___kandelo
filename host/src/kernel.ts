@@ -182,6 +182,16 @@ export class WasmPosixKernel {
         host_closedir: (dirHandle: bigint): number => {
           return this.hostClosedir(dirHandle);
         },
+        host_clock_gettime: (
+          clockId: number,
+          secPtr: number,
+          nsecPtr: number,
+        ): number => {
+          return this.hostClockGettime(clockId, secPtr, nsecPtr);
+        },
+        host_nanosleep: (sec: bigint, nsec: bigint): number => {
+          return this.hostNanosleep(sec, nsec);
+        },
       },
     };
 
@@ -893,6 +903,65 @@ export class WasmPosixKernel {
           result = -1;
         });
       return result;
+    } catch {
+      return -1;
+    }
+  }
+
+  // ---- Phase 7: Time host imports ----
+
+  /**
+   * host_clock_gettime(clock_id, sec_ptr, nsec_ptr) -> i32
+   *
+   * Writes the current time (seconds and nanoseconds) to Wasm memory
+   * at the given pointers.
+   */
+  private hostClockGettime(
+    clockId: number,
+    secPtr: number,
+    nsecPtr: number,
+  ): number {
+    try {
+      type TimeResult = { sec: number; nsec: number };
+      let result: TimeResult | null = null;
+      let failed = false;
+      this.io
+        .clockGettime(clockId)
+        .then((r) => {
+          result = r;
+        })
+        .catch(() => {
+          failed = true;
+        });
+      if (failed) return -1;
+      const timeResult = result as TimeResult | null;
+      if (!timeResult) return -1;
+      const dv = this.getMemoryDataView();
+      dv.setBigInt64(secPtr, BigInt(timeResult.sec), true);
+      dv.setBigInt64(nsecPtr, BigInt(timeResult.nsec), true);
+      return 0;
+    } catch {
+      return -1;
+    }
+  }
+
+  /**
+   * host_nanosleep(sec: i64, nsec: i64) -> i32
+   *
+   * Sleep for the specified duration. The i64 parameters appear as
+   * BigInt in JavaScript.
+   */
+  private hostNanosleep(sec: bigint, nsec: bigint): number {
+    try {
+      let failed = false;
+      this.io
+        .nanosleep(Number(sec), Number(nsec))
+        .then(() => {})
+        .catch(() => {
+          failed = true;
+        });
+      if (failed) return -1;
+      return 0;
     } catch {
       return -1;
     }
