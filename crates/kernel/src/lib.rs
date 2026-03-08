@@ -6,6 +6,7 @@ extern crate wasm_posix_shared;
 
 pub mod fd;
 pub mod ofd;
+pub mod path;
 pub mod pipe;
 pub mod process;
 pub mod syscalls;
