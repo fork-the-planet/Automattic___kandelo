@@ -220,7 +220,17 @@ pub mod fcntl_cmd {
     pub const F_SETFD: u32 = 2;
     pub const F_GETFL: u32 = 3;
     pub const F_SETFL: u32 = 4;
+    pub const F_GETLK: u32 = 5;
+    pub const F_SETLK: u32 = 6;
+    pub const F_SETLKW: u32 = 7;
     pub const F_DUPFD_CLOEXEC: u32 = 1030;
+}
+
+/// Lock type constants for advisory record locking.
+pub mod lock_type {
+    pub const F_RDLCK: u32 = 0;
+    pub const F_WRLCK: u32 = 1;
+    pub const F_UNLCK: u32 = 2;
 }
 
 /// Seek whence constants.
@@ -334,6 +344,21 @@ pub struct WasmDirent {
     pub d_ino: u64,
     pub d_type: u32,
     pub d_namlen: u32,
+}
+
+/// flock structure for advisory record locking.
+///
+/// Uses `repr(C)` for a stable, predictable memory layout that can be
+/// shared across the Wasm shared-memory boundary.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct WasmFlock {
+    pub l_type: u32,    // F_RDLCK, F_WRLCK, F_UNLCK
+    pub l_whence: u32,  // SEEK_SET, SEEK_CUR, SEEK_END
+    pub l_start: i64,   // offset
+    pub l_len: i64,     // length (0 = to end of file)
+    pub l_pid: u32,     // process ID
+    pub _pad: u32,      // alignment padding
 }
 
 /// POSIX signal constants.
