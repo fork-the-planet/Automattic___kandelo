@@ -189,6 +189,22 @@ export class NodePlatformIO implements PlatformIO {
     this.dirHandles.delete(handle);
   }
 
+  async ftruncate(handle: number, length: number): Promise<void> {
+    fs.ftruncateSync(handle, length);
+  }
+
+  async fsync(handle: number): Promise<void> {
+    fs.fsyncSync(handle);
+  }
+
+  async fchmod(handle: number, mode: number): Promise<void> {
+    fs.fchmodSync(handle, mode);
+  }
+
+  async fchown(handle: number, uid: number, gid: number): Promise<void> {
+    fs.fchownSync(handle, uid, gid);
+  }
+
   async clockGettime(
     clockId: number,
   ): Promise<{ sec: number; nsec: number }> {
