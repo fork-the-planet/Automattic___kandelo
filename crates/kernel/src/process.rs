@@ -4,6 +4,7 @@ use alloc::vec::Vec;
 use wasm_posix_shared::{Errno, WasmStat};
 
 use crate::fd::FdTable;
+use crate::lock::LockTable;
 use crate::ofd::OfdTable;
 use crate::pipe::PipeBuffer;
 use crate::signal::SignalState;
@@ -57,6 +58,7 @@ pub struct Process {
     pub exit_status: i32,
     pub fd_table: FdTable,
     pub ofd_table: OfdTable,
+    pub lock_table: LockTable,
     pub pipes: Vec<Option<PipeBuffer>>,
     pub cwd: Vec<u8>,
     pub dir_streams: Vec<Option<DirStream>>,
@@ -92,6 +94,7 @@ impl Process {
             exit_status: 0,
             fd_table,
             ofd_table,
+            lock_table: LockTable::new(),
             pipes: Vec::new(),
             cwd: alloc::vec![b'/'],
             dir_streams: Vec::new(),
