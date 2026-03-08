@@ -25,7 +25,8 @@ export class MockWorkerHandle implements WorkerHandle {
   on(event: "message", handler: (msg: unknown) => void): void;
   on(event: "error", handler: (err: Error) => void): void;
   on(event: "exit", handler: (code: number) => void): void;
-  on(event: string, handler: (...args: unknown[]) => void): void {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  on(event: string, handler: (...args: any[]) => void): void {
     switch (event) {
       case "message":
         this.messageHandlers.push(handler as (msg: unknown) => void);
@@ -67,5 +68,54 @@ export class MockWorkerAdapter implements WorkerAdapter {
     this.lastWorker = handle;
     this.lastWorkerData = workerData;
     return handle;
+  }
+}
+
+// --- Node.js implementation ---
+
+import { Worker } from "node:worker_threads";
+import { fileURLToPath } from "node:url";
+
+export class NodeWorkerAdapter implements WorkerAdapter {
+  private entryUrl: URL;
+
+  constructor(entryUrl?: URL) {
+    this.entryUrl =
+      entryUrl ?? new URL("./worker-entry.ts", import.meta.url);
+  }
+
+  createWorker(workerData: unknown): WorkerHandle {
+    const worker = new Worker(fileURLToPath(this.entryUrl), {
+      workerData,
+      execArgv: ["--import", "tsx"],
+    });
+    return new NodeWorkerHandle(worker);
+  }
+}
+
+class NodeWorkerHandle implements WorkerHandle {
+  constructor(private worker: Worker) {}
+
+  postMessage(message: unknown, transfer?: Transferable[]): void {
+    if (transfer) {
+      this.worker.postMessage(
+        message,
+        transfer as import("node:worker_threads").TransferListItem[],
+      );
+    } else {
+      this.worker.postMessage(message);
+    }
+  }
+
+  on(event: "message", handler: (msg: unknown) => void): void;
+  on(event: "error", handler: (err: Error) => void): void;
+  on(event: "exit", handler: (code: number) => void): void;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  on(event: string, handler: (...args: any[]) => void): void {
+    this.worker.on(event, handler);
+  }
+
+  async terminate(): Promise<number> {
+    return this.worker.terminate();
   }
 }
