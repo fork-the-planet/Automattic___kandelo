@@ -156,18 +156,28 @@ pub fn sys_read(
             } else {
                 // Kernel-internal pipe
                 let pipe_idx = (-(host_handle + 1)) as usize;
-                let pipe = proc
-                    .pipes
-                    .get_mut(pipe_idx)
-                    .and_then(|p| p.as_mut())
-                    .ok_or(Errno::EBADF)?;
-                let n = pipe.read(buf);
-                if n == 0 && pipe.is_write_end_open() {
+                loop {
+                    let pipe = proc
+                        .pipes
+                        .get_mut(pipe_idx)
+                        .and_then(|p| p.as_mut())
+                        .ok_or(Errno::EBADF)?;
+                    let n = pipe.read(buf);
+                    if n > 0 {
+                        return Ok(n);
+                    }
+                    if !pipe.is_write_end_open() {
+                        return Ok(0); // EOF — write end closed
+                    }
                     if status_flags & O_NONBLOCK != 0 {
                         return Err(Errno::EAGAIN);
                     }
+                    // Block: check for signals then sleep 1ms
+                    if proc.signals.deliverable() != 0 {
+                        return Err(Errno::EINTR);
+                    }
+                    let _ = host.host_nanosleep(0, 1_000_000);
                 }
-                Ok(n)
             }
         }
         FileType::Socket => {
@@ -177,18 +187,27 @@ pub fn sys_read(
                 return Ok(0);
             }
             let recv_buf_idx = sock.recv_buf_idx.ok_or(Errno::ENOTCONN)?;
-            let pipe = proc
-                .pipes
-                .get_mut(recv_buf_idx)
-                .and_then(|p| p.as_mut())
-                .ok_or(Errno::EBADF)?;
-            let n = pipe.read(buf);
-            if n == 0 && pipe.is_write_end_open() {
+            loop {
+                let pipe = proc
+                    .pipes
+                    .get_mut(recv_buf_idx)
+                    .and_then(|p| p.as_mut())
+                    .ok_or(Errno::EBADF)?;
+                let n = pipe.read(buf);
+                if n > 0 {
+                    return Ok(n);
+                }
+                if !pipe.is_write_end_open() {
+                    return Ok(0); // EOF — peer closed
+                }
                 if status_flags & O_NONBLOCK != 0 {
                     return Err(Errno::EAGAIN);
                 }
+                if proc.signals.deliverable() != 0 {
+                    return Err(Errno::EINTR);
+                }
+                let _ = host.host_nanosleep(0, 1_000_000);
             }
-            Ok(n)
         }
         _ => {
             let n = host.host_read(host_handle, buf)?;
@@ -231,20 +250,29 @@ pub fn sys_write(
             } else {
                 // Kernel-internal pipe
                 let pipe_idx = (-(host_handle + 1)) as usize;
-                let pipe = proc
-                    .pipes
-                    .get_mut(pipe_idx)
-                    .and_then(|p| p.as_mut())
-                    .ok_or(Errno::EBADF)?;
-                if !pipe.is_read_end_open() {
-                    proc.signals.raise(wasm_posix_shared::signal::SIGPIPE);
-                    return Err(Errno::EPIPE);
+                loop {
+                    let pipe = proc
+                        .pipes
+                        .get_mut(pipe_idx)
+                        .and_then(|p| p.as_mut())
+                        .ok_or(Errno::EBADF)?;
+                    if !pipe.is_read_end_open() {
+                        proc.signals.raise(wasm_posix_shared::signal::SIGPIPE);
+                        return Err(Errno::EPIPE);
+                    }
+                    let n = pipe.write(buf);
+                    if n > 0 {
+                        return Ok(n);
+                    }
+                    if status_flags & O_NONBLOCK != 0 {
+                        return Err(Errno::EAGAIN);
+                    }
+                    // Block: check for signals then sleep 1ms
+                    if proc.signals.deliverable() != 0 {
+                        return Err(Errno::EINTR);
+                    }
+                    let _ = host.host_nanosleep(0, 1_000_000);
                 }
-                let n = pipe.write(buf);
-                if n == 0 && status_flags & O_NONBLOCK != 0 {
-                    return Err(Errno::EAGAIN);
-                }
-                Ok(n)
             }
         }
         FileType::Socket => {
@@ -255,20 +283,28 @@ pub fn sys_write(
                 return Err(Errno::EPIPE);
             }
             let send_buf_idx = sock.send_buf_idx.ok_or(Errno::ENOTCONN)?;
-            let pipe = proc
-                .pipes
-                .get_mut(send_buf_idx)
-                .and_then(|p| p.as_mut())
-                .ok_or(Errno::EBADF)?;
-            if !pipe.is_read_end_open() {
-                proc.signals.raise(wasm_posix_shared::signal::SIGPIPE);
-                return Err(Errno::EPIPE);
+            loop {
+                let pipe = proc
+                    .pipes
+                    .get_mut(send_buf_idx)
+                    .and_then(|p| p.as_mut())
+                    .ok_or(Errno::EBADF)?;
+                if !pipe.is_read_end_open() {
+                    proc.signals.raise(wasm_posix_shared::signal::SIGPIPE);
+                    return Err(Errno::EPIPE);
+                }
+                let n = pipe.write(buf);
+                if n > 0 {
+                    return Ok(n);
+                }
+                if status_flags & O_NONBLOCK != 0 {
+                    return Err(Errno::EAGAIN);
+                }
+                if proc.signals.deliverable() != 0 {
+                    return Err(Errno::EINTR);
+                }
+                let _ = host.host_nanosleep(0, 1_000_000);
             }
-            let n = pipe.write(buf);
-            if n == 0 && status_flags & O_NONBLOCK != 0 {
-                return Err(Errno::EAGAIN);
-            }
-            Ok(n)
         }
         _ => {
             // O_APPEND: seek to end before writing (POSIX atomicity for single-process)
@@ -4448,6 +4484,39 @@ mod tests {
         // Next write should get EAGAIN
         let result = sys_write(&mut proc, &mut host, write_fd, b"x");
         assert_eq!(result, Err(Errno::EAGAIN));
+    }
+
+    #[test]
+    fn test_blocking_pipe_read_eintr_on_signal() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let (read_fd, _write_fd) = sys_pipe(&mut proc).unwrap();
+        // Don't set O_NONBLOCK — default is blocking
+
+        // Raise a signal so the blocking read returns EINTR
+        proc.signals.raise(wasm_posix_shared::signal::SIGTERM);
+
+        let mut buf = [0u8; 16];
+        let result = sys_read(&mut proc, &mut host, read_fd, &mut buf);
+        assert_eq!(result, Err(Errno::EINTR));
+    }
+
+    #[test]
+    fn test_blocking_pipe_write_eintr_on_signal() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let (_read_fd, write_fd) = sys_pipe(&mut proc).unwrap();
+        // Fill the pipe buffer
+        let big = [0u8; 65536];
+        let n = sys_write(&mut proc, &mut host, write_fd, &big).unwrap();
+        assert_eq!(n, 65536);
+        // Don't set O_NONBLOCK — default is blocking
+
+        // Raise a signal so the blocking write returns EINTR
+        proc.signals.raise(wasm_posix_shared::signal::SIGTERM);
+
+        let result = sys_write(&mut proc, &mut host, write_fd, b"x");
+        assert_eq!(result, Err(Errno::EINTR));
     }
 
     // ---- umask tests ----
