@@ -1365,7 +1365,8 @@ pub extern "C" fn kernel_poll(fds_ptr: *mut u8, nfds: u32, timeout: i32) -> i32 
     let fds = unsafe {
         slice::from_raw_parts_mut(fds_ptr as *mut wasm_posix_shared::WasmPollFd, nfds as usize)
     };
-    match syscalls::sys_poll(proc, fds, timeout) {
+    let mut host = WasmHostIO;
+    match syscalls::sys_poll(proc, &mut host, fds, timeout) {
         Ok(n) => n,
         Err(e) => -(e as i32),
     }
@@ -1895,7 +1896,8 @@ pub extern "C" fn kernel_select(
         Some(unsafe { core::slice::from_raw_parts_mut(exceptfds_ptr, 128) })
     };
 
-    match syscalls::sys_select(proc, nfds, readfds, writefds, exceptfds, timeout_ms) {
+    let mut host = WasmHostIO;
+    match syscalls::sys_select(proc, &mut host, nfds, readfds, writefds, exceptfds, timeout_ms) {
         Ok(n) => n,
         Err(e) => -(e as i32),
     }

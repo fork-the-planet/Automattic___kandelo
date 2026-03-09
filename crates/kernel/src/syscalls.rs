@@ -1677,9 +1677,53 @@ pub fn sys_recvfrom(
 /// Poll file descriptors for I/O readiness.
 pub fn sys_poll(
     proc: &mut Process,
+    host: &mut dyn HostIO,
     fds: &mut [WasmPollFd],
-    _timeout_ms: i32,
+    timeout_ms: i32,
 ) -> Result<i32, Errno> {
+    // First non-blocking check
+    let ready = poll_check(proc, fds);
+    if ready > 0 || timeout_ms == 0 {
+        return Ok(ready);
+    }
+
+    // timeout_ms < 0 means wait indefinitely; > 0 means wait up to that many ms.
+    // Use polling loop with short sleeps (1ms intervals).
+    let deadline_ns: Option<u64> = if timeout_ms > 0 {
+        let (sec, nsec) = host.host_clock_gettime(1)?; // CLOCK_MONOTONIC
+        let now = sec as u64 * 1_000_000_000 + nsec as u64;
+        Some(now + (timeout_ms as u64) * 1_000_000)
+    } else {
+        None // infinite wait
+    };
+
+    loop {
+        // Check for pending signals — POSIX: poll is interruptible
+        if proc.signals.deliverable() != 0 {
+            return Err(Errno::EINTR);
+        }
+
+        // Sleep 1ms
+        let _ = host.host_nanosleep(0, 1_000_000);
+
+        let ready = poll_check(proc, fds);
+        if ready > 0 {
+            return Ok(ready);
+        }
+
+        // Check deadline
+        if let Some(dl) = deadline_ns {
+            let (sec, nsec) = host.host_clock_gettime(1)?;
+            let now = sec as u64 * 1_000_000_000 + nsec as u64;
+            if now >= dl {
+                return Ok(0); // Timeout expired, nothing ready
+            }
+        }
+    }
+}
+
+/// Single non-blocking pass checking fd readiness. Used by sys_poll's loop.
+fn poll_check(proc: &mut Process, fds: &mut [WasmPollFd]) -> i32 {
     use wasm_posix_shared::poll::*;
 
     let mut ready_count = 0i32;
@@ -1775,7 +1819,7 @@ pub fn sys_poll(
         }
     }
 
-    Ok(ready_count)
+    ready_count
 }
 
 /// Get current time in seconds since epoch.
@@ -2388,11 +2432,12 @@ pub fn sys_readlinkat(
 /// Each fd_set is FD_SETSIZE/8 = 128 bytes. Null sets are allowed.
 pub fn sys_select(
     proc: &mut Process,
+    host: &mut dyn HostIO,
     nfds: i32,
     mut readfds: Option<&mut [u8]>,
     mut writefds: Option<&mut [u8]>,
     mut exceptfds: Option<&mut [u8]>,
-    _timeout_ms: i32,
+    timeout_ms: i32,
 ) -> Result<i32, Errno> {
     use wasm_posix_shared::poll::{POLLIN, POLLOUT, POLLPRI, POLLERR, POLLHUP};
 
@@ -2430,8 +2475,8 @@ pub fn sys_select(
         }
     }
 
-    // Run poll
-    sys_poll(proc, &mut pollfds, 0)?;
+    // Run poll with timeout forwarded
+    sys_poll(proc, host, &mut pollfds, timeout_ms)?;
 
     // Clear the output fd_sets
     if let Some(ref mut s) = readfds { s[..nfds.div_ceil(8)].fill(0); }
@@ -3880,11 +3925,12 @@ mod tests {
     #[test]
     fn test_poll_regular_file_always_ready() {
         let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
         use wasm_posix_shared::WasmPollFd;
         use wasm_posix_shared::poll::*;
         // stdout (fd 1) should be ready for writing
         let mut pollfd = WasmPollFd { fd: 1, events: POLLOUT, revents: 0 };
-        let n = sys_poll(&mut proc, core::slice::from_mut(&mut pollfd), 0).unwrap();
+        let n = sys_poll(&mut proc, &mut host, core::slice::from_mut(&mut pollfd), 0).unwrap();
         assert_eq!(n, 1);
         assert_ne!(pollfd.revents & POLLOUT, 0);
     }
@@ -3899,7 +3945,7 @@ mod tests {
 
         // Pipe is empty — not readable yet
         let mut pollfd = WasmPollFd { fd: read_fd, events: POLLIN, revents: 0 };
-        let n = sys_poll(&mut proc, core::slice::from_mut(&mut pollfd), 0).unwrap();
+        let n = sys_poll(&mut proc, &mut host, core::slice::from_mut(&mut pollfd), 0).unwrap();
         assert_eq!(n, 0);
         assert_eq!(pollfd.revents, 0);
 
@@ -3908,7 +3954,7 @@ mod tests {
 
         // Now pipe should be readable
         let mut pollfd = WasmPollFd { fd: read_fd, events: POLLIN, revents: 0 };
-        let n = sys_poll(&mut proc, core::slice::from_mut(&mut pollfd), 0).unwrap();
+        let n = sys_poll(&mut proc, &mut host, core::slice::from_mut(&mut pollfd), 0).unwrap();
         assert_eq!(n, 1);
         assert_ne!(pollfd.revents & POLLIN, 0);
     }
@@ -3916,12 +3962,13 @@ mod tests {
     #[test]
     fn test_poll_pipe_writable() {
         let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
         use wasm_posix_shared::WasmPollFd;
         use wasm_posix_shared::poll::*;
         let (_read_fd, write_fd) = sys_pipe(&mut proc).unwrap();
 
         let mut pollfd = WasmPollFd { fd: write_fd, events: POLLOUT, revents: 0 };
-        let n = sys_poll(&mut proc, core::slice::from_mut(&mut pollfd), 0).unwrap();
+        let n = sys_poll(&mut proc, &mut host, core::slice::from_mut(&mut pollfd), 0).unwrap();
         assert_eq!(n, 1);
         assert_ne!(pollfd.revents & POLLOUT, 0);
     }
@@ -3937,7 +3984,7 @@ mod tests {
         sys_close(&mut proc, &mut host, write_fd).unwrap();
 
         let mut pollfd = WasmPollFd { fd: read_fd, events: POLLIN, revents: 0 };
-        let n = sys_poll(&mut proc, core::slice::from_mut(&mut pollfd), 0).unwrap();
+        let n = sys_poll(&mut proc, &mut host, core::slice::from_mut(&mut pollfd), 0).unwrap();
         assert_eq!(n, 1);
         assert_ne!(pollfd.revents & POLLHUP, 0);
     }
@@ -3945,10 +3992,11 @@ mod tests {
     #[test]
     fn test_poll_invalid_fd() {
         let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
         use wasm_posix_shared::WasmPollFd;
         use wasm_posix_shared::poll::*;
         let mut pollfd = WasmPollFd { fd: 99, events: POLLIN, revents: 0 };
-        let n = sys_poll(&mut proc, core::slice::from_mut(&mut pollfd), 0).unwrap();
+        let n = sys_poll(&mut proc, &mut host, core::slice::from_mut(&mut pollfd), 0).unwrap();
         assert_eq!(n, 1);
         assert_ne!(pollfd.revents & POLLNVAL, 0);
     }
@@ -3964,19 +4012,19 @@ mod tests {
 
         // Socket is writable (send buffer has space)
         let mut pollfd = WasmPollFd { fd: fd0, events: POLLOUT, revents: 0 };
-        let n = sys_poll(&mut proc, core::slice::from_mut(&mut pollfd), 0).unwrap();
+        let n = sys_poll(&mut proc, &mut host, core::slice::from_mut(&mut pollfd), 0).unwrap();
         assert_eq!(n, 1);
         assert_ne!(pollfd.revents & POLLOUT, 0);
 
         // Socket is not readable (no data yet)
         let mut pollfd = WasmPollFd { fd: fd0, events: POLLIN, revents: 0 };
-        let n = sys_poll(&mut proc, core::slice::from_mut(&mut pollfd), 0).unwrap();
+        let n = sys_poll(&mut proc, &mut host, core::slice::from_mut(&mut pollfd), 0).unwrap();
         assert_eq!(n, 0);
 
         // Write to fd1, now fd0 is readable
         sys_write(&mut proc, &mut host, fd1, b"x").unwrap();
         let mut pollfd = WasmPollFd { fd: fd0, events: POLLIN, revents: 0 };
-        let n = sys_poll(&mut proc, core::slice::from_mut(&mut pollfd), 0).unwrap();
+        let n = sys_poll(&mut proc, &mut host, core::slice::from_mut(&mut pollfd), 0).unwrap();
         assert_eq!(n, 1);
         assert_ne!(pollfd.revents & POLLIN, 0);
     }
@@ -3994,7 +4042,7 @@ mod tests {
             WasmPollFd { fd: 1, events: POLLOUT, revents: 0 },
             WasmPollFd { fd: fd0, events: POLLIN, revents: 0 },
         ];
-        let n = sys_poll(&mut proc, &mut pollfds, 0).unwrap();
+        let n = sys_poll(&mut proc, &mut host, &mut pollfds, 0).unwrap();
         assert_eq!(n, 1); // Only stdout ready
         assert_ne!(pollfds[0].revents & POLLOUT, 0);
         assert_eq!(pollfds[1].revents, 0);
@@ -4948,7 +4996,7 @@ mod tests {
         // Set fd 3 in readfds
         let mut readfds = [0u8; 128];
         readfds[0] = 0b1000; // bit 3
-        let result = sys_select(&mut proc, 4, Some(&mut readfds), None, None, 0);
+        let result = sys_select(&mut proc, &mut host, 4, Some(&mut readfds), None, None, 0);
         assert_eq!(result, Ok(1));
         assert_eq!(readfds[0] & 0b1000, 0b1000); // fd 3 still set
     }
@@ -4956,14 +5004,16 @@ mod tests {
     #[test]
     fn test_select_empty_sets() {
         let mut proc = Process::new(1);
-        let result = sys_select(&mut proc, 0, None, None, None, 0);
+        let mut host = MockHostIO::new();
+        let result = sys_select(&mut proc, &mut host, 0, None, None, None, 0);
         assert_eq!(result, Ok(0));
     }
 
     #[test]
     fn test_select_invalid_nfds() {
         let mut proc = Process::new(1);
-        let result = sys_select(&mut proc, -1, None, None, None, 0);
+        let mut host = MockHostIO::new();
+        let result = sys_select(&mut proc, &mut host, -1, None, None, None, 0);
         assert_eq!(result, Err(Errno::EINVAL));
     }
 
@@ -4981,7 +5031,7 @@ mod tests {
         let bit = rfd as usize % 8;
         readfds[byte] = 1 << bit;
 
-        let result = sys_select(&mut proc, rfd + 1, Some(&mut readfds), None, None, 0);
+        let result = sys_select(&mut proc, &mut host, rfd + 1, Some(&mut readfds), None, None, 0);
         assert_eq!(result, Ok(1));
         assert_ne!(readfds[byte] & (1 << bit), 0);
     }
@@ -4989,6 +5039,7 @@ mod tests {
     #[test]
     fn test_select_pipe_writable() {
         let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
 
         let (_rfd, wfd) = sys_pipe(&mut proc).unwrap();
 
@@ -4997,7 +5048,7 @@ mod tests {
         let bit = wfd as usize % 8;
         writefds[byte] = 1 << bit;
 
-        let result = sys_select(&mut proc, wfd + 1, None, Some(&mut writefds), None, 0);
+        let result = sys_select(&mut proc, &mut host, wfd + 1, None, Some(&mut writefds), None, 0);
         assert_eq!(result, Ok(1));
         assert_ne!(writefds[byte] & (1 << bit), 0);
     }
@@ -5015,7 +5066,7 @@ mod tests {
         readfds[fd2 as usize / 8] |= 1 << (fd2 as usize % 8);
 
         let max_fd = core::cmp::max(fd1, fd2) + 1;
-        let result = sys_select(&mut proc, max_fd, Some(&mut readfds), None, None, 0);
+        let result = sys_select(&mut proc, &mut host, max_fd, Some(&mut readfds), None, None, 0);
         assert_eq!(result, Ok(2));
     }
 
