@@ -10,6 +10,7 @@
 //! - CWD (variable): current working directory bytes
 //! - Rlimits (256 bytes): 16 pairs of u64
 //! - Terminal (56 bytes): flags, control chars, window size
+//! - Program break (4 bytes): current brk value
 
 extern crate alloc;
 
@@ -29,7 +30,7 @@ use crate::terminal::{TerminalState, WinSize, NCCS};
 
 const FORK_MAGIC: u32 = 0x464F524B; // "FORK"
 const EXEC_MAGIC: u32 = 0x45584543; // "EXEC"
-const FORK_VERSION: u32 = 1;
+const FORK_VERSION: u32 = 2;
 
 // ── Writer helper ───────────────────────────────────────────────────────────
 
@@ -303,6 +304,9 @@ pub fn serialize_fork_state(proc: &Process, buf: &mut [u8]) -> Result<usize, Err
     w.write_u16(proc.terminal.winsize.ws_xpixel)?;
     w.write_u16(proc.terminal.winsize.ws_ypixel)?;
 
+    // ── Program break ──
+    w.write_u32(proc.memory.get_brk())?;
+
     // ── Patch total_size ──
     let total = w.pos as u32;
     w.patch_u32(total_size_offset, total);
@@ -450,6 +454,11 @@ pub fn deserialize_fork_state(buf: &[u8], child_pid: u32) -> Result<Process, Err
         },
     };
 
+    // ── Program break ──
+    let program_break = r.read_u32()?;
+    let mut memory = MemoryManager::new();
+    memory.set_brk(program_break);
+
     Ok(Process {
         pid: child_pid,
         ppid,
@@ -469,7 +478,7 @@ pub fn deserialize_fork_state(buf: &[u8], child_pid: u32) -> Result<Process, Err
         cwd,
         dir_streams: Vec::new(),
         signals,
-        memory: MemoryManager::new(),
+        memory,
         terminal,
         environ,
         umask,
@@ -590,6 +599,9 @@ pub fn serialize_exec_state(proc: &Process, buf: &mut [u8]) -> Result<usize, Err
     w.write_u16(proc.terminal.winsize.ws_col)?;
     w.write_u16(proc.terminal.winsize.ws_xpixel)?;
     w.write_u16(proc.terminal.winsize.ws_ypixel)?;
+
+    // ── Program break ──
+    w.write_u32(proc.memory.get_brk())?;
 
     // ── Patch total_size ──
     let total = w.pos as u32;
@@ -738,6 +750,11 @@ pub fn deserialize_exec_state(buf: &[u8], pid: u32) -> Result<Process, Errno> {
         },
     };
 
+    // ── Program break ──
+    let program_break = r.read_u32()?;
+    let mut memory = MemoryManager::new();
+    memory.set_brk(program_break);
+
     Ok(Process {
         pid,
         ppid,
@@ -757,7 +774,7 @@ pub fn deserialize_exec_state(buf: &[u8], pid: u32) -> Result<Process, Errno> {
         cwd,
         dir_streams: Vec::new(),
         signals,
-        memory: MemoryManager::new(),
+        memory,
         terminal,
         environ,
         umask,
@@ -944,5 +961,29 @@ mod tests {
         let restored = deserialize_exec_state(&buf[..written], 5).unwrap();
 
         assert_eq!(restored.ppid, 3); // ppid preserved
+    }
+
+    #[test]
+    fn test_fork_inherits_program_break() {
+        let mut proc = Process::new(1);
+        proc.memory.set_brk(0x02000000); // move brk past default
+
+        let mut buf = vec![0u8; 64 * 1024];
+        let written = serialize_fork_state(&proc, &mut buf).unwrap();
+        let child = deserialize_fork_state(&buf[..written], 42).unwrap();
+
+        assert_eq!(child.memory.get_brk(), 0x02000000);
+    }
+
+    #[test]
+    fn test_exec_inherits_program_break() {
+        let mut proc = Process::new(1);
+        proc.memory.set_brk(0x02000000);
+
+        let mut buf = vec![0u8; 64 * 1024];
+        let written = serialize_exec_state(&proc, &mut buf).unwrap();
+        let child = deserialize_exec_state(&buf[..written], 1).unwrap();
+
+        assert_eq!(child.memory.get_brk(), 0x02000000);
     }
 }
