@@ -281,6 +281,7 @@ pub enum Errno {
     ENFILE = 23,
     EMFILE = 24,
     ENOTTY = 25,
+    EFBIG = 27,
     ENOSPC = 28,
     ESPIPE = 29,
     EROFS = 30,
@@ -335,6 +336,7 @@ impl Errno {
             23 => Some(Errno::ENFILE),
             24 => Some(Errno::EMFILE),
             25 => Some(Errno::ENOTTY),
+            27 => Some(Errno::EFBIG),
             28 => Some(Errno::ENOSPC),
             29 => Some(Errno::ESPIPE),
             30 => Some(Errno::EROFS),
@@ -619,6 +621,8 @@ pub mod signal {
     pub const SIGCONT: u32 = 18;
     pub const SIGSTOP: u32 = 19;
     pub const SIGTSTP: u32 = 20;
+    pub const SIGXCPU: u32 = 24;
+    pub const SIGXFSZ: u32 = 25;
     pub const SIGWINCH: u32 = 28;
 
     // Maximum signal number

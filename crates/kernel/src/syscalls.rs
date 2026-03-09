@@ -278,6 +278,16 @@ pub fn sys_write(
                     ofd.offset = end;
                 }
             }
+            // RLIMIT_FSIZE: check if write would exceed file size limit
+            let fsize_limit = proc.rlimits[1][0]; // RLIMIT_FSIZE soft limit
+            if fsize_limit != u64::MAX {
+                let current_offset = proc.ofd_table.get(ofd_idx).map_or(0, |o| o.offset);
+                let end_pos = current_offset as u64 + buf.len() as u64;
+                if end_pos > fsize_limit {
+                    proc.signals.raise(wasm_posix_shared::signal::SIGXFSZ);
+                    return Err(Errno::EFBIG);
+                }
+            }
             let n = host.host_write(host_handle, buf)?;
             if let Some(ofd) = proc.ofd_table.get_mut(ofd_idx) {
                 ofd.offset += n as i64;
@@ -4754,6 +4764,29 @@ mod tests {
         // fd 5 should fail with EMFILE
         let result = sys_open(&mut proc, &mut host, b"/tmp/c", O_RDWR | O_CREAT, 0o644);
         assert_eq!(result, Err(Errno::EMFILE));
+    }
+
+    #[test]
+    fn test_rlimit_fsize_enforced() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+
+        // Open a file for writing
+        let fd = sys_open(&mut proc, &mut host, b"/tmp/fsize_test", O_WRONLY | O_CREAT, 0o644).unwrap();
+
+        // Set RLIMIT_FSIZE to 10 bytes
+        sys_setrlimit(&mut proc, 1, 10, 10).unwrap(); // resource 1 = RLIMIT_FSIZE
+
+        // Writing 5 bytes at offset 0 should succeed (end_pos=5 <= 10)
+        let result = sys_write(&mut proc, &mut host, fd, &[1, 2, 3, 4, 5]);
+        assert!(result.is_ok());
+
+        // Writing 10 more bytes should fail (end_pos=15 > 10) with EFBIG
+        let result = sys_write(&mut proc, &mut host, fd, &[0u8; 10]);
+        assert_eq!(result, Err(Errno::EFBIG));
+
+        // SIGXFSZ should have been raised
+        assert_ne!(proc.signals.deliverable(), 0);
     }
 
     #[test]
