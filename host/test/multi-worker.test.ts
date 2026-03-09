@@ -184,6 +184,53 @@ describe("Cross-Process Signal Delivery", () => {
   }, 15_000);
 });
 
+describe("Exec", () => {
+  it("should exec a process with same binary", async () => {
+    const pm = new ProcessManager({
+      wasmBytes: loadWasmBytes(),
+      kernelConfig: {
+        maxWorkers: 4,
+        dataBufferSize: 65536,
+        useSharedMemory: false,
+      },
+      workerAdapter: new NodeWorkerAdapter(),
+    });
+
+    const pid = await pm.spawn();
+
+    // Exec with same binary (since we only have one)
+    await pm.exec(pid, loadWasmBytes());
+
+    // Process should still be tracked with same PID
+    const info = pm.getProcess(pid);
+    expect(info).toBeDefined();
+    expect(info!.pid).toBe(pid);
+
+    await pm.terminate(pid);
+  }, 15_000);
+
+  it("should maintain process count after exec", async () => {
+    const pm = new ProcessManager({
+      wasmBytes: loadWasmBytes(),
+      kernelConfig: {
+        maxWorkers: 4,
+        dataBufferSize: 65536,
+        useSharedMemory: false,
+      },
+      workerAdapter: new NodeWorkerAdapter(),
+    });
+
+    const pid = await pm.spawn();
+    const countBefore = pm.getProcessCount();
+
+    await pm.exec(pid, loadWasmBytes());
+
+    expect(pm.getProcessCount()).toBe(countBefore);
+
+    await pm.terminate(pid);
+  }, 15_000);
+});
+
 describe("Cross-Process Pipe Integration", () => {
   it("should fork a process with pipe conversion support active", async () => {
     const pm = new ProcessManager({
