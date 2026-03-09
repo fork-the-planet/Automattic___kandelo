@@ -69,7 +69,7 @@ This document tracks the implementation status of POSIX APIs in the wasm-posix-k
 | Function | Status | Notes |
 |----------|--------|-------|
 | `fork()` | Partial | Host-side ProcessManager.fork() serializes kernel state from parent worker, deserializes in child worker. Binary format covers process scalars, FD/OFD tables, signals, environment, CWD, rlimits, terminal. No Wasm-internal fork syscall yet (host-initiated only). |
-| `exec()` | Planned | Load new Wasm module into existing process context. Deferred to Phase 13e. |
+| `exec()` | Partial | Replaces process image with new Wasm binary in same worker. Preserves PID, open fds (closes CLOEXEC), environment, CWD, signal mask. Resets caught handlers to default (SIG_IGN preserved). Host-initiated via ProcessManager.exec() and kernel-initiated via host_exec import. |
 | `waitpid()` | Partial | Host-side ProcessManager.waitpid() with WNOHANG support. Reaps zombie processes. No Wasm-internal waitpid syscall yet (host-initiated only). |
 | `exit()` / `_exit()` | Partial | Closes all fds and dir streams, sets ProcessState::Exited. No parent notification yet (needs waitpid). |
 | `getpid()` | Full | Returns pid from Process struct. |
@@ -242,3 +242,9 @@ These features require SharedArrayBuffer (and cross-origin isolation headers in 
 - host_kill Wasm import with cross-process routing in sys_kill
 - DeliverSignalMessage protocol and ProcessManager.deliverSignal()
 - KillRequestMessage: worker → host → target worker signal routing
+13e. **Phase 13e (Complete):** Exec
+- Exec state serialization: CLOEXEC fd filtering, signal handler reset, pending preservation
+- kernel_get_exec_state / kernel_init_from_exec Wasm exports
+- host_exec Wasm import and sys_execve syscall
+- Worker re-initialization: new kernel instance with exec state in same worker
+- ProcessManager.exec() for host-initiated exec
