@@ -959,8 +959,10 @@ pub fn sys_getsid(proc: &Process, pid: u32) -> Result<u32, Errno> {
 
 /// setsid -- create session and set process group ID.
 pub fn sys_setsid(proc: &mut Process) -> Result<u32, Errno> {
-    // In a real OS, would fail if already session leader
-    // In our single-process environment, always succeeds
+    // POSIX: fail with EPERM if the calling process is already a session leader
+    if proc.sid == proc.pid {
+        return Err(Errno::EPERM);
+    }
     proc.sid = proc.pid;
     proc.pgid = proc.pid;
     Ok(proc.sid)
@@ -4805,12 +4807,22 @@ mod tests {
 
     #[test]
     fn test_setsid() {
-        let mut proc = Process::new(1);
-        proc.pgid = 42; // Change pgid first
+        // Simulate a child process (pid=2) that inherited parent's session (sid=1)
+        let mut proc = Process::new(2);
+        proc.sid = 1;
+        proc.pgid = 1;
         let result = sys_setsid(&mut proc);
-        assert_eq!(result, Ok(1)); // Returns pid
-        assert_eq!(proc.sid, 1);
-        assert_eq!(proc.pgid, 1);
+        assert_eq!(result, Ok(2)); // Returns new session id == pid
+        assert_eq!(proc.sid, 2);
+        assert_eq!(proc.pgid, 2);
+    }
+
+    #[test]
+    fn test_setsid_already_leader_fails() {
+        let mut proc = Process::new(1);
+        // pid == sid, so already a session leader
+        let result = sys_setsid(&mut proc);
+        assert_eq!(result, Err(Errno::EPERM));
     }
 
     // ---- Phase 12: Remaining *at() variants ----
