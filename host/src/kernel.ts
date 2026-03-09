@@ -24,6 +24,7 @@ const WASM_DIRENT_SIZE = 16;
 
 export interface KernelCallbacks {
   onKill?: (pid: number, signal: number) => number;
+  onExec?: (path: string) => number;
 }
 
 export class WasmPosixKernel {
@@ -223,8 +224,8 @@ export class WasmPosixKernel {
         host_kill: (pid: number, sig: number): number => {
           return this.hostKill(pid, sig);
         },
-        host_exec: (_pathPtr: number, _pathLen: number): number => {
-          return -2; // -ENOENT stub
+        host_exec: (pathPtr: number, pathLen: number): number => {
+          return this.hostExec(pathPtr, pathLen);
         },
       },
     };
@@ -1115,6 +1116,17 @@ export class WasmPosixKernel {
       return this.callbacks.onKill(pid, sig);
     }
     return -3; // -ESRCH: no callback means can't reach other processes
+  }
+
+  // ---- Phase 13e: Exec ----
+
+  private hostExec(pathPtr: number, pathLen: number): number {
+    if (this.callbacks.onExec) {
+      const mem = this.getMemoryBuffer();
+      const path = new TextDecoder().decode(mem.slice(pathPtr, pathPtr + pathLen));
+      return this.callbacks.onExec(path);
+    }
+    return -2; // -ENOENT
   }
 
   // ---- Public API: Socket & Poll operations ----

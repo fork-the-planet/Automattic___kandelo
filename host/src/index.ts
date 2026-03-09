@@ -19,4 +19,7 @@ export type {
   ConvertPipeMessage,
   DeliverSignalMessage,
   KillRequestMessage,
+  ExecRequestMessage,
+  ExecReplyMessage,
+  ExecCompleteMessage,
 } from "./worker-protocol";

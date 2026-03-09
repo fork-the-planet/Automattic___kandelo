@@ -8,7 +8,8 @@ export type HostToWorkerMessage =
   | GetForkStateMessage
   | RegisterPipeMessage
   | ConvertPipeMessage
-  | DeliverSignalMessage;
+  | DeliverSignalMessage
+  | ExecReplyMessage;
 
 export interface GetForkStateMessage {
   type: "get_fork_state";
@@ -54,7 +55,9 @@ export type WorkerToHostMessage =
   | WorkerExitMessage
   | WorkerErrorMessage
   | ForkStateMessage
-  | KillRequestMessage;
+  | KillRequestMessage
+  | ExecRequestMessage
+  | ExecCompleteMessage;
 
 export interface WorkerReadyMessage {
   type: "ready";
@@ -84,4 +87,20 @@ export interface KillRequestMessage {
   pid: number;
   signal: number;
   sourcePid: number;
+}
+
+export interface ExecRequestMessage {
+  type: "exec_request";
+  pid: number;
+  path: string;
+}
+
+export interface ExecCompleteMessage {
+  type: "exec_complete";
+  pid: number;
+}
+
+export interface ExecReplyMessage {
+  type: "exec_reply";
+  wasmBytes: ArrayBuffer;
 }

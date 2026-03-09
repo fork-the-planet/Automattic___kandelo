@@ -1,6 +1,7 @@
 // host/src/worker-entry.ts
 import { parentPort, workerData } from "node:worker_threads";
 import { WasmPosixKernel } from "./kernel";
+import type { KernelCallbacks } from "./kernel";
 import { NodePlatformIO } from "./platform/node";
 import type {
   WorkerInitMessage,
@@ -9,6 +10,7 @@ import type {
   RegisterPipeMessage,
   ConvertPipeMessage,
   DeliverSignalMessage,
+  ExecReplyMessage,
 } from "./worker-protocol";
 
 interface MessagePort {
@@ -21,7 +23,7 @@ export async function workerMain(
   initData: WorkerInitMessage,
 ): Promise<void> {
   try {
-    const kernel = new WasmPosixKernel(initData.kernelConfig, new NodePlatformIO(), {
+    const callbacks: KernelCallbacks = {
       onKill: (pid: number, signal: number): number => {
         port.postMessage({
           type: "kill_request",
@@ -31,10 +33,20 @@ export async function workerMain(
         } satisfies WorkerToHostMessage);
         return 0; // fire-and-forget from kernel's perspective
       },
-    });
+      onExec: (path: string): number => {
+        port.postMessage({
+          type: "exec_request",
+          pid: initData.pid,
+          path,
+        } satisfies WorkerToHostMessage);
+        return 0;
+      },
+    };
+
+    let kernel = new WasmPosixKernel(initData.kernelConfig, new NodePlatformIO(), callbacks);
     await kernel.init(initData.wasmBytes);
 
-    const instance = kernel.getInstance()!;
+    let instance = kernel.getInstance()!;
 
     if (initData.forkState) {
       // Fork init: write fork state to Wasm memory and call kernel_init_from_fork
@@ -122,6 +134,73 @@ export async function workerMain(
           const deliverFn = instance.exports.kernel_deliver_signal as
             (sig: number) => number;
           deliverFn(m.signal);
+          break;
+        }
+        case "exec_reply": {
+          (async () => {
+            try {
+              const msg = m as ExecReplyMessage;
+              // 1. Get exec state from current kernel
+              const memory = kernel.getMemory()!;
+              const EXEC_BUF_PAGES = 16; // 1MB buffer
+              const startPage = memory.grow(EXEC_BUF_PAGES);
+              const bufPtr = startPage * 65536;
+              const bufSize = EXEC_BUF_PAGES * 65536;
+
+              const getExecState = instance.exports.kernel_get_exec_state as
+                (ptr: number, len: number) => number;
+              const written = getExecState(bufPtr, bufSize);
+              if (written < 0) {
+                port.postMessage({
+                  type: "error",
+                  pid: initData.pid,
+                  message: `kernel_get_exec_state failed: ${written}`,
+                } satisfies WorkerToHostMessage);
+                return;
+              }
+              const execState = new Uint8Array(memory.buffer, bufPtr, written).slice();
+
+              // 2. Create new kernel with new binary
+              const newKernel = new WasmPosixKernel(initData.kernelConfig, new NodePlatformIO(), callbacks);
+              await newKernel.init(msg.wasmBytes);
+              const newInstance = newKernel.getInstance()!;
+              const newMemory = newKernel.getMemory()!;
+
+              // 3. Write exec state to new kernel memory and init
+              const pages = Math.ceil(execState.byteLength / 65536) + 1;
+              const sp = newMemory.grow(pages);
+              const bp = sp * 65536;
+              new Uint8Array(newMemory.buffer, bp, execState.byteLength).set(execState);
+
+              const initFromExec = newInstance.exports.kernel_init_from_exec as
+                (ptr: number, len: number, pid: number) => number;
+              const result = initFromExec(bp, execState.byteLength, initData.pid);
+              if (result < 0) {
+                port.postMessage({
+                  type: "error",
+                  pid: initData.pid,
+                  message: `kernel_init_from_exec failed: ${result}`,
+                } satisfies WorkerToHostMessage);
+                return;
+              }
+
+              // 4. Replace references
+              kernel = newKernel;
+              instance = newInstance;
+
+              // 5. Notify host
+              port.postMessage({
+                type: "exec_complete",
+                pid: initData.pid,
+              } satisfies WorkerToHostMessage);
+            } catch (err) {
+              port.postMessage({
+                type: "error",
+                pid: initData.pid,
+                message: `exec failed: ${err instanceof Error ? err.message : String(err)}`,
+              } satisfies WorkerToHostMessage);
+            }
+          })();
           break;
         }
       }
