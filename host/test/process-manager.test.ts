@@ -501,6 +501,112 @@ describe("ProcessManager kill_request handling", () => {
   });
 });
 
+describe("ProcessManager.exec()", () => {
+  it("should send exec_reply to worker", async () => {
+    const { pm, adapter } = createTestPM();
+    const spawnPromise = pm.spawn();
+    adapter.lastWorker!.simulateMessage({ type: "ready", pid: 1 });
+    const pid = await spawnPromise;
+
+    const worker = adapter.lastWorker!;
+
+    // Start exec (will wait for exec_complete, so we need to simulate it)
+    const execPromise = pm.exec(pid, new ArrayBuffer(8));
+
+    // Simulate exec_complete from worker
+    worker.simulateMessage({ type: "exec_complete", pid });
+
+    await execPromise;
+
+    // Verify exec_reply was sent to worker
+    const execMsgs = worker.sentMessages.filter((m: any) => m.type === "exec_reply");
+    expect(execMsgs).toHaveLength(1);
+    expect((execMsgs[0] as any).wasmBytes).toBeInstanceOf(ArrayBuffer);
+  });
+
+  it("should throw for non-running process", async () => {
+    const { pm } = createTestPM();
+    await expect(pm.exec(999, new ArrayBuffer(0))).rejects.toThrow();
+  });
+
+  it("should throw for zombie process", async () => {
+    const { pm, adapter } = createTestPM();
+    const spawnPromise = pm.spawn();
+    adapter.lastWorker!.simulateMessage({ type: "ready", pid: 1 });
+    await spawnPromise;
+
+    // Transition to zombie
+    adapter.lastWorker!.simulateMessage({ type: "exit", pid: 1, status: 0 });
+
+    await expect(pm.exec(1, new ArrayBuffer(0))).rejects.toThrow(
+      "Cannot exec process 1: not running"
+    );
+  });
+
+  it("should reject if worker sends error during exec", async () => {
+    const { pm, adapter } = createTestPM();
+    const spawnPromise = pm.spawn();
+    adapter.lastWorker!.simulateMessage({ type: "ready", pid: 1 });
+    await spawnPromise;
+
+    const worker = adapter.lastWorker!;
+    const execPromise = pm.exec(1, new ArrayBuffer(8));
+
+    // Simulate error from worker
+    worker.simulateMessage({ type: "error", pid: 1, message: "exec failed" });
+
+    await expect(execPromise).rejects.toThrow("exec failed");
+  });
+
+  it("should handle exec_request from worker in spawn", async () => {
+    const { pm, adapter } = createTestPM();
+    const spawnPromise = pm.spawn();
+    adapter.lastWorker!.simulateMessage({ type: "ready", pid: 1 });
+    await spawnPromise;
+
+    const worker = adapter.lastWorker!;
+
+    // Simulate exec_request from worker
+    worker.simulateMessage({ type: "exec_request", pid: 1, path: "/bin/ls" });
+
+    // Verify exec_reply was sent back
+    const execMsgs = worker.sentMessages.filter((m: any) => m.type === "exec_reply");
+    expect(execMsgs).toHaveLength(1);
+    expect((execMsgs[0] as any).wasmBytes).toBeInstanceOf(ArrayBuffer);
+  });
+
+  it("should handle exec_request from forked worker", async () => {
+    const { pm, adapter } = createTestPM();
+
+    // Spawn parent
+    const spawnPromise = pm.spawn();
+    adapter.lastWorker!.simulateMessage({ type: "ready", pid: 1 });
+    await spawnPromise;
+    const parentWorker = adapter.lastWorker!;
+
+    // Fork parent
+    const forkPromise = pm.fork(1);
+    parentWorker.simulateMessage({
+      type: "fork_state",
+      pid: 1,
+      data: new ArrayBuffer(64),
+    });
+    await Promise.resolve();
+
+    const childWorker = adapter.lastWorker!;
+    childWorker.simulateMessage({ type: "ready", pid: 2 });
+    await forkPromise;
+
+    // Simulate exec_request from child worker
+    childWorker.simulateMessage({ type: "exec_request", pid: 2, path: "/bin/sh" });
+
+    // Verify exec_reply was sent back to the child
+    const execMsgs = childWorker.sentMessages.filter((m: any) => m.type === "exec_reply");
+    expect(execMsgs).toHaveLength(1);
+    expect((execMsgs[0] as any).wasmBytes).toBeInstanceOf(ArrayBuffer);
+  });
+});
+
 describe("ProcessManager.waitpid()", () => {
   it("should return immediately for already-exited child", async () => {
     const { pm, adapter } = createTestPM();

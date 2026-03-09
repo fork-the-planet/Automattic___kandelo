@@ -116,6 +116,15 @@ export class ProcessManager {
               // Target doesn't exist — ESRCH, but caller already returned 0
             }
             break;
+          case "exec_request": {
+            // Load binary — for now use same kernel binary.
+            // In the future, resolve path to different binary.
+            const wasmBytes = this.config.wasmBytes;
+            info.worker.postMessage(
+              { type: "exec_reply", wasmBytes: wasmBytes.slice(0) },
+            );
+            break;
+          }
         }
       });
 
@@ -265,6 +274,15 @@ export class ProcessManager {
               // Target doesn't exist — ESRCH, but caller already returned 0
             }
             break;
+          case "exec_request": {
+            // Load binary — for now use same kernel binary.
+            // In the future, resolve path to different binary.
+            const wasmBytes = this.config.wasmBytes;
+            childInfo.worker.postMessage(
+              { type: "exec_reply", wasmBytes: wasmBytes.slice(0) },
+            );
+            break;
+          }
         }
       });
 
@@ -396,6 +414,37 @@ export class ProcessManager {
         this.processes.delete(targetPid);
         resolve({ pid: targetPid, status: code });
       });
+    });
+  }
+
+  async exec(pid: number, wasmBytes: ArrayBuffer): Promise<void> {
+    const info = this.processes.get(pid);
+    if (!info || info.state !== "running") {
+      throw new Error(`Cannot exec process ${pid}: not running`);
+    }
+
+    info.worker.postMessage({ type: "exec_reply", wasmBytes: wasmBytes.slice(0) });
+
+    return new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        info.worker.off("message", handler);
+        reject(new Error(`Exec timed out for process ${pid}`));
+      }, 10_000);
+
+      const handler = (msg: unknown) => {
+        const m = msg as WorkerToHostMessage;
+        if (m.type === "exec_complete" && m.pid === pid) {
+          clearTimeout(timeout);
+          info.worker.off("message", handler);
+          resolve();
+        } else if (m.type === "error" && m.pid === pid) {
+          clearTimeout(timeout);
+          info.worker.off("message", handler);
+          reject(new Error(m.message));
+        }
+      };
+
+      info.worker.on("message", handler);
     });
   }
 
