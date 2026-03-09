@@ -103,9 +103,9 @@ impl Process {
         use wasm_posix_shared::flags::{O_RDONLY, O_WRONLY};
 
         let mut ofd_table = OfdTable::new();
-        ofd_table.create(FileType::CharDevice, O_RDONLY, 0); // OFD 0 = stdin
-        ofd_table.create(FileType::CharDevice, O_WRONLY, 1); // OFD 1 = stdout
-        ofd_table.create(FileType::CharDevice, O_WRONLY, 2); // OFD 2 = stderr
+        ofd_table.create(FileType::CharDevice, O_RDONLY, 0, b"/dev/stdin".to_vec()); // OFD 0 = stdin
+        ofd_table.create(FileType::CharDevice, O_WRONLY, 1, b"/dev/stdout".to_vec()); // OFD 1 = stdout
+        ofd_table.create(FileType::CharDevice, O_WRONLY, 2, b"/dev/stderr".to_vec()); // OFD 2 = stderr
 
         let mut fd_table = FdTable::new();
         fd_table.preopen_stdio(); // fds 0,1,2 → OFD refs 0,1,2

@@ -34,7 +34,8 @@ pub fn sys_open(
     } else {
         mode
     };
-    let host_handle = host.host_open(path, oflags, effective_mode)?;
+    let resolved = crate::path::resolve_path(path, &proc.cwd);
+    let host_handle = host.host_open(&resolved, oflags, effective_mode)?;
 
     let file_type = if oflags & O_DIRECTORY != 0 {
         FileType::Directory
@@ -45,7 +46,7 @@ pub fn sys_open(
     // Status flags = oflags minus creation-only flags
     let status_flags = oflags & !CREATION_FLAGS;
 
-    let ofd_idx = proc.ofd_table.create(file_type, status_flags, host_handle);
+    let ofd_idx = proc.ofd_table.create(file_type, status_flags, host_handle, resolved);
 
     let fd_flags = if oflags & O_CLOEXEC != 0 {
         FD_CLOEXEC
@@ -539,8 +540,8 @@ pub fn sys_pipe(proc: &mut Process) -> Result<(i32, i32), Errno> {
     let pipe_handle = -((pipe_idx as i64) + 1);
 
     // Create two OFDs: read end (O_RDONLY) and write end (O_WRONLY).
-    let read_ofd = proc.ofd_table.create(FileType::Pipe, O_RDONLY, pipe_handle);
-    let write_ofd = proc.ofd_table.create(FileType::Pipe, O_WRONLY, pipe_handle);
+    let read_ofd = proc.ofd_table.create(FileType::Pipe, O_RDONLY, pipe_handle, b"/dev/pipe".to_vec());
+    let write_ofd = proc.ofd_table.create(FileType::Pipe, O_WRONLY, pipe_handle, b"/dev/pipe".to_vec());
 
     // Allocate two fds.
     let read_fd = match proc.fd_table.alloc(OpenFileDescRef(read_ofd), 0) {
@@ -1414,7 +1415,7 @@ pub fn sys_socket(
         status_flags |= O_NONBLOCK;
     }
     let host_handle = -((sock_idx as i64) + 1);
-    let ofd_idx = proc.ofd_table.create(FileType::Socket, status_flags, host_handle);
+    let ofd_idx = proc.ofd_table.create(FileType::Socket, status_flags, host_handle, b"/dev/socket".to_vec());
 
     let fd_flags = if sock_type & SOCK_CLOEXEC != 0 {
         FD_CLOEXEC
@@ -1480,8 +1481,8 @@ pub fn sys_socketpair(
 
     let handle_a = -((sock_a_idx as i64) + 1);
     let handle_b = -((sock_b_idx as i64) + 1);
-    let ofd_a = proc.ofd_table.create(FileType::Socket, status_flags, handle_a);
-    let ofd_b = proc.ofd_table.create(FileType::Socket, status_flags, handle_b);
+    let ofd_a = proc.ofd_table.create(FileType::Socket, status_flags, handle_a, b"/dev/socket".to_vec());
+    let ofd_b = proc.ofd_table.create(FileType::Socket, status_flags, handle_b, b"/dev/socket".to_vec());
 
     let fd_flags = if sock_type & SOCK_CLOEXEC != 0 {
         FD_CLOEXEC
@@ -1991,6 +1992,33 @@ pub fn sys_usleep(
     host.host_nanosleep(sec, nsec)
 }
 
+/// Resolve a path relative to a directory fd.
+/// - Absolute paths: returned as-is (dirfd ignored)
+/// - AT_FDCWD: resolved relative to cwd
+/// - Real dirfd: resolved relative to the directory's stored path
+fn resolve_at_path(
+    proc: &Process,
+    dirfd: i32,
+    path: &[u8],
+) -> Result<alloc::vec::Vec<u8>, Errno> {
+    use wasm_posix_shared::flags::AT_FDCWD;
+
+    if !path.is_empty() && path[0] == b'/' {
+        return Ok(path.to_vec());
+    }
+    if dirfd == AT_FDCWD {
+        return Ok(crate::path::resolve_path(path, &proc.cwd));
+    }
+
+    let entry = proc.fd_table.get(dirfd)?;
+    let ofd = proc.ofd_table.get(entry.ofd_ref.0).ok_or(Errno::EBADF)?;
+    if ofd.file_type != FileType::Directory {
+        return Err(Errno::ENOTDIR);
+    }
+
+    Ok(crate::path::resolve_path(path, &ofd.path))
+}
+
 /// Open a file relative to a directory file descriptor.
 ///
 /// If dirfd is AT_FDCWD, the path is resolved relative to the process cwd
@@ -2004,38 +2032,38 @@ pub fn sys_openat(
     oflags: u32,
     mode: u32,
 ) -> Result<i32, Errno> {
-    use wasm_posix_shared::flags::AT_FDCWD;
+    let resolved = resolve_at_path(proc, dirfd, path)?;
 
-    // If path is absolute, dirfd is ignored
-    if !path.is_empty() && path[0] == b'/' {
-        return sys_open(proc, host, path, oflags, mode);
-    }
+    let effective_mode = if oflags & O_CREAT != 0 {
+        mode & !proc.umask
+    } else {
+        mode
+    };
+    let host_handle = host.host_open(&resolved, oflags, effective_mode)?;
 
-    if dirfd == AT_FDCWD {
-        // Resolve relative to cwd (same as open())
-        return sys_open(proc, host, path, oflags, mode);
-    }
+    let file_type = if oflags & O_DIRECTORY != 0 {
+        FileType::Directory
+    } else {
+        FileType::Regular
+    };
 
-    // dirfd must refer to a directory
-    let entry = proc.fd_table.get(dirfd)?;
-    let ofd = proc.ofd_table.get(entry.ofd_ref.0).ok_or(Errno::EBADF)?;
-    if ofd.file_type != FileType::Directory {
-        return Err(Errno::ENOTDIR);
-    }
+    let status_flags = oflags & !CREATION_FLAGS;
+    let ofd_idx = proc.ofd_table.create(file_type, status_flags, host_handle, resolved);
 
-    // For now, since we can't easily get the directory path from the host handle,
-    // return ENOSYS for non-AT_FDCWD dirfd with relative paths.
-    // This is a limitation: full openat() would need to resolve the directory path
-    // from the host handle, which the current HostIO interface doesn't support.
-    // AT_FDCWD (the most common usage) works fully.
-    Err(Errno::ENOSYS)
+    let fd_flags = if oflags & O_CLOEXEC != 0 {
+        FD_CLOEXEC
+    } else {
+        0
+    };
+
+    let fd = proc.fd_table.alloc(OpenFileDescRef(ofd_idx), fd_flags)?;
+    Ok(fd)
 }
 
 /// fstatat -- stat relative to directory fd.
 ///
-/// If path is absolute or dirfd is AT_FDCWD, delegates to sys_stat (or
-/// sys_lstat when AT_SYMLINK_NOFOLLOW is set). Relative paths with a real
-/// dirfd are not yet supported and return ENOSYS.
+/// Resolves the path relative to dirfd, then stats the file.
+/// When AT_SYMLINK_NOFOLLOW is set, uses lstat instead of stat.
 pub fn sys_fstatat(
     proc: &mut Process,
     host: &mut dyn HostIO,
@@ -2043,22 +2071,19 @@ pub fn sys_fstatat(
     path: &[u8],
     flags: u32,
 ) -> Result<WasmStat, Errno> {
-    use wasm_posix_shared::flags::{AT_FDCWD, AT_SYMLINK_NOFOLLOW};
+    use wasm_posix_shared::flags::AT_SYMLINK_NOFOLLOW;
 
-    if (!path.is_empty() && path[0] == b'/') || dirfd == AT_FDCWD {
-        if flags & AT_SYMLINK_NOFOLLOW != 0 {
-            return sys_lstat(proc, host, path);
-        }
-        return sys_stat(proc, host, path);
+    let resolved = resolve_at_path(proc, dirfd, path)?;
+    if flags & AT_SYMLINK_NOFOLLOW != 0 {
+        host.host_lstat(&resolved)
+    } else {
+        host.host_stat(&resolved)
     }
-
-    Err(Errno::ENOSYS)
 }
 
 /// unlinkat -- unlink relative to directory fd.
 ///
-/// If flags contains AT_REMOVEDIR, acts like rmdir. Otherwise acts like
-/// unlink. Only AT_FDCWD and absolute paths are currently supported.
+/// If flags contains AT_REMOVEDIR, acts like rmdir. Otherwise acts like unlink.
 pub fn sys_unlinkat(
     proc: &mut Process,
     host: &mut dyn HostIO,
@@ -2066,21 +2091,17 @@ pub fn sys_unlinkat(
     path: &[u8],
     flags: u32,
 ) -> Result<(), Errno> {
-    use wasm_posix_shared::flags::{AT_FDCWD, AT_REMOVEDIR};
+    use wasm_posix_shared::flags::AT_REMOVEDIR;
 
-    if (!path.is_empty() && path[0] == b'/') || dirfd == AT_FDCWD {
-        if flags & AT_REMOVEDIR != 0 {
-            return sys_rmdir(proc, host, path);
-        }
-        return sys_unlink(proc, host, path);
+    let resolved = resolve_at_path(proc, dirfd, path)?;
+    if flags & AT_REMOVEDIR != 0 {
+        host.host_rmdir(&resolved)
+    } else {
+        host.host_unlink(&resolved)
     }
-
-    Err(Errno::ENOSYS)
 }
 
 /// mkdirat -- mkdir relative to directory fd.
-///
-/// Only AT_FDCWD and absolute paths are currently supported.
 pub fn sys_mkdirat(
     proc: &mut Process,
     host: &mut dyn HostIO,
@@ -2088,19 +2109,12 @@ pub fn sys_mkdirat(
     path: &[u8],
     mode: u32,
 ) -> Result<(), Errno> {
-    use wasm_posix_shared::flags::AT_FDCWD;
-
-    if (!path.is_empty() && path[0] == b'/') || dirfd == AT_FDCWD {
-        return sys_mkdir(proc, host, path, mode);
-    }
-
-    Err(Errno::ENOSYS)
+    let resolved = resolve_at_path(proc, dirfd, path)?;
+    let effective_mode = mode & !proc.umask;
+    host.host_mkdir(&resolved, effective_mode)
 }
 
 /// renameat -- rename relative to directory fds.
-///
-/// Both old and new paths must be absolute or use AT_FDCWD. If either
-/// path is relative with a real dirfd, returns ENOSYS.
 pub fn sys_renameat(
     proc: &mut Process,
     host: &mut dyn HostIO,
@@ -2109,18 +2123,9 @@ pub fn sys_renameat(
     newdirfd: i32,
     newpath: &[u8],
 ) -> Result<(), Errno> {
-    use wasm_posix_shared::flags::AT_FDCWD;
-
-    let old_resolved =
-        (!oldpath.is_empty() && oldpath[0] == b'/') || olddirfd == AT_FDCWD;
-    let new_resolved =
-        (!newpath.is_empty() && newpath[0] == b'/') || newdirfd == AT_FDCWD;
-
-    if old_resolved && new_resolved {
-        return sys_rename(proc, host, oldpath, newpath);
-    }
-
-    Err(Errno::ENOSYS)
+    let old_resolved = resolve_at_path(proc, olddirfd, oldpath)?;
+    let new_resolved = resolve_at_path(proc, newdirfd, newpath)?;
+    host.host_rename(&old_resolved, &new_resolved)
 }
 
 /// tcgetattr -- get terminal attributes.
@@ -2483,18 +2488,12 @@ pub fn sys_faccessat(
     amode: u32,
     _flags: u32,
 ) -> Result<(), Errno> {
-    use wasm_posix_shared::flags::AT_FDCWD;
-
-    if (!path.is_empty() && path[0] == b'/') || dirfd == AT_FDCWD {
-        return sys_access(proc, host, path, amode);
-    }
-
-    Err(Errno::ENOSYS)
+    let resolved = resolve_at_path(proc, dirfd, path)?;
+    host.host_access(&resolved, amode)
 }
 
 /// fchmodat -- change file mode relative to directory fd.
 ///
-/// Only AT_FDCWD and absolute paths are currently supported.
 /// AT_SYMLINK_NOFOLLOW is accepted but not distinguishable from
 /// regular chmod in our host delegation model.
 pub fn sys_fchmodat(
@@ -2505,18 +2504,11 @@ pub fn sys_fchmodat(
     mode: u32,
     _flags: u32,
 ) -> Result<(), Errno> {
-    use wasm_posix_shared::flags::AT_FDCWD;
-
-    if (!path.is_empty() && path[0] == b'/') || dirfd == AT_FDCWD {
-        return sys_chmod(proc, host, path, mode);
-    }
-
-    Err(Errno::ENOSYS)
+    let resolved = resolve_at_path(proc, dirfd, path)?;
+    host.host_chmod(&resolved, mode)
 }
 
 /// fchownat -- change file owner/group relative to directory fd.
-///
-/// Only AT_FDCWD and absolute paths are currently supported.
 pub fn sys_fchownat(
     proc: &mut Process,
     host: &mut dyn HostIO,
@@ -2526,18 +2518,11 @@ pub fn sys_fchownat(
     gid: u32,
     _flags: u32,
 ) -> Result<(), Errno> {
-    use wasm_posix_shared::flags::AT_FDCWD;
-
-    if (!path.is_empty() && path[0] == b'/') || dirfd == AT_FDCWD {
-        return sys_chown(proc, host, path, uid, gid);
-    }
-
-    Err(Errno::ENOSYS)
+    let resolved = resolve_at_path(proc, dirfd, path)?;
+    host.host_chown(&resolved, uid, gid)
 }
 
 /// linkat -- create hard link relative to directory fds.
-///
-/// Both old and new paths must be absolute or use AT_FDCWD.
 pub fn sys_linkat(
     proc: &mut Process,
     host: &mut dyn HostIO,
@@ -2547,24 +2532,15 @@ pub fn sys_linkat(
     newpath: &[u8],
     _flags: u32,
 ) -> Result<(), Errno> {
-    use wasm_posix_shared::flags::AT_FDCWD;
-
-    let old_resolved =
-        (!oldpath.is_empty() && oldpath[0] == b'/') || olddirfd == AT_FDCWD;
-    let new_resolved =
-        (!newpath.is_empty() && newpath[0] == b'/') || newdirfd == AT_FDCWD;
-
-    if old_resolved && new_resolved {
-        return sys_link(proc, host, oldpath, newpath);
-    }
-
-    Err(Errno::ENOSYS)
+    let old_resolved = resolve_at_path(proc, olddirfd, oldpath)?;
+    let new_resolved = resolve_at_path(proc, newdirfd, newpath)?;
+    host.host_link(&old_resolved, &new_resolved)
 }
 
 /// symlinkat -- create symbolic link relative to directory fd.
 ///
-/// The target path is stored as-is (not resolved). Only newdirfd
-/// applies, and only AT_FDCWD and absolute paths are supported.
+/// The target path is stored as-is (not resolved). Only the linkpath
+/// is resolved relative to newdirfd.
 pub fn sys_symlinkat(
     proc: &mut Process,
     host: &mut dyn HostIO,
@@ -2572,18 +2548,11 @@ pub fn sys_symlinkat(
     newdirfd: i32,
     linkpath: &[u8],
 ) -> Result<(), Errno> {
-    use wasm_posix_shared::flags::AT_FDCWD;
-
-    if (!linkpath.is_empty() && linkpath[0] == b'/') || newdirfd == AT_FDCWD {
-        return sys_symlink(proc, host, target, linkpath);
-    }
-
-    Err(Errno::ENOSYS)
+    let resolved_link = resolve_at_path(proc, newdirfd, linkpath)?;
+    host.host_symlink(target, &resolved_link)
 }
 
 /// readlinkat -- read symbolic link relative to directory fd.
-///
-/// Only AT_FDCWD and absolute paths are currently supported.
 pub fn sys_readlinkat(
     proc: &mut Process,
     host: &mut dyn HostIO,
@@ -2591,13 +2560,8 @@ pub fn sys_readlinkat(
     path: &[u8],
     buf: &mut [u8],
 ) -> Result<usize, Errno> {
-    use wasm_posix_shared::flags::AT_FDCWD;
-
-    if (!path.is_empty() && path[0] == b'/') || dirfd == AT_FDCWD {
-        return sys_readlink(proc, host, path, buf);
-    }
-
-    Err(Errno::ENOSYS)
+    let resolved = resolve_at_path(proc, dirfd, path)?;
+    host.host_readlink(&resolved, buf)
 }
 
 /// select -- synchronous I/O multiplexing.
@@ -4403,11 +4367,12 @@ mod tests {
     }
 
     #[test]
-    fn test_fstatat_relative_enosys() {
+    fn test_fstatat_relative_invalid_dirfd() {
         let mut proc = Process::new(1);
         let mut host = MockHostIO::new();
+        // fd 5 doesn't exist, should get EBADF
         let result = sys_fstatat(&mut proc, &mut host, 5, b"relative", 0);
-        assert!(matches!(result, Err(Errno::ENOSYS)));
+        assert!(matches!(result, Err(Errno::EBADF)));
     }
 
     #[test]
@@ -4427,11 +4392,12 @@ mod tests {
     }
 
     #[test]
-    fn test_unlinkat_relative_enosys() {
+    fn test_unlinkat_relative_invalid_dirfd() {
         let mut proc = Process::new(1);
         let mut host = MockHostIO::new();
+        // fd 5 doesn't exist, should get EBADF
         let result = sys_unlinkat(&mut proc, &mut host, 5, b"relative", 0);
-        assert_eq!(result, Err(Errno::ENOSYS));
+        assert_eq!(result, Err(Errno::EBADF));
     }
 
     #[test]
@@ -4443,11 +4409,12 @@ mod tests {
     }
 
     #[test]
-    fn test_mkdirat_relative_enosys() {
+    fn test_mkdirat_relative_invalid_dirfd() {
         let mut proc = Process::new(1);
         let mut host = MockHostIO::new();
+        // fd 5 doesn't exist, should get EBADF
         let result = sys_mkdirat(&mut proc, &mut host, 5, b"relative", 0o755);
-        assert_eq!(result, Err(Errno::ENOSYS));
+        assert_eq!(result, Err(Errno::EBADF));
     }
 
     #[test]
@@ -4468,12 +4435,12 @@ mod tests {
     }
 
     #[test]
-    fn test_renameat_relative_enosys() {
+    fn test_renameat_relative_invalid_dirfd() {
         let mut proc = Process::new(1);
         let mut host = MockHostIO::new();
-        // Old path relative with non-AT_FDCWD dirfd
+        // Old path relative with non-existent dirfd
         let result = sys_renameat(&mut proc, &mut host, 5, b"relative", AT_FDCWD, b"/tmp/new");
-        assert_eq!(result, Err(Errno::ENOSYS));
+        assert_eq!(result, Err(Errno::EBADF));
     }
 
     #[test]
@@ -5271,11 +5238,12 @@ mod tests {
     }
 
     #[test]
-    fn test_faccessat_real_dirfd_enosys() {
+    fn test_faccessat_real_dirfd_invalid() {
         let mut proc = Process::new(1);
         let mut host = MockHostIO::new();
+        // fd 5 doesn't exist, should get EBADF
         let result = sys_faccessat(&mut proc, &mut host, 5, b"relative", 0, 0);
-        assert_eq!(result, Err(Errno::ENOSYS));
+        assert_eq!(result, Err(Errno::EBADF));
     }
 
     #[test]
@@ -5295,11 +5263,12 @@ mod tests {
     }
 
     #[test]
-    fn test_fchmodat_real_dirfd_enosys() {
+    fn test_fchmodat_real_dirfd_invalid() {
         let mut proc = Process::new(1);
         let mut host = MockHostIO::new();
+        // fd 5 doesn't exist, should get EBADF
         let result = sys_fchmodat(&mut proc, &mut host, 5, b"relative", 0o644, 0);
-        assert_eq!(result, Err(Errno::ENOSYS));
+        assert_eq!(result, Err(Errno::EBADF));
     }
 
     #[test]
@@ -5311,11 +5280,12 @@ mod tests {
     }
 
     #[test]
-    fn test_fchownat_real_dirfd_enosys() {
+    fn test_fchownat_real_dirfd_invalid() {
         let mut proc = Process::new(1);
         let mut host = MockHostIO::new();
+        // fd 5 doesn't exist, should get EBADF
         let result = sys_fchownat(&mut proc, &mut host, 5, b"relative", 1000, 1000, 0);
-        assert_eq!(result, Err(Errno::ENOSYS));
+        assert_eq!(result, Err(Errno::EBADF));
     }
 
     #[test]
@@ -5327,11 +5297,12 @@ mod tests {
     }
 
     #[test]
-    fn test_linkat_real_dirfd_enosys() {
+    fn test_linkat_real_dirfd_invalid() {
         let mut proc = Process::new(1);
         let mut host = MockHostIO::new();
+        // fd 5 doesn't exist, should get EBADF
         let result = sys_linkat(&mut proc, &mut host, 5, b"old", -100, b"/new", 0);
-        assert_eq!(result, Err(Errno::ENOSYS));
+        assert_eq!(result, Err(Errno::EBADF));
     }
 
     #[test]
@@ -5343,11 +5314,12 @@ mod tests {
     }
 
     #[test]
-    fn test_symlinkat_real_dirfd_enosys() {
+    fn test_symlinkat_real_dirfd_invalid() {
         let mut proc = Process::new(1);
         let mut host = MockHostIO::new();
+        // fd 5 doesn't exist, should get EBADF
         let result = sys_symlinkat(&mut proc, &mut host, b"target", 5, b"link");
-        assert_eq!(result, Err(Errno::ENOSYS));
+        assert_eq!(result, Err(Errno::EBADF));
     }
 
     #[test]
@@ -5361,12 +5333,13 @@ mod tests {
     }
 
     #[test]
-    fn test_readlinkat_real_dirfd_enosys() {
+    fn test_readlinkat_real_dirfd_invalid() {
         let mut proc = Process::new(1);
         let mut host = MockHostIO::new();
         let mut buf = [0u8; 256];
+        // fd 5 doesn't exist, should get EBADF
         let result = sys_readlinkat(&mut proc, &mut host, 5, b"relative/link", &mut buf);
-        assert_eq!(result, Err(Errno::ENOSYS));
+        assert_eq!(result, Err(Errno::EBADF));
     }
 
     // ---- Phase 12: select() ----
@@ -5682,5 +5655,334 @@ mod tests {
         assert_eq!(result, Err(Errno::EINTR));
         // Mask must be restored even when host returns error
         assert_eq!(proc.signals.blocked, 0xFF);
+    }
+
+    // ---- *at() syscalls with real dirfd ----
+
+    /// A mock HostIO that records the resolved paths passed to host calls.
+    struct TrackingHostIO {
+        next_handle: i64,
+        last_open_path: Vec<u8>,
+        last_stat_path: Vec<u8>,
+        last_lstat_path: Vec<u8>,
+        last_unlink_path: Vec<u8>,
+        last_rmdir_path: Vec<u8>,
+        last_mkdir_path: Vec<u8>,
+        last_rename_old: Vec<u8>,
+        last_rename_new: Vec<u8>,
+        last_chmod_path: Vec<u8>,
+        last_chown_path: Vec<u8>,
+        last_access_path: Vec<u8>,
+        last_link_old: Vec<u8>,
+        last_link_new: Vec<u8>,
+        last_symlink_target: Vec<u8>,
+        last_symlink_linkpath: Vec<u8>,
+        last_readlink_path: Vec<u8>,
+    }
+
+    impl TrackingHostIO {
+        fn new() -> Self {
+            TrackingHostIO {
+                next_handle: 100,
+                last_open_path: Vec::new(),
+                last_stat_path: Vec::new(),
+                last_lstat_path: Vec::new(),
+                last_unlink_path: Vec::new(),
+                last_rmdir_path: Vec::new(),
+                last_mkdir_path: Vec::new(),
+                last_rename_old: Vec::new(),
+                last_rename_new: Vec::new(),
+                last_chmod_path: Vec::new(),
+                last_chown_path: Vec::new(),
+                last_access_path: Vec::new(),
+                last_link_old: Vec::new(),
+                last_link_new: Vec::new(),
+                last_symlink_target: Vec::new(),
+                last_symlink_linkpath: Vec::new(),
+                last_readlink_path: Vec::new(),
+            }
+        }
+    }
+
+    impl HostIO for TrackingHostIO {
+        fn host_open(&mut self, path: &[u8], _flags: u32, _mode: u32) -> Result<i64, Errno> {
+            self.last_open_path = path.to_vec();
+            let h = self.next_handle;
+            self.next_handle += 1;
+            Ok(h)
+        }
+        fn host_close(&mut self, _handle: i64) -> Result<(), Errno> { Ok(()) }
+        fn host_read(&mut self, _handle: i64, buf: &mut [u8]) -> Result<usize, Errno> {
+            let n = buf.len().min(5);
+            buf[..n].copy_from_slice(&b"hello"[..n]);
+            Ok(n)
+        }
+        fn host_write(&mut self, _handle: i64, buf: &[u8]) -> Result<usize, Errno> { Ok(buf.len()) }
+        fn host_seek(&mut self, _handle: i64, _offset: i64, _whence: u32) -> Result<i64, Errno> { Ok(0) }
+        fn host_fstat(&mut self, _handle: i64) -> Result<WasmStat, Errno> {
+            Ok(WasmStat {
+                st_dev: 0, st_ino: 0, st_mode: S_IFREG | 0o644, st_nlink: 1,
+                st_uid: 0, st_gid: 0, st_size: 1024,
+                st_atime_sec: 0, st_atime_nsec: 0, st_mtime_sec: 0, st_mtime_nsec: 0,
+                st_ctime_sec: 0, st_ctime_nsec: 0, _pad: 0,
+            })
+        }
+        fn host_stat(&mut self, path: &[u8]) -> Result<WasmStat, Errno> {
+            self.last_stat_path = path.to_vec();
+            let is_dir = path.ends_with(b"dir") || path.ends_with(b"tmp")
+                || path.ends_with(b"/") || path == b"/";
+            let mode = if is_dir { S_IFDIR | 0o755 } else { S_IFREG | 0o644 };
+            Ok(WasmStat {
+                st_dev: 0, st_ino: 1, st_mode: mode, st_nlink: 1,
+                st_uid: 0, st_gid: 0, st_size: 1024,
+                st_atime_sec: 0, st_atime_nsec: 0, st_mtime_sec: 0, st_mtime_nsec: 0,
+                st_ctime_sec: 0, st_ctime_nsec: 0, _pad: 0,
+            })
+        }
+        fn host_lstat(&mut self, path: &[u8]) -> Result<WasmStat, Errno> {
+            self.last_lstat_path = path.to_vec();
+            Ok(WasmStat {
+                st_dev: 0, st_ino: 2, st_mode: S_IFLNK | 0o777, st_nlink: 1,
+                st_uid: 0, st_gid: 0, st_size: 7,
+                st_atime_sec: 0, st_atime_nsec: 0, st_mtime_sec: 0, st_mtime_nsec: 0,
+                st_ctime_sec: 0, st_ctime_nsec: 0, _pad: 0,
+            })
+        }
+        fn host_mkdir(&mut self, path: &[u8], _mode: u32) -> Result<(), Errno> {
+            self.last_mkdir_path = path.to_vec();
+            Ok(())
+        }
+        fn host_rmdir(&mut self, path: &[u8]) -> Result<(), Errno> {
+            self.last_rmdir_path = path.to_vec();
+            Ok(())
+        }
+        fn host_unlink(&mut self, path: &[u8]) -> Result<(), Errno> {
+            self.last_unlink_path = path.to_vec();
+            Ok(())
+        }
+        fn host_rename(&mut self, oldpath: &[u8], newpath: &[u8]) -> Result<(), Errno> {
+            self.last_rename_old = oldpath.to_vec();
+            self.last_rename_new = newpath.to_vec();
+            Ok(())
+        }
+        fn host_link(&mut self, oldpath: &[u8], newpath: &[u8]) -> Result<(), Errno> {
+            self.last_link_old = oldpath.to_vec();
+            self.last_link_new = newpath.to_vec();
+            Ok(())
+        }
+        fn host_symlink(&mut self, target: &[u8], linkpath: &[u8]) -> Result<(), Errno> {
+            self.last_symlink_target = target.to_vec();
+            self.last_symlink_linkpath = linkpath.to_vec();
+            Ok(())
+        }
+        fn host_readlink(&mut self, path: &[u8], buf: &mut [u8]) -> Result<usize, Errno> {
+            self.last_readlink_path = path.to_vec();
+            let target = b"/target";
+            let n = buf.len().min(target.len());
+            buf[..n].copy_from_slice(&target[..n]);
+            Ok(n)
+        }
+        fn host_chmod(&mut self, path: &[u8], _mode: u32) -> Result<(), Errno> {
+            self.last_chmod_path = path.to_vec();
+            Ok(())
+        }
+        fn host_chown(&mut self, path: &[u8], _uid: u32, _gid: u32) -> Result<(), Errno> {
+            self.last_chown_path = path.to_vec();
+            Ok(())
+        }
+        fn host_access(&mut self, path: &[u8], _amode: u32) -> Result<(), Errno> {
+            self.last_access_path = path.to_vec();
+            Ok(())
+        }
+        fn host_opendir(&mut self, _path: &[u8]) -> Result<i64, Errno> { Ok(200) }
+        fn host_readdir(&mut self, _handle: i64, _name_buf: &mut [u8]) -> Result<Option<(u64, u32, usize)>, Errno> { Ok(None) }
+        fn host_closedir(&mut self, _handle: i64) -> Result<(), Errno> { Ok(()) }
+        fn host_clock_gettime(&mut self, _clock_id: u32) -> Result<(i64, i64), Errno> { Ok((0, 0)) }
+        fn host_nanosleep(&mut self, _seconds: i64, _nanoseconds: i64) -> Result<(), Errno> { Ok(()) }
+        fn host_ftruncate(&mut self, _handle: i64, _length: i64) -> Result<(), Errno> { Ok(()) }
+        fn host_fsync(&mut self, _handle: i64) -> Result<(), Errno> { Ok(()) }
+        fn host_fchmod(&mut self, _handle: i64, _mode: u32) -> Result<(), Errno> { Ok(()) }
+        fn host_fchown(&mut self, _handle: i64, _uid: u32, _gid: u32) -> Result<(), Errno> { Ok(()) }
+        fn host_kill(&mut self, _pid: i32, _sig: u32) -> Result<(), Errno> { Ok(()) }
+        fn host_exec(&mut self, _path: &[u8]) -> Result<(), Errno> { Ok(()) }
+        fn host_set_alarm(&mut self, _seconds: u32) -> Result<(), Errno> { Ok(()) }
+        fn host_sigsuspend_wait(&mut self) -> Result<u32, Errno> { Err(Errno::EINTR) }
+        fn host_call_signal_handler(&mut self, _handler_index: u32, _signum: u32) -> Result<(), Errno> { Ok(()) }
+    }
+
+    /// Helper: open a directory and return its fd.
+    fn open_dir_fd(proc: &mut Process, host: &mut dyn HostIO, dir_path: &[u8]) -> i32 {
+        sys_open(proc, host, dir_path, O_RDONLY | O_DIRECTORY, 0).expect("open dir should succeed")
+    }
+
+    #[test]
+    fn test_openat_with_real_dirfd() {
+        let mut proc = Process::new(1);
+        let mut host = TrackingHostIO::new();
+        let dirfd = open_dir_fd(&mut proc, &mut host, b"/home/user/dir");
+        // open a file relative to /home/user/dir
+        let fd = sys_openat(&mut proc, &mut host, dirfd, b"file.txt", O_RDONLY, 0);
+        assert!(fd.is_ok());
+        assert_eq!(host.last_open_path, b"/home/user/dir/file.txt");
+    }
+
+    #[test]
+    fn test_fstatat_with_real_dirfd() {
+        let mut proc = Process::new(1);
+        let mut host = TrackingHostIO::new();
+        let dirfd = open_dir_fd(&mut proc, &mut host, b"/var/dir");
+        let result = sys_fstatat(&mut proc, &mut host, dirfd, b"subdir", 0);
+        assert!(result.is_ok());
+        assert_eq!(host.last_stat_path, b"/var/dir/subdir");
+    }
+
+    #[test]
+    fn test_fstatat_with_real_dirfd_nofollow() {
+        let mut proc = Process::new(1);
+        let mut host = TrackingHostIO::new();
+        let dirfd = open_dir_fd(&mut proc, &mut host, b"/var/dir");
+        let result = sys_fstatat(&mut proc, &mut host, dirfd, b"link", AT_SYMLINK_NOFOLLOW);
+        assert!(result.is_ok());
+        assert_eq!(host.last_lstat_path, b"/var/dir/link");
+    }
+
+    #[test]
+    fn test_unlinkat_with_real_dirfd() {
+        let mut proc = Process::new(1);
+        let mut host = TrackingHostIO::new();
+        let dirfd = open_dir_fd(&mut proc, &mut host, b"/tmp/dir");
+        let result = sys_unlinkat(&mut proc, &mut host, dirfd, b"file", 0);
+        assert!(result.is_ok());
+        assert_eq!(host.last_unlink_path, b"/tmp/dir/file");
+    }
+
+    #[test]
+    fn test_unlinkat_removedir_with_real_dirfd() {
+        let mut proc = Process::new(1);
+        let mut host = TrackingHostIO::new();
+        let dirfd = open_dir_fd(&mut proc, &mut host, b"/tmp/dir");
+        let result = sys_unlinkat(&mut proc, &mut host, dirfd, b"subdir", AT_REMOVEDIR);
+        assert!(result.is_ok());
+        assert_eq!(host.last_rmdir_path, b"/tmp/dir/subdir");
+    }
+
+    #[test]
+    fn test_mkdirat_with_real_dirfd() {
+        let mut proc = Process::new(1);
+        let mut host = TrackingHostIO::new();
+        let dirfd = open_dir_fd(&mut proc, &mut host, b"/home/dir");
+        let result = sys_mkdirat(&mut proc, &mut host, dirfd, b"newdir", 0o755);
+        assert!(result.is_ok());
+        assert_eq!(host.last_mkdir_path, b"/home/dir/newdir");
+    }
+
+    #[test]
+    fn test_renameat_with_real_dirfds() {
+        let mut proc = Process::new(1);
+        let mut host = TrackingHostIO::new();
+        let dirfd1 = open_dir_fd(&mut proc, &mut host, b"/src/dir");
+        let dirfd2 = open_dir_fd(&mut proc, &mut host, b"/dst/dir");
+        let result = sys_renameat(&mut proc, &mut host, dirfd1, b"old", dirfd2, b"new");
+        assert!(result.is_ok());
+        assert_eq!(host.last_rename_old, b"/src/dir/old");
+        assert_eq!(host.last_rename_new, b"/dst/dir/new");
+    }
+
+    #[test]
+    fn test_linkat_with_real_dirfds() {
+        let mut proc = Process::new(1);
+        let mut host = TrackingHostIO::new();
+        let dirfd = open_dir_fd(&mut proc, &mut host, b"/data/dir");
+        let result = sys_linkat(&mut proc, &mut host, dirfd, b"existing", dirfd, b"link", 0);
+        assert!(result.is_ok());
+        assert_eq!(host.last_link_old, b"/data/dir/existing");
+        assert_eq!(host.last_link_new, b"/data/dir/link");
+    }
+
+    #[test]
+    fn test_symlinkat_with_real_dirfd() {
+        let mut proc = Process::new(1);
+        let mut host = TrackingHostIO::new();
+        let dirfd = open_dir_fd(&mut proc, &mut host, b"/opt/dir");
+        let result = sys_symlinkat(&mut proc, &mut host, b"../target", dirfd, b"link");
+        assert!(result.is_ok());
+        // target is stored as-is, only linkpath is resolved
+        assert_eq!(host.last_symlink_target, b"../target");
+        assert_eq!(host.last_symlink_linkpath, b"/opt/dir/link");
+    }
+
+    #[test]
+    fn test_readlinkat_with_real_dirfd() {
+        let mut proc = Process::new(1);
+        let mut host = TrackingHostIO::new();
+        let dirfd = open_dir_fd(&mut proc, &mut host, b"/etc/dir");
+        let mut buf = [0u8; 256];
+        let result = sys_readlinkat(&mut proc, &mut host, dirfd, b"link", &mut buf);
+        assert!(result.is_ok());
+        assert_eq!(host.last_readlink_path, b"/etc/dir/link");
+    }
+
+    #[test]
+    fn test_fchmodat_with_real_dirfd() {
+        let mut proc = Process::new(1);
+        let mut host = TrackingHostIO::new();
+        let dirfd = open_dir_fd(&mut proc, &mut host, b"/var/dir");
+        let result = sys_fchmodat(&mut proc, &mut host, dirfd, b"file", 0o644, 0);
+        assert!(result.is_ok());
+        assert_eq!(host.last_chmod_path, b"/var/dir/file");
+    }
+
+    #[test]
+    fn test_fchownat_with_real_dirfd() {
+        let mut proc = Process::new(1);
+        let mut host = TrackingHostIO::new();
+        let dirfd = open_dir_fd(&mut proc, &mut host, b"/var/dir");
+        let result = sys_fchownat(&mut proc, &mut host, dirfd, b"file", 1000, 1000, 0);
+        assert!(result.is_ok());
+        assert_eq!(host.last_chown_path, b"/var/dir/file");
+    }
+
+    #[test]
+    fn test_faccessat_with_real_dirfd() {
+        let mut proc = Process::new(1);
+        let mut host = TrackingHostIO::new();
+        let dirfd = open_dir_fd(&mut proc, &mut host, b"/var/dir");
+        let result = sys_faccessat(&mut proc, &mut host, dirfd, b"file", 0, 0);
+        assert!(result.is_ok());
+        assert_eq!(host.last_access_path, b"/var/dir/file");
+    }
+
+    #[test]
+    fn test_at_absolute_path_ignores_dirfd() {
+        let mut proc = Process::new(1);
+        let mut host = TrackingHostIO::new();
+        let dirfd = open_dir_fd(&mut proc, &mut host, b"/wrong/dir");
+        // Absolute path should ignore dirfd
+        let result = sys_fstatat(&mut proc, &mut host, dirfd, b"/absolute/path", 0);
+        assert!(result.is_ok());
+        assert_eq!(host.last_stat_path, b"/absolute/path");
+    }
+
+    #[test]
+    fn test_at_enotdir_when_dirfd_is_regular_file() {
+        let mut proc = Process::new(1);
+        let mut host = TrackingHostIO::new();
+        // Open a regular file (not a directory)
+        let fd = sys_open(&mut proc, &mut host, b"/some/file.txt", O_RDONLY, 0).unwrap();
+        // Try to use it as a dirfd - should get ENOTDIR
+        let result = sys_fstatat(&mut proc, &mut host, fd, b"relative", 0);
+        assert!(matches!(result, Err(Errno::ENOTDIR)));
+    }
+
+    #[test]
+    fn test_openat_stores_resolved_path_in_ofd() {
+        let mut proc = Process::new(1);
+        let mut host = TrackingHostIO::new();
+        let dirfd = open_dir_fd(&mut proc, &mut host, b"/base/dir");
+        let fd = sys_openat(&mut proc, &mut host, dirfd, b"child/dir", O_RDONLY | O_DIRECTORY, 0).unwrap();
+        // The new OFD should have the resolved path stored
+        let entry = proc.fd_table.get(fd).unwrap();
+        let ofd = proc.ofd_table.get(entry.ofd_ref.0).unwrap();
+        assert_eq!(ofd.path, b"/base/dir/child/dir");
     }
 }

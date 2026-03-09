@@ -271,6 +271,8 @@ pub fn serialize_fork_state(proc: &Process, buf: &mut [u8]) -> Result<usize, Err
         w.write_i64(ofd.host_handle)?;
         w.write_i64(ofd.offset)?;
         w.write_u32(ofd.ref_count)?;
+        w.write_u32(ofd.path.len() as u32)?;
+        w.write_bytes(&ofd.path)?;
     }
 
     // ── Environment ──
@@ -383,6 +385,8 @@ pub fn deserialize_fork_state(buf: &[u8], child_pid: u32) -> Result<Process, Err
         let host_handle = r.read_i64()?;
         let offset = r.read_i64()?;
         let ref_count = r.read_u32()?;
+        let path_len = r.read_u32()? as usize;
+        let path = r.read_bytes(path_len)?.to_vec();
         while ofd_entries.len() <= index {
             ofd_entries.push(None);
         }
@@ -393,6 +397,7 @@ pub fn deserialize_fork_state(buf: &[u8], child_pid: u32) -> Result<Process, Err
             offset,
             ref_count,
             owner_pid: child_pid,
+            path,
         });
     }
     let ofd_table = OfdTable::from_raw(ofd_entries);
@@ -554,6 +559,8 @@ pub fn serialize_exec_state(proc: &Process, buf: &mut [u8]) -> Result<usize, Err
         w.write_i64(ofd.host_handle)?;
         w.write_i64(ofd.offset)?;
         w.write_u32(ofd.ref_count)?;
+        w.write_u32(ofd.path.len() as u32)?;
+        w.write_bytes(&ofd.path)?;
     }
 
     // ── Environment ──
@@ -666,6 +673,8 @@ pub fn deserialize_exec_state(buf: &[u8], pid: u32) -> Result<Process, Errno> {
         let host_handle = r.read_i64()?;
         let offset = r.read_i64()?;
         let ref_count = r.read_u32()?;
+        let path_len = r.read_u32()? as usize;
+        let path = r.read_bytes(path_len)?.to_vec();
         while ofd_entries.len() <= index {
             ofd_entries.push(None);
         }
@@ -676,6 +685,7 @@ pub fn deserialize_exec_state(buf: &[u8], pid: u32) -> Result<Process, Errno> {
             offset,
             ref_count,
             owner_pid: pid,
+            path,
         });
     }
     let ofd_table = OfdTable::from_raw(ofd_entries);
@@ -884,7 +894,7 @@ mod tests {
         use wasm_posix_shared::fd_flags::FD_CLOEXEC;
         let mut proc = Process::new(1);
         // fd 3 with CLOEXEC
-        let ofd_ref = proc.ofd_table.create(crate::ofd::FileType::Regular, 0, 100);
+        let ofd_ref = proc.ofd_table.create(crate::ofd::FileType::Regular, 0, 100, b"/test/cloexec".to_vec());
         proc.fd_table.alloc(crate::fd::OpenFileDescRef(ofd_ref), FD_CLOEXEC).unwrap();
 
         let mut buf = vec![0u8; 64 * 1024];

@@ -23,6 +23,7 @@ pub struct OpenFileDesc {
     pub offset: i64,
     pub ref_count: u32,
     pub owner_pid: u32,
+    pub path: Vec<u8>,  // resolved absolute path
 }
 
 pub struct OfdTable {
@@ -38,7 +39,7 @@ impl OfdTable {
 
     /// Create a new open file description. Returns the OFD index.
     /// Reuses freed slots when available.
-    pub fn create(&mut self, file_type: FileType, status_flags: u32, host_handle: i64) -> usize {
+    pub fn create(&mut self, file_type: FileType, status_flags: u32, host_handle: i64, path: Vec<u8>) -> usize {
         let ofd = OpenFileDesc {
             file_type,
             status_flags,
@@ -46,6 +47,7 @@ impl OfdTable {
             offset: 0,
             ref_count: 1,
             owner_pid: 0,
+            path,
         };
 
         // Search for a free (None) slot to reuse.
@@ -131,7 +133,7 @@ mod tests {
     #[test]
     fn test_create_ofd() {
         let mut table = OfdTable::new();
-        let idx = table.create(FileType::Regular, O_RDWR | O_APPEND, 42);
+        let idx = table.create(FileType::Regular, O_RDWR | O_APPEND, 42, b"/test".to_vec());
         assert_eq!(idx, 0);
 
         let ofd = table.get(idx).expect("OFD should exist at index 0");
@@ -140,12 +142,13 @@ mod tests {
         assert_eq!(ofd.host_handle, 42);
         assert_eq!(ofd.offset, 0);
         assert_eq!(ofd.ref_count, 1);
+        assert_eq!(ofd.path, b"/test");
     }
 
     #[test]
     fn test_ref_counting() {
         let mut table = OfdTable::new();
-        let idx = table.create(FileType::Regular, O_RDONLY, 10);
+        let idx = table.create(FileType::Regular, O_RDONLY, 10, Vec::new());
 
         // Initially ref_count = 1
         assert_eq!(table.get(idx).unwrap().ref_count, 1);
@@ -168,7 +171,7 @@ mod tests {
     #[test]
     fn test_set_status_flags_preserves_access_mode() {
         let mut table = OfdTable::new();
-        let idx = table.create(FileType::Regular, O_RDWR | O_APPEND, 5);
+        let idx = table.create(FileType::Regular, O_RDWR | O_APPEND, 5, Vec::new());
 
         // Verify initial state: access mode is O_RDWR, O_APPEND is set
         let ofd = table.get(idx).unwrap();
@@ -191,7 +194,7 @@ mod tests {
     #[test]
     fn test_slot_reuse() {
         let mut table = OfdTable::new();
-        let idx0 = table.create(FileType::Regular, O_RDONLY, 1);
+        let idx0 = table.create(FileType::Regular, O_RDONLY, 1, Vec::new());
         assert_eq!(idx0, 0);
 
         // Free slot 0
@@ -199,7 +202,7 @@ mod tests {
         assert!(freed);
 
         // Create again; should reuse slot 0
-        let idx_reused = table.create(FileType::Pipe, O_RDWR, 2);
+        let idx_reused = table.create(FileType::Pipe, O_RDWR, 2, Vec::new());
         assert_eq!(idx_reused, 0);
         let ofd = table.get(idx_reused).unwrap();
         assert_eq!(ofd.file_type, FileType::Pipe);
@@ -209,9 +212,9 @@ mod tests {
     #[test]
     fn test_multiple_ofds() {
         let mut table = OfdTable::new();
-        let idx0 = table.create(FileType::Regular, O_RDONLY, 10);
-        let idx1 = table.create(FileType::Pipe, O_RDWR, 20);
-        let idx2 = table.create(FileType::Socket, O_RDWR | O_NONBLOCK, 30);
+        let idx0 = table.create(FileType::Regular, O_RDONLY, 10, Vec::new());
+        let idx1 = table.create(FileType::Pipe, O_RDWR, 20, Vec::new());
+        let idx2 = table.create(FileType::Socket, O_RDWR | O_NONBLOCK, 30, Vec::new());
 
         assert_eq!(idx0, 0);
         assert_eq!(idx1, 1);
@@ -225,8 +228,8 @@ mod tests {
     #[test]
     fn test_iter_returns_open_ofds() {
         let mut table = OfdTable::new();
-        let idx0 = table.create(FileType::Regular, O_RDONLY, 10);
-        let idx1 = table.create(FileType::Pipe, O_RDWR, 20);
+        let idx0 = table.create(FileType::Regular, O_RDONLY, 10, Vec::new());
+        let idx1 = table.create(FileType::Pipe, O_RDWR, 20, Vec::new());
 
         let ofds: Vec<(usize, &OpenFileDesc)> = table.iter().collect();
         assert_eq!(ofds.len(), 2);
@@ -239,8 +242,8 @@ mod tests {
     #[test]
     fn test_iter_skips_freed_slots() {
         let mut table = OfdTable::new();
-        table.create(FileType::Regular, O_RDONLY, 10);
-        table.create(FileType::Pipe, O_RDWR, 20);
+        table.create(FileType::Regular, O_RDONLY, 10, Vec::new());
+        table.create(FileType::Pipe, O_RDWR, 20, Vec::new());
         table.dec_ref(0); // free slot 0
 
         let ofds: Vec<(usize, &OpenFileDesc)> = table.iter().collect();
@@ -251,8 +254,8 @@ mod tests {
     #[test]
     fn test_from_raw_roundtrip() {
         let mut table = OfdTable::new();
-        table.create(FileType::Regular, O_RDONLY, 10);
-        table.create(FileType::Socket, O_RDWR, 30);
+        table.create(FileType::Regular, O_RDONLY, 10, b"/a".to_vec());
+        table.create(FileType::Socket, O_RDWR, 30, b"/b".to_vec());
 
         // Build raw entries from iteration
         let max_idx = table.iter().map(|(i, _)| i).max().unwrap_or(0);
@@ -265,6 +268,7 @@ mod tests {
                 offset: ofd.offset,
                 ref_count: ofd.ref_count,
                 owner_pid: ofd.owner_pid,
+                path: ofd.path.clone(),
             });
         }
 
