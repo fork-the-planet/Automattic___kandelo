@@ -397,6 +397,33 @@ pub extern "C" fn kernel_init_from_fork(buf_ptr: *const u8, buf_len: u32, child_
     }
 }
 
+/// Serialize exec-safe state. Returns bytes written on success, negative errno on error.
+/// Exec state differs from fork: closes CLOEXEC fds, resets caught signal handlers,
+/// preserves pending signals and signal mask.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_get_exec_state(buf_ptr: *mut u8, buf_len: u32) -> i32 {
+    let proc = unsafe { get_process() };
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, buf_len as usize) };
+    match crate::fork::serialize_exec_state(proc, buf) {
+        Ok(written) => written as i32,
+        Err(e) => -(e as i32),
+    }
+}
+
+/// Initialize kernel from exec state (replaces current process image).
+/// Returns 0 on success, negative errno on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_init_from_exec(buf_ptr: *const u8, buf_len: u32, pid: u32) -> i32 {
+    let buf = unsafe { core::slice::from_raw_parts(buf_ptr, buf_len as usize) };
+    match crate::fork::deserialize_exec_state(buf, pid) {
+        Ok(proc) => {
+            unsafe { *PROCESS.0.get() = Some(proc); }
+            0
+        }
+        Err(e) => -(e as i32),
+    }
+}
+
 /// Convert a pipe's OFD from kernel-internal to host-delegated.
 /// After this, reads/writes for this OFD will go through host_read/host_write.
 #[unsafe(no_mangle)]
