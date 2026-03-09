@@ -116,6 +116,22 @@ impl FdTable {
         self.entries[idx].as_mut().ok_or(Errno::EBADF)
     }
 
+    /// Iterate over all open file descriptors.
+    pub fn iter(&self) -> impl Iterator<Item = (i32, &FdEntry)> + '_ {
+        self.entries.iter().enumerate()
+            .filter_map(|(i, e)| e.as_ref().map(|entry| (i as i32, entry)))
+    }
+
+    /// Reconstruct an FdTable from raw entries. Used by fork deserialization.
+    pub fn from_raw(entries: Vec<Option<FdEntry>>, max_fds: usize) -> Self {
+        FdTable { entries, max_fds }
+    }
+
+    /// Returns the max_fds limit.
+    pub fn max_fds(&self) -> usize {
+        self.max_fds
+    }
+
     /// Place an entry at a specific fd (dup2 semantics).
     ///
     /// If the slot was occupied, returns `Some(old_ofd_ref)`.
@@ -241,5 +257,52 @@ mod tests {
         // fd 5 is not allocated
         let result = table.get(5);
         assert_eq!(result, Err(Errno::EBADF));
+    }
+
+    #[test]
+    fn test_iter_returns_open_fds() {
+        let mut table = FdTable::new();
+        table.preopen_stdio();
+        let fd3 = table.alloc(OpenFileDescRef(10), 0).unwrap();
+        assert_eq!(fd3, 3);
+
+        let fds: Vec<(i32, &FdEntry)> = table.iter().collect();
+        assert_eq!(fds.len(), 4); // 0,1,2,3
+        assert_eq!(fds[0].0, 0);
+        assert_eq!(fds[3].0, 3);
+        assert_eq!(fds[3].1.ofd_ref, OpenFileDescRef(10));
+    }
+
+    #[test]
+    fn test_iter_skips_closed_fds() {
+        let mut table = FdTable::new();
+        table.preopen_stdio();
+        table.free(1).unwrap(); // close fd 1
+
+        let fds: Vec<(i32, &FdEntry)> = table.iter().collect();
+        assert_eq!(fds.len(), 2); // 0, 2
+        assert_eq!(fds[0].0, 0);
+        assert_eq!(fds[1].0, 2);
+    }
+
+    #[test]
+    fn test_from_raw_roundtrip() {
+        let mut table = FdTable::new();
+        table.preopen_stdio();
+        let max = table.max_fds();
+
+        let entries: Vec<Option<FdEntry>> = table.iter()
+            .fold(Vec::new(), |mut v, (fd, entry)| {
+                while v.len() <= fd as usize {
+                    v.push(None);
+                }
+                v[fd as usize] = Some(entry.clone());
+                v
+            });
+        let rebuilt = FdTable::from_raw(entries, max);
+        assert_eq!(rebuilt.get(0).unwrap().ofd_ref, OpenFileDescRef(0));
+        assert_eq!(rebuilt.get(1).unwrap().ofd_ref, OpenFileDescRef(1));
+        assert_eq!(rebuilt.get(2).unwrap().ofd_ref, OpenFileDescRef(2));
+        assert!(rebuilt.get(3).is_err());
     }
 }

@@ -101,6 +101,17 @@ impl SignalState {
     pub fn deliverable(&self) -> u64 {
         self.pending & !self.blocked
     }
+
+    /// Reconstruct signal state from parts. Used by fork deserialization.
+    /// Pending signals are cleared (per POSIX, child starts with no pending signals).
+    pub fn from_parts(handlers: [SignalHandler; 64], blocked: u64) -> Self {
+        SignalState { handlers, blocked, pending: 0 }
+    }
+
+    /// Get the raw handlers array for serialization.
+    pub fn handlers(&self) -> &[SignalHandler; 64] {
+        &self.handlers
+    }
 }
 
 #[cfg(test)]
@@ -169,5 +180,22 @@ mod tests {
         assert_eq!(default_action(SIGCHLD), DefaultAction::Ignore);
         assert_eq!(default_action(SIGCONT), DefaultAction::Continue);
         assert_eq!(default_action(SIGSTOP), DefaultAction::Stop);
+    }
+
+    #[test]
+    fn test_from_parts_clears_pending() {
+        let handlers = [SignalHandler::Default; 64];
+        let state = SignalState::from_parts(handlers, 0x0000_0004);
+        assert_eq!(state.blocked, 0x0000_0004);
+        assert_eq!(state.pending, 0); // always cleared for fork
+    }
+
+    #[test]
+    fn test_handlers_accessor() {
+        let mut state = SignalState::new();
+        state.set_handler(SIGINT, SignalHandler::Ignore).unwrap();
+        let handlers = state.handlers();
+        assert_eq!(handlers[SIGINT as usize], SignalHandler::Ignore);
+        assert_eq!(handlers[SIGTERM as usize], SignalHandler::Default);
     }
 }

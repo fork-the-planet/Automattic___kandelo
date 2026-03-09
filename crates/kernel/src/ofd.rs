@@ -15,6 +15,7 @@ pub enum FileType {
     Socket,
 }
 
+#[derive(Clone)]
 pub struct OpenFileDesc {
     pub file_type: FileType,
     pub status_flags: u32,
@@ -94,6 +95,17 @@ impl OfdTable {
         } else {
             false
         }
+    }
+
+    /// Iterate over all open file descriptions with their indices.
+    pub fn iter(&self) -> impl Iterator<Item = (usize, &OpenFileDesc)> + '_ {
+        self.entries.iter().enumerate()
+            .filter_map(|(i, e)| e.as_ref().map(|ofd| (i, ofd)))
+    }
+
+    /// Reconstruct an OfdTable from raw entries. Used by fork deserialization.
+    pub fn from_raw(entries: Vec<Option<OpenFileDesc>>) -> Self {
+        OfdTable { entries }
     }
 
     /// Update status flags with F_SETFL semantics.
@@ -208,5 +220,56 @@ mod tests {
         assert_eq!(table.get(0).unwrap().host_handle, 10);
         assert_eq!(table.get(1).unwrap().host_handle, 20);
         assert_eq!(table.get(2).unwrap().host_handle, 30);
+    }
+
+    #[test]
+    fn test_iter_returns_open_ofds() {
+        let mut table = OfdTable::new();
+        let idx0 = table.create(FileType::Regular, O_RDONLY, 10);
+        let idx1 = table.create(FileType::Pipe, O_RDWR, 20);
+
+        let ofds: Vec<(usize, &OpenFileDesc)> = table.iter().collect();
+        assert_eq!(ofds.len(), 2);
+        assert_eq!(ofds[0].0, idx0);
+        assert_eq!(ofds[0].1.host_handle, 10);
+        assert_eq!(ofds[1].0, idx1);
+        assert_eq!(ofds[1].1.host_handle, 20);
+    }
+
+    #[test]
+    fn test_iter_skips_freed_slots() {
+        let mut table = OfdTable::new();
+        table.create(FileType::Regular, O_RDONLY, 10);
+        table.create(FileType::Pipe, O_RDWR, 20);
+        table.dec_ref(0); // free slot 0
+
+        let ofds: Vec<(usize, &OpenFileDesc)> = table.iter().collect();
+        assert_eq!(ofds.len(), 1);
+        assert_eq!(ofds[0].0, 1);
+    }
+
+    #[test]
+    fn test_from_raw_roundtrip() {
+        let mut table = OfdTable::new();
+        table.create(FileType::Regular, O_RDONLY, 10);
+        table.create(FileType::Socket, O_RDWR, 30);
+
+        // Build raw entries from iteration
+        let max_idx = table.iter().map(|(i, _)| i).max().unwrap_or(0);
+        let mut raw: Vec<Option<OpenFileDesc>> = (0..=max_idx).map(|_| None).collect();
+        for (i, ofd) in table.iter() {
+            raw[i] = Some(OpenFileDesc {
+                file_type: ofd.file_type,
+                status_flags: ofd.status_flags,
+                host_handle: ofd.host_handle,
+                offset: ofd.offset,
+                ref_count: ofd.ref_count,
+                owner_pid: ofd.owner_pid,
+            });
+        }
+
+        let rebuilt = OfdTable::from_raw(raw);
+        assert_eq!(rebuilt.get(0).unwrap().host_handle, 10);
+        assert_eq!(rebuilt.get(1).unwrap().host_handle, 30);
     }
 }
