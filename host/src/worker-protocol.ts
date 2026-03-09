@@ -53,7 +53,8 @@ export type WorkerToHostMessage =
   | WorkerReadyMessage
   | WorkerExitMessage
   | WorkerErrorMessage
-  | ForkStateMessage;
+  | ForkStateMessage
+  | KillRequestMessage;
 
 export interface WorkerReadyMessage {
   type: "ready";
@@ -76,4 +77,11 @@ export interface ForkStateMessage {
   type: "fork_state";
   pid: number;
   data: ArrayBuffer;
+}
+
+export interface KillRequestMessage {
+  type: "kill_request";
+  pid: number;
+  signal: number;
+  sourcePid: number;
 }

@@ -22,16 +22,22 @@ const WASM_STAT_SIZE = 88;
 /** Size of the WasmDirent struct: d_ino(u64) + d_type(u32) + d_namlen(u32). */
 const WASM_DIRENT_SIZE = 16;
 
+export interface KernelCallbacks {
+  onKill?: (pid: number, signal: number) => number;
+}
+
 export class WasmPosixKernel {
   private config: KernelConfig;
   private io: PlatformIO;
+  private callbacks: KernelCallbacks;
   private instance: WebAssembly.Instance | null = null;
   private memory: WebAssembly.Memory | null = null;
   private sharedPipes = new Map<number, { pipe: SharedPipeBuffer; end: "read" | "write" }>();
 
-  constructor(config: KernelConfig, io: PlatformIO) {
+  constructor(config: KernelConfig, io: PlatformIO, callbacks?: KernelCallbacks) {
     this.config = config;
     this.io = io;
+    this.callbacks = callbacks ?? {};
   }
 
   registerSharedPipe(handle: number, sab: SharedArrayBuffer, end: "read" | "write"): void {
@@ -214,10 +220,8 @@ export class WasmPosixKernel {
         host_fchown: (handle: bigint, uid: number, gid: number): number => {
           return this.hostFchown(handle, uid, gid);
         },
-        host_kill: (_pid: number, _sig: number): number => {
-          // Stub: cross-process kill not yet implemented (Task 4).
-          // Return -ESRCH (3) to indicate no such process.
-          return -3;
+        host_kill: (pid: number, sig: number): number => {
+          return this.hostKill(pid, sig);
         },
       },
     };
@@ -1099,6 +1103,15 @@ export class WasmPosixKernel {
     } catch {
       return -1;
     }
+  }
+
+  // ---- Phase 13d: Cross-process kill ----
+
+  private hostKill(pid: number, sig: number): number {
+    if (this.callbacks.onKill) {
+      return this.callbacks.onKill(pid, sig);
+    }
+    return -3; // -ESRCH: no callback means can't reach other processes
   }
 
   // ---- Public API: Socket & Poll operations ----

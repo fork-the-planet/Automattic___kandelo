@@ -35,4 +35,21 @@ describe("WasmPosixKernel", () => {
     const result = kernelDup(99);
     expect(result).toBeLessThan(0); // EBADF
   });
+
+  it("should accept onKill callback in constructor", () => {
+    let killArgs: { pid: number; signal: number } | null = null;
+    const kernel = new WasmPosixKernel(
+      { maxWorkers: 4, dataBufferSize: 65536, useSharedMemory: false },
+      new NodePlatformIO(),
+      {
+        onKill: (pid, signal) => {
+          killArgs = { pid, signal };
+          return 0;
+        },
+      },
+    );
+    expect(kernel).toBeDefined();
+    // killArgs is unused here but verifies the callback type is accepted
+    expect(killArgs).toBeNull();
+  });
 });

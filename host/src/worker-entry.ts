@@ -21,7 +21,17 @@ export async function workerMain(
   initData: WorkerInitMessage,
 ): Promise<void> {
   try {
-    const kernel = new WasmPosixKernel(initData.kernelConfig, new NodePlatformIO());
+    const kernel = new WasmPosixKernel(initData.kernelConfig, new NodePlatformIO(), {
+      onKill: (pid: number, signal: number): number => {
+        port.postMessage({
+          type: "kill_request",
+          pid,
+          signal,
+          sourcePid: initData.pid,
+        } satisfies WorkerToHostMessage);
+        return 0; // fire-and-forget from kernel's perspective
+      },
+    });
     await kernel.init(initData.wasmBytes);
 
     const instance = kernel.getInstance()!;

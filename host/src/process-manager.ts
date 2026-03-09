@@ -109,6 +109,13 @@ export class ProcessManager {
               reject(new Error(m.message));
             }
             break;
+          case "kill_request":
+            try {
+              this.deliverSignal(m.pid, m.signal);
+            } catch {
+              // Target doesn't exist — ESRCH, but caller already returned 0
+            }
+            break;
         }
       });
 
@@ -249,6 +256,13 @@ export class ProcessManager {
               clearTimeout(timeout);
               cleanup();
               reject(new Error(m.message));
+            }
+            break;
+          case "kill_request":
+            try {
+              this.deliverSignal(m.pid, m.signal);
+            } catch {
+              // Target doesn't exist — ESRCH, but caller already returned 0
             }
             break;
         }

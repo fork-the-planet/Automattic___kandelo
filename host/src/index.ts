@@ -1,4 +1,5 @@
 export { WasmPosixKernel } from "./kernel";
+export type { KernelCallbacks } from "./kernel";
 export { SyscallChannel, ChannelStatus } from "./channel";
 export { NodePlatformIO } from "./platform/node";
 export { ProcessManager } from "./process-manager";
@@ -17,4 +18,5 @@ export type {
   RegisterPipeMessage,
   ConvertPipeMessage,
   DeliverSignalMessage,
+  KillRequestMessage,
 } from "./worker-protocol";

@@ -452,6 +452,55 @@ describe("ProcessManager.deliverSignal()", () => {
   });
 });
 
+describe("ProcessManager kill_request handling", () => {
+  it("should handle kill_request from worker by delivering signal", async () => {
+    const { pm, adapter } = createTestPM();
+
+    // Spawn two processes
+    const p1 = pm.spawn();
+    const worker1 = adapter.lastWorker!;
+    worker1.simulateMessage({ type: "ready", pid: 1 });
+    await p1;
+
+    const p2 = pm.spawn();
+    const worker2 = adapter.lastWorker!;
+    worker2.simulateMessage({ type: "ready", pid: 2 });
+    await p2;
+
+    // Simulate a kill_request message from worker 1 targeting worker 2
+    worker1.simulateMessage({
+      type: "kill_request",
+      pid: 2,
+      signal: 15,
+      sourcePid: 1,
+    });
+
+    // Check that deliver_signal was sent to worker 2
+    const signalMsgs = worker2.sentMessages.filter(
+      (m: any) => m.type === "deliver_signal",
+    );
+    expect(signalMsgs).toHaveLength(1);
+    expect(signalMsgs[0]).toEqual({ type: "deliver_signal", signal: 15 });
+  });
+
+  it("should silently ignore kill_request for non-existent target", async () => {
+    const { pm, adapter } = createTestPM();
+
+    const p1 = pm.spawn();
+    const worker1 = adapter.lastWorker!;
+    worker1.simulateMessage({ type: "ready", pid: 1 });
+    await p1;
+
+    // kill_request targeting non-existent pid 99 — should not throw
+    worker1.simulateMessage({
+      type: "kill_request",
+      pid: 99,
+      signal: 15,
+      sourcePid: 1,
+    });
+  });
+});
+
 describe("ProcessManager.waitpid()", () => {
   it("should return immediately for already-exited child", async () => {
     const { pm, adapter } = createTestPM();
