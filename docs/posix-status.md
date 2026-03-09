@@ -26,7 +26,7 @@ This document tracks the implementation status of POSIX APIs in the wasm-posix-k
 | `dup()` | Full | Lowest available fd. FD_CLOEXEC cleared. Shares OFD with original. |
 | `dup2()` | Full | Atomic close-and-dup. Same-fd no-op. FD_CLOEXEC cleared. |
 | `dup3()` | Full | Like dup2 but returns EINVAL if oldfd==newfd. Supports O_CLOEXEC flag. |
-| `pipe()` | Partial | Kernel-space ring buffer (64KB). PIPE_BUF=4096. O_NONBLOCK enforced (EAGAIN). Blocking read/write not yet implemented (needs cross-worker IPC). |
+| `pipe()` | Partial | Kernel-space ring buffer (64KB). PIPE_BUF=4096. O_NONBLOCK enforced (EAGAIN). Cross-process pipes via SharedArrayBuffer after fork. Blocking read/write not yet implemented. |
 | `pipe2()` | Full | Like pipe with O_NONBLOCK and O_CLOEXEC flag support. |
 | `readv()` | Full | Scatter read. Iterates over iovec array calling sys_read for each buffer. Stops on short read or EOF. |
 | `writev()` | Full | Gather write. Iterates over iovec array calling sys_write for each buffer. Stops on short write. |
@@ -232,3 +232,8 @@ These features require SharedArrayBuffer (and cross-origin isolation headers in 
 - kernel_get_fork_state / kernel_init_from_fork Wasm exports
 - ProcessManager.fork() with state transfer to child worker
 - ProcessManager.waitpid() with WNOHANG support
+13c. **Phase 13c (Complete):** Cross-Process Pipes
+- SharedPipeBuffer class (SharedArrayBuffer ring buffer with atomics)
+- Host-delegated pipe support in kernel (host_handle >= 0 routes to host_read/host_write)
+- kernel_convert_pipe_to_host Wasm export
+- Pipe detection and conversion on fork via ProcessManager
