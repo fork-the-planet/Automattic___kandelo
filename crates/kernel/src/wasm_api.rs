@@ -1037,6 +1037,46 @@ pub extern "C" fn kernel_closedir(dir_handle: i32) -> i32 {
     result
 }
 
+/// Rewind a directory stream to the beginning. Returns 0 on success, or negative errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_rewinddir(dir_handle: i32) -> i32 {
+    let proc = unsafe { get_process() };
+    let mut host = WasmHostIO;
+    let result = match syscalls::sys_rewinddir(proc, &mut host, dir_handle) {
+        Ok(()) => 0,
+        Err(e) => -(e as i32),
+    };
+    deliver_pending_signals(proc, &mut host);
+    result
+}
+
+/// Return current position in a directory stream. Returns position (>= 0) or negative errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_telldir(dir_handle: i32) -> i64 {
+    let proc = unsafe { get_process() };
+    let mut host = WasmHostIO;
+    let result = match syscalls::sys_telldir(proc, dir_handle) {
+        Ok(pos) => pos as i64,
+        Err(e) => -(e as i64),
+    };
+    deliver_pending_signals(proc, &mut host);
+    result
+}
+
+/// Seek to a position in a directory stream. Returns 0 on success, or negative errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_seekdir(dir_handle: i32, loc_lo: u32, loc_hi: u32) -> i32 {
+    let proc = unsafe { get_process() };
+    let mut host = WasmHostIO;
+    let loc = (loc_hi as u64) << 32 | (loc_lo as u64);
+    let result = match syscalls::sys_seekdir(proc, &mut host, dir_handle, loc) {
+        Ok(()) => 0,
+        Err(e) => -(e as i32),
+    };
+    deliver_pending_signals(proc, &mut host);
+    result
+}
+
 /// Get the process ID.
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_getpid() -> i32 {

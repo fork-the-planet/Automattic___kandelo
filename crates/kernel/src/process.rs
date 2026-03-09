@@ -15,6 +15,8 @@ use crate::terminal::TerminalState;
 /// A handle to an open directory stream for readdir iteration.
 pub struct DirStream {
     pub host_handle: i64,
+    pub path: Vec<u8>,     // resolved directory path (for rewinddir)
+    pub position: u64,     // entry counter (for telldir/seekdir)
 }
 
 /// Trait for host I/O operations that the kernel delegates to the runtime.

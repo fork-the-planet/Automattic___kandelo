@@ -119,6 +119,9 @@ pub enum Syscall {
     Fpathconf = 113,
     Getsockname = 114,
     Getpeername = 115,
+    Rewinddir = 116,
+    Telldir = 117,
+    Seekdir = 118,
 }
 
 impl Syscall {
@@ -240,6 +243,9 @@ impl Syscall {
             113 => Some(Syscall::Fpathconf),
             114 => Some(Syscall::Getsockname),
             115 => Some(Syscall::Getpeername),
+            116 => Some(Syscall::Rewinddir),
+            117 => Some(Syscall::Telldir),
+            118 => Some(Syscall::Seekdir),
             _ => None,
         }
     }

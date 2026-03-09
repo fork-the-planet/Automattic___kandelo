@@ -890,7 +890,7 @@ pub fn sys_getcwd(proc: &Process, buf: &mut [u8]) -> Result<usize, Errno> {
 pub fn sys_opendir(proc: &mut Process, host: &mut dyn HostIO, path: &[u8]) -> Result<i32, Errno> {
     let resolved = crate::path::resolve_path(path, &proc.cwd);
     let host_handle = host.host_opendir(&resolved)?;
-    let stream = DirStream { host_handle };
+    let stream = DirStream { host_handle, path: resolved, position: 0 };
 
     // Find a free slot or append
     for (i, slot) in proc.dir_streams.iter().enumerate() {
@@ -940,6 +940,10 @@ pub fn sys_readdir(
                 };
                 dirent_buf[..dirent_size].copy_from_slice(dirent_bytes);
             }
+            // Increment position
+            if let Some(stream) = proc.dir_streams.get_mut(idx).and_then(|s| s.as_mut()) {
+                stream.position += 1;
+            }
             Ok(1)
         }
         None => Ok(0),
@@ -954,6 +958,49 @@ pub fn sys_closedir(proc: &mut Process, host: &mut dyn HostIO, dir_handle: i32) 
     }
     let stream = proc.dir_streams[idx].take().ok_or(Errno::EBADF)?;
     host.host_closedir(stream.host_handle)
+}
+
+/// Rewind a directory stream to the beginning.
+pub fn sys_rewinddir(proc: &mut Process, host: &mut dyn HostIO, dir_handle: i32) -> Result<(), Errno> {
+    let idx = dir_handle as usize;
+    let stream = proc.dir_streams.get(idx).and_then(|s| s.as_ref()).ok_or(Errno::EBADF)?;
+    let path = stream.path.clone();
+    let old_handle = stream.host_handle;
+
+    host.host_closedir(old_handle)?;
+    let new_handle = host.host_opendir(&path)?;
+
+    let stream = proc.dir_streams.get_mut(idx).and_then(|s| s.as_mut()).ok_or(Errno::EBADF)?;
+    stream.host_handle = new_handle;
+    stream.position = 0;
+    Ok(())
+}
+
+/// Return the current position in a directory stream.
+pub fn sys_telldir(proc: &Process, dir_handle: i32) -> Result<u64, Errno> {
+    let idx = dir_handle as usize;
+    let stream = proc.dir_streams.get(idx).and_then(|s| s.as_ref()).ok_or(Errno::EBADF)?;
+    Ok(stream.position)
+}
+
+/// Seek to a position in a directory stream.
+pub fn sys_seekdir(proc: &mut Process, host: &mut dyn HostIO, dir_handle: i32, loc: u64) -> Result<(), Errno> {
+    // Rewind to beginning, then skip `loc` entries
+    sys_rewinddir(proc, host, dir_handle)?;
+    let idx = dir_handle as usize;
+    let mut name_buf = [0u8; 256];
+    for _ in 0..loc {
+        let stream = proc.dir_streams.get(idx).and_then(|s| s.as_ref()).ok_or(Errno::EBADF)?;
+        let handle = stream.host_handle;
+        match host.host_readdir(handle, &mut name_buf)? {
+            Some(_) => {},
+            None => break, // past end of directory
+        }
+    }
+    if let Some(stream) = proc.dir_streams.get_mut(idx).and_then(|s| s.as_mut()) {
+        stream.position = loc;
+    }
+    Ok(())
 }
 
 /// Get the process ID.
@@ -2736,13 +2783,15 @@ mod tests {
     struct MockHostIO {
         next_handle: i64,
         dir_entry_returned: bool,
+        dir_entry_index: usize,     // current position in mock directory
+        dir_entry_count: usize,     // total number of mock entries
         sigsuspend_signal: u32,
         sigsuspend_error: bool,
     }
 
     impl MockHostIO {
         fn new() -> Self {
-            MockHostIO { next_handle: 100, dir_entry_returned: false, sigsuspend_signal: 0, sigsuspend_error: false }
+            MockHostIO { next_handle: 100, dir_entry_returned: false, dir_entry_index: 0, dir_entry_count: 1, sigsuspend_signal: 0, sigsuspend_error: false }
         }
     }
 
@@ -2843,15 +2892,23 @@ mod tests {
         fn host_chown(&mut self, _path: &[u8], _uid: u32, _gid: u32) -> Result<(), Errno> { Ok(()) }
         fn host_access(&mut self, _path: &[u8], _amode: u32) -> Result<(), Errno> { Ok(()) }
 
-        fn host_opendir(&mut self, _path: &[u8]) -> Result<i64, Errno> { Ok(200) }
+        fn host_opendir(&mut self, _path: &[u8]) -> Result<i64, Errno> {
+            self.dir_entry_returned = false;
+            self.dir_entry_index = 0;
+            Ok(200)
+        }
 
         fn host_readdir(&mut self, _handle: i64, name_buf: &mut [u8]) -> Result<Option<(u64, u32, usize)>, Errno> {
-            if !self.dir_entry_returned {
+            if self.dir_entry_index < self.dir_entry_count {
+                let idx = self.dir_entry_index;
+                self.dir_entry_index += 1;
                 self.dir_entry_returned = true;
-                let name = b"test.txt";
+                // Generate distinct entries based on index
+                let names: [&[u8]; 5] = [b"test.txt", b"foo.txt", b"bar.txt", b"baz.txt", b"qux.txt"];
+                let name = if idx < names.len() { names[idx] } else { b"test.txt" };
                 let n = name_buf.len().min(name.len());
                 name_buf[..n].copy_from_slice(&name[..n]);
-                Ok(Some((42, 8, n))) // d_ino=42, d_type=DT_REG=8, name_len
+                Ok(Some(((42 + idx as u64), 8, n))) // d_ino varies, d_type=DT_REG=8
             } else {
                 Ok(None) // end of directory
             }
@@ -3309,6 +3366,102 @@ mod tests {
         let dh1 = sys_opendir(&mut proc, &mut host, b"/tmp").unwrap();
         assert_eq!(dh1, 0);
         sys_closedir(&mut proc, &mut host, dh1).unwrap();
+    }
+
+    #[test]
+    fn test_rewinddir_resets_position() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        host.dir_entry_count = 2; // two entries: test.txt, foo.txt
+        let dh = sys_opendir(&mut proc, &mut host, b"/tmp").unwrap();
+
+        let mut dirent_buf = [0u8; 16];
+        let mut name_buf = [0u8; 256];
+
+        // Read first entry
+        let r = sys_readdir(&mut proc, &mut host, dh, &mut dirent_buf, &mut name_buf).unwrap();
+        assert_eq!(r, 1);
+        assert_eq!(&name_buf[..8], b"test.txt");
+
+        // Read second entry
+        let r = sys_readdir(&mut proc, &mut host, dh, &mut dirent_buf, &mut name_buf).unwrap();
+        assert_eq!(r, 1);
+        assert_eq!(&name_buf[..7], b"foo.txt");
+
+        // End of directory
+        let r = sys_readdir(&mut proc, &mut host, dh, &mut dirent_buf, &mut name_buf).unwrap();
+        assert_eq!(r, 0);
+
+        // Rewind
+        sys_rewinddir(&mut proc, &mut host, dh).unwrap();
+
+        // Read again — should get first entry again
+        let r = sys_readdir(&mut proc, &mut host, dh, &mut dirent_buf, &mut name_buf).unwrap();
+        assert_eq!(r, 1);
+        assert_eq!(&name_buf[..8], b"test.txt");
+
+        sys_closedir(&mut proc, &mut host, dh).unwrap();
+    }
+
+    #[test]
+    fn test_telldir_returns_position() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        host.dir_entry_count = 3;
+        let dh = sys_opendir(&mut proc, &mut host, b"/tmp").unwrap();
+
+        // Position starts at 0
+        assert_eq!(sys_telldir(&proc, dh).unwrap(), 0);
+
+        let mut dirent_buf = [0u8; 16];
+        let mut name_buf = [0u8; 256];
+
+        // Read one entry, position should be 1
+        sys_readdir(&mut proc, &mut host, dh, &mut dirent_buf, &mut name_buf).unwrap();
+        assert_eq!(sys_telldir(&proc, dh).unwrap(), 1);
+
+        // Read another, position should be 2
+        sys_readdir(&mut proc, &mut host, dh, &mut dirent_buf, &mut name_buf).unwrap();
+        assert_eq!(sys_telldir(&proc, dh).unwrap(), 2);
+
+        sys_closedir(&mut proc, &mut host, dh).unwrap();
+    }
+
+    #[test]
+    fn test_seekdir_skips_entries() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        host.dir_entry_count = 4; // test.txt, foo.txt, bar.txt, baz.txt
+
+        let dh = sys_opendir(&mut proc, &mut host, b"/tmp").unwrap();
+
+        let mut dirent_buf = [0u8; 16];
+        let mut name_buf = [0u8; 256];
+
+        // Read first 3 entries
+        sys_readdir(&mut proc, &mut host, dh, &mut dirent_buf, &mut name_buf).unwrap();
+        sys_readdir(&mut proc, &mut host, dh, &mut dirent_buf, &mut name_buf).unwrap();
+        sys_readdir(&mut proc, &mut host, dh, &mut dirent_buf, &mut name_buf).unwrap();
+        assert_eq!(sys_telldir(&proc, dh).unwrap(), 3);
+
+        // Seek to position 1
+        sys_seekdir(&mut proc, &mut host, dh, 1).unwrap();
+        assert_eq!(sys_telldir(&proc, dh).unwrap(), 1);
+
+        // Read should give entry at position 1 (foo.txt)
+        let r = sys_readdir(&mut proc, &mut host, dh, &mut dirent_buf, &mut name_buf).unwrap();
+        assert_eq!(r, 1);
+        assert_eq!(&name_buf[..7], b"foo.txt");
+
+        sys_closedir(&mut proc, &mut host, dh).unwrap();
+    }
+
+    #[test]
+    fn test_rewinddir_invalid_handle() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let result = sys_rewinddir(&mut proc, &mut host, 99);
+        assert_eq!(result, Err(Errno::EBADF));
     }
 
     #[test]
