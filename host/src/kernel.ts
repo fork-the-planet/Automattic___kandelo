@@ -192,6 +192,12 @@ export class WasmPosixKernel {
         host_nanosleep: (sec: bigint, nsec: bigint): number => {
           return this.hostNanosleep(sec, nsec);
         },
+        host_ftruncate: (handle: bigint, length: bigint): number => {
+          return this.hostFtruncate(handle, length);
+        },
+        host_fsync: (handle: bigint): number => {
+          return this.hostFsync(handle);
+        },
         host_fchmod: (handle: bigint, mode: number): number => {
           return this.hostFchmod(handle, mode);
         },
@@ -973,7 +979,44 @@ export class WasmPosixKernel {
     }
   }
 
-  // ---- Phase 11: fchmod/fchown host imports ----
+  // ---- Phase 11: ftruncate/fsync/fchmod/fchown host imports ----
+
+  private hostFtruncate(handle: bigint, length: bigint): number {
+    const h = Number(handle);
+    const l = Number(length);
+    try {
+      let result = 0;
+      this.io
+        .ftruncate(h, l)
+        .then(() => {
+          result = 0;
+        })
+        .catch(() => {
+          result = -1;
+        });
+      return result;
+    } catch {
+      return -1;
+    }
+  }
+
+  private hostFsync(handle: bigint): number {
+    const h = Number(handle);
+    try {
+      let result = 0;
+      this.io
+        .fsync(h)
+        .then(() => {
+          result = 0;
+        })
+        .catch(() => {
+          result = -1;
+        });
+      return result;
+    } catch {
+      return -1;
+    }
+  }
 
   /**
    * host_fchmod(handle: i64, mode: u32) -> i32
