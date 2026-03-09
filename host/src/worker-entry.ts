@@ -56,6 +56,10 @@ export async function workerMain(
 
     let instance = kernel.getInstance()!;
 
+    if (initData.signalWakeSab) {
+      kernel.registerSignalWakeSab(initData.signalWakeSab);
+    }
+
     if (initData.forkState) {
       // Fork init: write fork state to Wasm memory and call kernel_init_from_fork
       const memory = kernel.getMemory()!;
@@ -195,6 +199,11 @@ export async function workerMain(
               // 4. Transfer shared pipe registrations from old kernel
               for (const [handle, entry] of kernel.getSharedPipes()) {
                 newKernel.registerSharedPipe(handle, entry.pipe.getBuffer(), entry.end);
+              }
+
+              // Transfer signal wake SAB to new kernel
+              if (initData.signalWakeSab) {
+                newKernel.registerSignalWakeSab(initData.signalWakeSab);
               }
 
               // 5. Replace references

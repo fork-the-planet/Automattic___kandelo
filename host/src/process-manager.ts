@@ -15,6 +15,7 @@ export interface ProcessInfo {
   state: "starting" | "running" | "zombie";
   exitStatus?: number;
   alarmTimer?: ReturnType<typeof setTimeout>;
+  signalWakeSab?: SharedArrayBuffer;
 }
 
 export interface ProcessManagerConfig {
@@ -49,6 +50,8 @@ export class ProcessManager {
     const pid = this.nextPid++;
     const ppid = options?.ppid ?? 0;
 
+    const signalWakeSab = new SharedArrayBuffer(8);
+
     const initData: WorkerInitMessage = {
       type: "init",
       pid,
@@ -57,6 +60,7 @@ export class ProcessManager {
       kernelConfig: this.config.kernelConfig,
       env: options?.env,
       cwd: options?.cwd,
+      signalWakeSab,
     };
 
     const worker = this.config.workerAdapter.createWorker(initData);
@@ -68,6 +72,7 @@ export class ProcessManager {
       sid: pid,
       worker,
       state: "starting",
+      signalWakeSab,
     };
 
     this.processes.set(pid, info);
@@ -193,6 +198,8 @@ export class ProcessManager {
     // Allocate child PID
     const childPid = this.nextPid++;
 
+    const signalWakeSab = new SharedArrayBuffer(8);
+
     // Create child worker with fork state
     const initData: WorkerInitMessage = {
       type: "init",
@@ -201,6 +208,7 @@ export class ProcessManager {
       wasmBytes: this.config.wasmBytes,
       kernelConfig: this.config.kernelConfig,
       forkState,
+      signalWakeSab,
     };
 
     const worker = this.config.workerAdapter.createWorker(initData);
@@ -211,6 +219,7 @@ export class ProcessManager {
       sid: parentInfo.sid,
       worker,
       state: "starting",
+      signalWakeSab,
     };
     this.processes.set(childPid, childInfo);
 
@@ -508,7 +517,17 @@ export class ProcessManager {
     }
     // sig=0 is a POSIX existence check — no actual signal delivery
     if (signal === 0) return;
+
+    // Normal delivery via message
     info.worker.postMessage({ type: "deliver_signal", signal });
+
+    // Also wake via shared memory (for sigsuspend)
+    if (info.signalWakeSab) {
+      const view = new Int32Array(info.signalWakeSab);
+      Atomics.store(view, 1, signal);
+      Atomics.store(view, 0, 1);
+      Atomics.notify(view, 0);
+    }
   }
 
   async terminate(pid: number): Promise<void> {

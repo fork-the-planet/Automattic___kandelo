@@ -42,6 +42,7 @@ export interface WorkerInitMessage {
   env?: string[];
   cwd?: string;
   forkState?: ArrayBuffer;
+  signalWakeSab?: SharedArrayBuffer;
 }
 
 export interface WorkerTerminateMessage {

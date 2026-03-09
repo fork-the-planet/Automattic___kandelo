@@ -35,6 +35,7 @@ export class WasmPosixKernel {
   private instance: WebAssembly.Instance | null = null;
   private memory: WebAssembly.Memory | null = null;
   private sharedPipes = new Map<number, { pipe: SharedPipeBuffer; end: "read" | "write" }>();
+  private signalWakeSab: SharedArrayBuffer | null = null;
 
   constructor(config: KernelConfig, io: PlatformIO, callbacks?: KernelCallbacks) {
     this.config = config;
@@ -53,6 +54,10 @@ export class WasmPosixKernel {
   /** Returns all registered shared pipes (for transferring during exec). */
   getSharedPipes(): Map<number, { pipe: SharedPipeBuffer; end: "read" | "write" }> {
     return this.sharedPipes;
+  }
+
+  registerSignalWakeSab(sab: SharedArrayBuffer): void {
+    this.signalWakeSab = sab;
   }
 
   /**
@@ -237,8 +242,7 @@ export class WasmPosixKernel {
           return this.hostSetAlarm(seconds);
         },
         host_sigsuspend_wait: (): number => {
-          // Stub: sigsuspend host infrastructure added in a later task
-          return -1;
+          return this.hostSigsuspendWait();
         },
       },
     };
@@ -1149,6 +1153,30 @@ export class WasmPosixKernel {
       return this.callbacks.onAlarm(seconds);
     }
     return 0;
+  }
+
+  private hostSigsuspendWait(): number {
+    if (!this.signalWakeSab) {
+      return -(4); // -EINTR, no SAB available
+    }
+    const view = new Int32Array(this.signalWakeSab);
+
+    // Check if already signaled (race-safe via CAS)
+    const old = Atomics.compareExchange(view, 0, 1, 0);
+    if (old === 1) {
+      const sig = Atomics.load(view, 1);
+      Atomics.store(view, 1, 0);
+      return sig;
+    }
+
+    // Block until notified
+    Atomics.wait(view, 0, 0);
+
+    // Read signal and reset
+    const sig = Atomics.load(view, 1);
+    Atomics.store(view, 0, 0);
+    Atomics.store(view, 1, 0);
+    return sig;
   }
 
   // ---- Public API: Socket & Poll operations ----
