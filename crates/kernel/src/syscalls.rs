@@ -1044,7 +1044,14 @@ pub fn sys_sigsuspend(proc: &mut Process, host: &mut dyn HostIO, mask: u64) -> R
 
     // Block until a deliverable signal arrives
     loop {
-        let sig = host.host_sigsuspend_wait()?;
+        let sig = match host.host_sigsuspend_wait() {
+            Ok(s) => s,
+            Err(_) => {
+                // Restore mask even on host error
+                proc.signals.blocked = old_mask;
+                return Err(Errno::EINTR);
+            }
+        };
         if sig > 0 && sig < NSIG {
             proc.signals.raise(sig);
         }
@@ -2526,11 +2533,12 @@ mod tests {
         next_handle: i64,
         dir_entry_returned: bool,
         sigsuspend_signal: u32,
+        sigsuspend_error: bool,
     }
 
     impl MockHostIO {
         fn new() -> Self {
-            MockHostIO { next_handle: 100, dir_entry_returned: false, sigsuspend_signal: 0 }
+            MockHostIO { next_handle: 100, dir_entry_returned: false, sigsuspend_signal: 0, sigsuspend_error: false }
         }
     }
 
@@ -2684,6 +2692,9 @@ mod tests {
         }
 
         fn host_sigsuspend_wait(&mut self) -> Result<u32, Errno> {
+            if self.sigsuspend_error {
+                return Err(Errno::EINTR);
+            }
             Ok(self.sigsuspend_signal)
         }
     }
@@ -5096,5 +5107,17 @@ mod tests {
         let result = sys_sigsuspend(&mut proc, &mut host, mask);
         assert_eq!(result, Err(Errno::EINTR));
         assert!(proc.signals.is_pending(9));
+    }
+
+    #[test]
+    fn test_sigsuspend_restores_mask_on_host_error() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        proc.signals.blocked = 0xFF;
+        host.sigsuspend_error = true;
+        let result = sys_sigsuspend(&mut proc, &mut host, 0);
+        assert_eq!(result, Err(Errno::EINTR));
+        // Mask must be restored even when host returns error
+        assert_eq!(proc.signals.blocked, 0xFF);
     }
 }
