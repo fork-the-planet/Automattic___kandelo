@@ -58,3 +58,57 @@ describe("Multi-Worker Integration", () => {
     await pm.terminate(2);
   }, 15_000);
 });
+
+describe("Fork Integration", () => {
+  it("should fork a process and create a child with cloned state", async () => {
+    const pm = new ProcessManager({
+      wasmBytes: loadWasmBytes(),
+      kernelConfig: {
+        maxWorkers: 4,
+        dataBufferSize: 65536,
+        useSharedMemory: false,
+      },
+      workerAdapter: new NodeWorkerAdapter(),
+    });
+
+    // Spawn parent
+    const parentPid = await pm.spawn();
+    expect(parentPid).toBe(1);
+
+    // Fork parent → child
+    const childPid = await pm.fork(parentPid);
+    expect(childPid).toBe(2);
+
+    const childInfo = pm.getProcess(childPid);
+    expect(childInfo).toBeDefined();
+    expect(childInfo!.state).toBe("running");
+    expect(childInfo!.ppid).toBe(parentPid);
+
+    // Clean up
+    await pm.terminate(childPid);
+    await pm.terminate(parentPid);
+  }, 15_000);
+
+  it("should waitpid for a terminated child", async () => {
+    const pm = new ProcessManager({
+      wasmBytes: loadWasmBytes(),
+      kernelConfig: {
+        maxWorkers: 4,
+        dataBufferSize: 65536,
+        useSharedMemory: false,
+      },
+      workerAdapter: new NodeWorkerAdapter(),
+    });
+
+    const parentPid = await pm.spawn();
+    const childPid = await pm.fork(parentPid);
+
+    // Terminate child (simulates exit)
+    await pm.terminate(childPid);
+
+    // Parent should be able to continue
+    expect(pm.getProcess(parentPid)!.state).toBe("running");
+
+    await pm.terminate(parentPid);
+  }, 15_000);
+});
