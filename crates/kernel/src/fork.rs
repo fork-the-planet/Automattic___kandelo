@@ -469,6 +469,7 @@ pub fn deserialize_fork_state(buf: &[u8], child_pid: u32) -> Result<Process, Err
         environ,
         umask,
         rlimits,
+        alarm_deadline_ns: 0,
     })
 }
 
@@ -751,6 +752,7 @@ pub fn deserialize_exec_state(buf: &[u8], pid: u32) -> Result<Process, Errno> {
         environ,
         umask,
         rlimits,
+        alarm_deadline_ns: 0,
     })
 }
 

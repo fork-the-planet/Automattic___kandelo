@@ -48,6 +48,7 @@ pub trait HostIO {
     fn host_fchown(&mut self, handle: i64, uid: u32, gid: u32) -> Result<(), Errno>;
     fn host_kill(&mut self, pid: i32, sig: u32) -> Result<(), Errno>;
     fn host_exec(&mut self, path: &[u8]) -> Result<(), Errno>;
+    fn host_set_alarm(&mut self, seconds: u32) -> Result<(), Errno>;
 }
 
 /// Process lifecycle state.
@@ -82,6 +83,7 @@ pub struct Process {
     pub environ: Vec<Vec<u8>>,
     pub umask: u32,
     pub rlimits: [[u64; 2]; 16], // [soft, hard] pairs for each resource
+    pub alarm_deadline_ns: u64,
 }
 
 impl Process {
@@ -130,6 +132,7 @@ impl Process {
             environ: Vec::new(),
             umask: 0o022,
             rlimits,
+            alarm_deadline_ns: 0,
         }
     }
 }

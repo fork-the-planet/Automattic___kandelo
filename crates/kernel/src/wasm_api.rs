@@ -51,6 +51,7 @@ unsafe extern "C" {
     fn host_fchown(handle: i64, uid: u32, gid: u32) -> i32;
     fn host_kill(pid: i32, sig: u32) -> i32;
     fn host_exec(path_ptr: *const u8, path_len: u32) -> i32;
+    fn host_set_alarm(seconds: u32) -> i32;
 }
 
 // ---------------------------------------------------------------------------
@@ -341,6 +342,11 @@ impl HostIO for WasmHostIO {
         } else {
             Ok(())
         }
+    }
+
+    fn host_set_alarm(&mut self, seconds: u32) -> Result<(), Errno> {
+        let result = unsafe { host_set_alarm(seconds) };
+        i32_to_result(result)
     }
 }
 
@@ -1978,6 +1984,22 @@ pub extern "C" fn kernel_execve(path_ptr: *const u8, path_len: u32) -> i32 {
     let mut host = WasmHostIO;
     match syscalls::sys_execve(proc, &mut host, path) {
         Ok(()) => 0,
+        Err(e) => -(e as i32),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// alarm
+// ---------------------------------------------------------------------------
+
+/// Schedule a SIGALRM after `seconds` seconds.
+/// Returns the number of seconds remaining from a previous alarm, or negative errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_alarm(seconds: u32) -> i32 {
+    let proc = unsafe { get_process() };
+    let mut host = WasmHostIO;
+    match syscalls::sys_alarm(proc, &mut host, seconds) {
+        Ok(remaining) => remaining as i32,
         Err(e) => -(e as i32),
     }
 }

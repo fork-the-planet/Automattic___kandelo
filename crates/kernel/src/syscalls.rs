@@ -997,6 +997,33 @@ pub fn sys_execve(_proc: &mut Process, host: &mut dyn HostIO, path: &[u8]) -> Re
     host.host_exec(path)
 }
 
+/// Schedule a SIGALRM signal after `seconds` seconds.
+/// Returns the number of seconds remaining from a previously scheduled alarm, or 0.
+/// If `seconds` is 0, any pending alarm is cancelled.
+pub fn sys_alarm(proc: &mut Process, host: &mut dyn HostIO, seconds: u32) -> Result<u32, Errno> {
+    let (sec, nsec) = host.host_clock_gettime(wasm_posix_shared::clock::CLOCK_MONOTONIC)?;
+    let now_ns = (sec as u64).wrapping_mul(1_000_000_000).wrapping_add(nsec as u64);
+
+    // Compute remaining seconds from previous alarm (rounded up)
+    let remaining = if proc.alarm_deadline_ns > now_ns {
+        ((proc.alarm_deadline_ns - now_ns + 999_999_999) / 1_000_000_000) as u32
+    } else {
+        0
+    };
+
+    // Set new deadline
+    if seconds > 0 {
+        proc.alarm_deadline_ns = now_ns + (seconds as u64) * 1_000_000_000;
+    } else {
+        proc.alarm_deadline_ns = 0;
+    }
+
+    // Tell host to schedule/cancel timer
+    host.host_set_alarm(seconds)?;
+
+    Ok(remaining)
+}
+
 /// Set signal handler. Returns the previous handler disposition as a u32.
 /// handler_val: 0=SIG_DFL, 1=SIG_IGN, anything else=function pointer (future use)
 pub fn sys_sigaction(proc: &mut Process, sig: u32, handler_val: u32) -> Result<u32, Errno> {
@@ -2615,6 +2642,10 @@ mod tests {
         }
 
         fn host_exec(&mut self, _path: &[u8]) -> Result<(), Errno> {
+            Ok(())
+        }
+
+        fn host_set_alarm(&mut self, _seconds: u32) -> Result<(), Errno> {
             Ok(())
         }
     }
@@ -4959,5 +4990,33 @@ mod tests {
         let mut host = MockHostIO::new();
         let result = sys_execve(&mut proc, &mut host, b"/bin/ls");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_alarm_sets_deadline_and_returns_zero_initially() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let remaining = sys_alarm(&mut proc, &mut host, 5).unwrap();
+        assert_eq!(remaining, 0);
+        assert!(proc.alarm_deadline_ns > 0);
+    }
+
+    #[test]
+    fn test_alarm_returns_previous_remaining() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        sys_alarm(&mut proc, &mut host, 10).unwrap();
+        let remaining = sys_alarm(&mut proc, &mut host, 5).unwrap();
+        assert!(remaining > 0 && remaining <= 10);
+    }
+
+    #[test]
+    fn test_alarm_zero_cancels() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        sys_alarm(&mut proc, &mut host, 5).unwrap();
+        let remaining = sys_alarm(&mut proc, &mut host, 0).unwrap();
+        assert!(remaining > 0);
+        assert_eq!(proc.alarm_deadline_ns, 0);
     }
 }
