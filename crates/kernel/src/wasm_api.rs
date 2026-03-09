@@ -12,6 +12,7 @@ use core::slice;
 
 use wasm_posix_shared::{Errno, WasmDirent, WasmStat, WasmTimespec};
 
+use crate::ofd::FileType;
 use crate::process::{HostIO, Process};
 use crate::syscalls;
 
@@ -381,6 +382,22 @@ pub extern "C" fn kernel_init_from_fork(buf_ptr: *const u8, buf_len: u32, child_
         }
         Err(e) => -(e as i32),
     }
+}
+
+/// Convert a pipe's OFD from kernel-internal to host-delegated.
+/// After this, reads/writes for this OFD will go through host_read/host_write.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_convert_pipe_to_host(ofd_idx: u32, new_host_handle: i64) -> i32 {
+    let proc = unsafe { get_process() };
+    let ofd = match proc.ofd_table.get_mut(ofd_idx as usize) {
+        Some(ofd) => ofd,
+        None => return -(Errno::EBADF as i32),
+    };
+    if ofd.file_type != FileType::Pipe {
+        return -(Errno::EINVAL as i32);
+    }
+    ofd.host_handle = new_host_handle;
+    0
 }
 
 /// Open a file. Returns fd (>= 0) on success, or negative errno on error.

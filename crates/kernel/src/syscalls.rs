@@ -78,14 +78,19 @@ pub fn sys_close(
     if freed {
         match file_type {
             FileType::Pipe => {
-                // host_handle for pipes is -(pipe_idx + 1)
-                let pipe_idx = (-(host_handle + 1)) as usize;
-                if let Some(pipe) = proc.pipes.get_mut(pipe_idx).and_then(|p| p.as_mut()) {
-                    let access_mode = status_flags & O_ACCMODE;
-                    if access_mode == O_RDONLY {
-                        pipe.close_read_end();
-                    } else {
-                        pipe.close_write_end();
+                if host_handle >= 0 {
+                    // Host-delegated pipe: let host handle cleanup
+                    let _ = host.host_close(host_handle);
+                } else {
+                    // Kernel-internal pipe
+                    let pipe_idx = (-(host_handle + 1)) as usize;
+                    if let Some(pipe) = proc.pipes.get_mut(pipe_idx).and_then(|p| p.as_mut()) {
+                        let access_mode = status_flags & O_ACCMODE;
+                        if access_mode == O_RDONLY {
+                            pipe.close_read_end();
+                        } else {
+                            pipe.close_write_end();
+                        }
                     }
                 }
             }
@@ -138,19 +143,26 @@ pub fn sys_read(
 
     match file_type {
         FileType::Pipe => {
-            let pipe_idx = (-(host_handle + 1)) as usize;
-            let pipe = proc
-                .pipes
-                .get_mut(pipe_idx)
-                .and_then(|p| p.as_mut())
-                .ok_or(Errno::EBADF)?;
-            let n = pipe.read(buf);
-            if n == 0 && pipe.is_write_end_open() {
-                if status_flags & O_NONBLOCK != 0 {
-                    return Err(Errno::EAGAIN);
+            if host_handle >= 0 {
+                // Host-delegated pipe (cross-process): use host_read
+                let n = host.host_read(host_handle, buf)?;
+                Ok(n)
+            } else {
+                // Kernel-internal pipe
+                let pipe_idx = (-(host_handle + 1)) as usize;
+                let pipe = proc
+                    .pipes
+                    .get_mut(pipe_idx)
+                    .and_then(|p| p.as_mut())
+                    .ok_or(Errno::EBADF)?;
+                let n = pipe.read(buf);
+                if n == 0 && pipe.is_write_end_open() {
+                    if status_flags & O_NONBLOCK != 0 {
+                        return Err(Errno::EAGAIN);
+                    }
                 }
+                Ok(n)
             }
-            Ok(n)
         }
         FileType::Socket => {
             let sock_idx = (-(host_handle + 1)) as usize;
@@ -206,20 +218,27 @@ pub fn sys_write(
 
     match file_type {
         FileType::Pipe => {
-            let pipe_idx = (-(host_handle + 1)) as usize;
-            let pipe = proc
-                .pipes
-                .get_mut(pipe_idx)
-                .and_then(|p| p.as_mut())
-                .ok_or(Errno::EBADF)?;
-            if !pipe.is_read_end_open() {
-                return Err(Errno::EPIPE);
+            if host_handle >= 0 {
+                // Host-delegated pipe (cross-process): use host_write
+                let n = host.host_write(host_handle, buf)?;
+                Ok(n)
+            } else {
+                // Kernel-internal pipe
+                let pipe_idx = (-(host_handle + 1)) as usize;
+                let pipe = proc
+                    .pipes
+                    .get_mut(pipe_idx)
+                    .and_then(|p| p.as_mut())
+                    .ok_or(Errno::EBADF)?;
+                if !pipe.is_read_end_open() {
+                    return Err(Errno::EPIPE);
+                }
+                let n = pipe.write(buf);
+                if n == 0 && status_flags & O_NONBLOCK != 0 {
+                    return Err(Errno::EAGAIN);
+                }
+                Ok(n)
             }
-            let n = pipe.write(buf);
-            if n == 0 && status_flags & O_NONBLOCK != 0 {
-                return Err(Errno::EAGAIN);
-            }
-            Ok(n)
         }
         FileType::Socket => {
             let sock_idx = (-(host_handle + 1)) as usize;
@@ -1598,16 +1617,27 @@ pub fn sys_poll(
                 }
             }
             FileType::Pipe => {
-                let pipe_idx = (-(ofd.host_handle + 1)) as usize;
-                if let Some(Some(pipe)) = proc.pipes.get(pipe_idx) {
-                    if pollfd.events & POLLIN != 0 && pipe.available() > 0 {
+                if ofd.host_handle >= 0 {
+                    // Host-delegated pipe: report as ready (non-blocking)
+                    if pollfd.events & POLLIN != 0 {
                         revents |= POLLIN;
                     }
-                    if pollfd.events & POLLOUT != 0 && pipe.free_space() > 0 {
+                    if pollfd.events & POLLOUT != 0 {
                         revents |= POLLOUT;
                     }
-                    if !pipe.is_write_end_open() {
-                        revents |= POLLHUP;
+                } else {
+                    // Kernel-internal pipe
+                    let pipe_idx = (-(ofd.host_handle + 1)) as usize;
+                    if let Some(Some(pipe)) = proc.pipes.get(pipe_idx) {
+                        if pollfd.events & POLLIN != 0 && pipe.available() > 0 {
+                            revents |= POLLIN;
+                        }
+                        if pollfd.events & POLLOUT != 0 && pipe.free_space() > 0 {
+                            revents |= POLLOUT;
+                        }
+                        if !pipe.is_write_end_open() {
+                            revents |= POLLHUP;
+                        }
                     }
                 }
             }
