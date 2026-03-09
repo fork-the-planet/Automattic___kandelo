@@ -1607,18 +1607,20 @@ pub fn sys_send(
 /// Receive data from a connected socket.
 pub fn sys_recv(
     proc: &mut Process,
-    _host: &mut dyn HostIO,
+    host: &mut dyn HostIO,
     fd: i32,
     buf: &mut [u8],
     flags: u32,
 ) -> Result<usize, Errno> {
     use crate::socket::SocketState;
+    use wasm_posix_shared::socket::{MSG_DONTWAIT, MSG_PEEK};
 
     let entry = proc.fd_table.get(fd)?;
     let ofd = proc.ofd_table.get(entry.ofd_ref.0).ok_or(Errno::EBADF)?;
     if ofd.file_type != FileType::Socket {
         return Err(Errno::ENOTSOCK);
     }
+    let status_flags = ofd.status_flags;
     let sock_idx = (-(ofd.host_handle + 1)) as usize;
     let sock = proc.sockets.get(sock_idx).ok_or(Errno::EBADF)?;
     if sock.state != SocketState::Connected {
@@ -1628,14 +1630,30 @@ pub fn sys_recv(
         return Ok(0);
     }
     let recv_buf_idx = sock.recv_buf_idx.ok_or(Errno::ENOTCONN)?;
-    let peek = flags & 2 != 0; // MSG_PEEK
-    let pipe = proc
-        .pipes
-        .get_mut(recv_buf_idx)
-        .and_then(|p| p.as_mut())
-        .ok_or(Errno::EBADF)?;
-    let n = if peek { pipe.peek(buf) } else { pipe.read(buf) };
-    Ok(n)
+    let peek = flags & MSG_PEEK != 0;
+    let nonblock = (status_flags & O_NONBLOCK != 0) || (flags & MSG_DONTWAIT != 0);
+
+    loop {
+        let pipe = proc
+            .pipes
+            .get_mut(recv_buf_idx)
+            .and_then(|p| p.as_mut())
+            .ok_or(Errno::EBADF)?;
+        let n = if peek { pipe.peek(buf) } else { pipe.read(buf) };
+        if n > 0 {
+            return Ok(n);
+        }
+        if !pipe.is_write_end_open() {
+            return Ok(0); // peer closed
+        }
+        if nonblock {
+            return Err(Errno::EAGAIN);
+        }
+        if proc.signals.deliverable() != 0 {
+            return Err(Errno::EINTR);
+        }
+        let _ = host.host_nanosleep(0, 1_000_000);
+    }
 }
 
 /// Get socket option value.
@@ -3968,9 +3986,9 @@ mod tests {
         assert_eq!(n2, 9);
         assert_eq!(&buf[..9], b"peek test");
 
-        // Now data is consumed
-        let n3 = sys_recv(&mut proc, &mut host, fd1, &mut buf, 0).unwrap();
-        assert_eq!(n3, 0);
+        // Now data is consumed — use MSG_DONTWAIT to avoid blocking
+        let result = sys_recv(&mut proc, &mut host, fd1, &mut buf, MSG_DONTWAIT);
+        assert_eq!(result, Err(Errno::EAGAIN));
     }
 
     #[test]
