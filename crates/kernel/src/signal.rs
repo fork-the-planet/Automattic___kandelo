@@ -108,6 +108,11 @@ impl SignalState {
         SignalState { handlers, blocked, pending: 0 }
     }
 
+    /// Reconstruct signal state for exec. Preserves pending signals (POSIX).
+    pub fn from_parts_with_pending(handlers: [SignalHandler; 64], blocked: u64, pending: u64) -> Self {
+        SignalState { handlers, blocked, pending }
+    }
+
     /// Get the raw handlers array for serialization.
     pub fn handlers(&self) -> &[SignalHandler; 64] {
         &self.handlers
@@ -188,6 +193,14 @@ mod tests {
         let state = SignalState::from_parts(handlers, 0x0000_0004);
         assert_eq!(state.blocked, 0x0000_0004);
         assert_eq!(state.pending, 0); // always cleared for fork
+    }
+
+    #[test]
+    fn test_from_parts_with_pending_preserves_pending() {
+        let handlers = [SignalHandler::Default; 64];
+        let state = SignalState::from_parts_with_pending(handlers, 0x0000_0004, 0x0000_0008);
+        assert_eq!(state.blocked, 0x0000_0004);
+        assert_eq!(state.pending, 0x0000_0008);
     }
 
     #[test]

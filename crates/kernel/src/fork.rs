@@ -13,7 +13,9 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
+use wasm_posix_shared::fd_flags::FD_CLOEXEC;
 use wasm_posix_shared::Errno;
 
 use crate::fd::{FdEntry, FdTable, OpenFileDescRef};
@@ -26,6 +28,7 @@ use crate::socket::SocketTable;
 use crate::terminal::{TerminalState, WinSize, NCCS};
 
 const FORK_MAGIC: u32 = 0x464F524B; // "FORK"
+const EXEC_MAGIC: u32 = 0x45584543; // "EXEC"
 const FORK_VERSION: u32 = 1;
 
 // ── Writer helper ───────────────────────────────────────────────────────────
@@ -469,6 +472,288 @@ pub fn deserialize_fork_state(buf: &[u8], child_pid: u32) -> Result<Process, Err
     })
 }
 
+// ── Exec Serialize ──────────────────────────────────────────────────────────
+
+/// Serialize the process state into a binary buffer for exec.
+///
+/// Differs from fork serialization:
+/// - Magic: EXEC_MAGIC (0x45584543)
+/// - ppid: preserves proc.ppid (fork writes proc.pid as child's ppid)
+/// - Signal handlers: only SIG_IGN preserved; caught Handler signals reset to Default
+/// - Pending signals: preserved (fork clears to 0)
+/// - FD table: FDs with FD_CLOEXEC are excluded
+/// - OFD table: only OFDs still referenced by remaining FDs after CLOEXEC filtering
+pub fn serialize_exec_state(proc: &Process, buf: &mut [u8]) -> Result<usize, Errno> {
+    let mut w = Writer::new(buf);
+
+    // ── Header (12 bytes) ──
+    w.write_u32(EXEC_MAGIC)?;
+    w.write_u32(FORK_VERSION)?;
+    let total_size_offset = w.pos;
+    w.write_u32(0)?; // placeholder for total_size
+
+    // ── Scalars (32 bytes) ──
+    // Preserve the process's own ppid (exec replaces the image, not the process)
+    w.write_u32(proc.ppid)?;
+    w.write_u32(proc.uid)?;
+    w.write_u32(proc.gid)?;
+    w.write_u32(proc.euid)?;
+    w.write_u32(proc.egid)?;
+    w.write_u32(proc.pgid)?;
+    w.write_u32(proc.sid)?;
+    w.write_u32(proc.umask)?;
+
+    // ── Signal state ──
+    w.write_u64(proc.signals.blocked)?;
+
+    // Only preserve SIG_IGN handlers; caught (Handler) signals reset to Default (POSIX)
+    let handlers = proc.signals.handlers();
+    let ignore_count = handlers.iter().enumerate().filter(|(i, h)| {
+        *i > 0 && **h == SignalHandler::Ignore
+    }).count() as u32;
+    w.write_u32(ignore_count)?;
+
+    for (i, h) in handlers.iter().enumerate() {
+        if i > 0 && *h == SignalHandler::Ignore {
+            w.write_u32(i as u32)?;
+            w.write_u32(handler_to_u32(*h))?;
+        }
+    }
+
+    // Pending signals preserved for exec (unlike fork which clears them)
+    w.write_u64(proc.signals.pending)?;
+
+    // ── FD table (filter out CLOEXEC fds) ──
+    let fd_entries: Vec<(i32, &FdEntry)> = proc.fd_table.iter()
+        .filter(|(_, entry)| entry.fd_flags & FD_CLOEXEC == 0)
+        .collect();
+
+    // Collect referenced OFD indices from the filtered FDs
+    let referenced_ofds: BTreeSet<usize> = fd_entries.iter()
+        .map(|(_, entry)| entry.ofd_ref.0)
+        .collect();
+
+    w.write_u32(proc.fd_table.max_fds() as u32)?;
+    w.write_u32(fd_entries.len() as u32)?;
+    for (fd_num, entry) in &fd_entries {
+        w.write_u32(*fd_num as u32)?;
+        w.write_u32(entry.ofd_ref.0 as u32)?;
+        w.write_u32(entry.fd_flags)?;
+    }
+
+    // ── OFD table (only OFDs referenced by remaining FDs) ──
+    let ofd_entries: Vec<(usize, &OpenFileDesc)> = proc.ofd_table.iter()
+        .filter(|(index, _)| referenced_ofds.contains(index))
+        .collect();
+    w.write_u32(ofd_entries.len() as u32)?;
+    for (index, ofd) in &ofd_entries {
+        w.write_u32(*index as u32)?;
+        w.write_u32(file_type_to_u32(ofd.file_type))?;
+        w.write_u32(ofd.status_flags)?;
+        w.write_i64(ofd.host_handle)?;
+        w.write_i64(ofd.offset)?;
+        w.write_u32(ofd.ref_count)?;
+    }
+
+    // ── Environment ──
+    w.write_u32(proc.environ.len() as u32)?;
+    for var in &proc.environ {
+        w.write_u32(var.len() as u32)?;
+        w.write_bytes(var)?;
+    }
+
+    // ── CWD ──
+    w.write_u32(proc.cwd.len() as u32)?;
+    w.write_bytes(&proc.cwd)?;
+
+    // ── Rlimits (256 bytes) ──
+    for pair in &proc.rlimits {
+        w.write_u64(pair[0])?;
+        w.write_u64(pair[1])?;
+    }
+
+    // ── Terminal (56 bytes) ──
+    w.write_u32(proc.terminal.c_iflag)?;
+    w.write_u32(proc.terminal.c_oflag)?;
+    w.write_u32(proc.terminal.c_cflag)?;
+    w.write_u32(proc.terminal.c_lflag)?;
+    w.write_bytes(&proc.terminal.c_cc)?;
+    w.write_u16(proc.terminal.winsize.ws_row)?;
+    w.write_u16(proc.terminal.winsize.ws_col)?;
+    w.write_u16(proc.terminal.winsize.ws_xpixel)?;
+    w.write_u16(proc.terminal.winsize.ws_ypixel)?;
+
+    // ── Patch total_size ──
+    let total = w.pos as u32;
+    w.patch_u32(total_size_offset, total);
+
+    Ok(w.pos)
+}
+
+// ── Exec Deserialize ────────────────────────────────────────────────────────
+
+/// Deserialize process state from an exec buffer.
+///
+/// Differs from fork deserialization:
+/// - Checks EXEC_MAGIC instead of FORK_MAGIC
+/// - Reads pending signals (u64) after handler entries
+/// - Uses `SignalState::from_parts_with_pending` to preserve pending signals
+pub fn deserialize_exec_state(buf: &[u8], pid: u32) -> Result<Process, Errno> {
+    let mut r = Reader::new(buf);
+
+    // ── Header ──
+    let magic = r.read_u32()?;
+    if magic != EXEC_MAGIC {
+        return Err(Errno::EINVAL);
+    }
+    let version = r.read_u32()?;
+    if version != FORK_VERSION {
+        return Err(Errno::EINVAL);
+    }
+    let _total_size = r.read_u32()?;
+
+    // ── Scalars ──
+    let ppid = r.read_u32()?;
+    let uid = r.read_u32()?;
+    let gid = r.read_u32()?;
+    let euid = r.read_u32()?;
+    let egid = r.read_u32()?;
+    let pgid = r.read_u32()?;
+    let sid = r.read_u32()?;
+    let umask = r.read_u32()?;
+
+    // ── Signal state ──
+    let blocked = r.read_u64()?;
+    let handler_count = r.read_u32()?;
+    let mut handlers = [SignalHandler::Default; 64];
+    for _ in 0..handler_count {
+        let signum = r.read_u32()?;
+        let handler_val = r.read_u32()?;
+        if (signum as usize) < 64 {
+            handlers[signum as usize] = u32_to_handler(handler_val);
+        }
+    }
+    // Read pending signals (exec preserves them, unlike fork)
+    let pending = r.read_u64()?;
+    let signals = SignalState::from_parts_with_pending(handlers, blocked, pending);
+
+    // ── FD table ──
+    let max_fds = r.read_u32()? as usize;
+    let fd_count = r.read_u32()?;
+    let mut fd_entries: Vec<Option<FdEntry>> = Vec::new();
+    for _ in 0..fd_count {
+        let fd_num = r.read_u32()? as usize;
+        let ofd_index = r.read_u32()? as usize;
+        let fd_flags = r.read_u32()?;
+        while fd_entries.len() <= fd_num {
+            fd_entries.push(None);
+        }
+        fd_entries[fd_num] = Some(FdEntry {
+            ofd_ref: OpenFileDescRef(ofd_index),
+            fd_flags,
+        });
+    }
+    let fd_table = FdTable::from_raw(fd_entries, max_fds);
+
+    // ── OFD table ──
+    let ofd_count = r.read_u32()?;
+    let mut ofd_entries: Vec<Option<OpenFileDesc>> = Vec::new();
+    for _ in 0..ofd_count {
+        let index = r.read_u32()? as usize;
+        let file_type = u32_to_file_type(r.read_u32()?)?;
+        let status_flags = r.read_u32()?;
+        let host_handle = r.read_i64()?;
+        let offset = r.read_i64()?;
+        let ref_count = r.read_u32()?;
+        while ofd_entries.len() <= index {
+            ofd_entries.push(None);
+        }
+        ofd_entries[index] = Some(OpenFileDesc {
+            file_type,
+            status_flags,
+            host_handle,
+            offset,
+            ref_count,
+            owner_pid: pid,
+        });
+    }
+    let ofd_table = OfdTable::from_raw(ofd_entries);
+
+    // ── Environment ──
+    let env_count = r.read_u32()?;
+    let mut environ = Vec::with_capacity(env_count as usize);
+    for _ in 0..env_count {
+        let len = r.read_u32()? as usize;
+        let data = r.read_bytes(len)?;
+        environ.push(data.to_vec());
+    }
+
+    // ── CWD ──
+    let cwd_len = r.read_u32()? as usize;
+    let cwd_data = r.read_bytes(cwd_len)?;
+    let cwd = cwd_data.to_vec();
+
+    // ── Rlimits ──
+    let mut rlimits = [[0u64; 2]; 16];
+    for pair in rlimits.iter_mut() {
+        pair[0] = r.read_u64()?;
+        pair[1] = r.read_u64()?;
+    }
+
+    // ── Terminal ──
+    let c_iflag = r.read_u32()?;
+    let c_oflag = r.read_u32()?;
+    let c_cflag = r.read_u32()?;
+    let c_lflag = r.read_u32()?;
+    let c_cc_data = r.read_bytes(NCCS)?;
+    let mut c_cc = [0u8; NCCS];
+    c_cc.copy_from_slice(c_cc_data);
+    let ws_row = r.read_u16()?;
+    let ws_col = r.read_u16()?;
+    let ws_xpixel = r.read_u16()?;
+    let ws_ypixel = r.read_u16()?;
+
+    let terminal = TerminalState {
+        c_iflag,
+        c_oflag,
+        c_cflag,
+        c_lflag,
+        c_cc,
+        winsize: WinSize {
+            ws_row,
+            ws_col,
+            ws_xpixel,
+            ws_ypixel,
+        },
+    };
+
+    Ok(Process {
+        pid,
+        ppid,
+        uid,
+        gid,
+        euid,
+        egid,
+        pgid,
+        sid,
+        state: ProcessState::Running,
+        exit_status: 0,
+        fd_table,
+        ofd_table,
+        lock_table: LockTable::new(),
+        pipes: Vec::new(),
+        sockets: SocketTable::new(),
+        cwd,
+        dir_streams: Vec::new(),
+        signals,
+        memory: MemoryManager::new(),
+        terminal,
+        environ,
+        umask,
+        rlimits,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,5 +859,78 @@ mod tests {
         let buf = [0u8; 64];
         let result = deserialize_fork_state(&buf, 1);
         assert!(result.is_err());
+    }
+
+    // ── Exec tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_exec_roundtrip_default_process() {
+        let proc = Process::new(1);
+        let mut buf = vec![0u8; 64 * 1024];
+        let written = serialize_exec_state(&proc, &mut buf).unwrap();
+        assert!(written > 12);
+        assert_eq!(&buf[0..4], &0x45584543u32.to_le_bytes()); // EXEC magic
+
+        let restored = deserialize_exec_state(&buf[..written], 1).unwrap();
+        assert_eq!(restored.pid, 1);
+        assert_eq!(restored.ppid, 0); // default ppid
+        assert_eq!(restored.signals.pending, 0);
+    }
+
+    #[test]
+    fn test_exec_state_filters_cloexec_fds() {
+        use wasm_posix_shared::fd_flags::FD_CLOEXEC;
+        let mut proc = Process::new(1);
+        // fd 3 with CLOEXEC
+        let ofd_ref = proc.ofd_table.create(crate::ofd::FileType::Regular, 0, 100);
+        proc.fd_table.alloc(crate::fd::OpenFileDescRef(ofd_ref), FD_CLOEXEC).unwrap();
+
+        let mut buf = vec![0u8; 64 * 1024];
+        let written = serialize_exec_state(&proc, &mut buf).unwrap();
+        let restored = deserialize_exec_state(&buf[..written], 1).unwrap();
+        // fd 3 should be gone (CLOEXEC)
+        assert!(restored.fd_table.get(3).is_err());
+        // fds 0,1,2 should still exist
+        assert!(restored.fd_table.get(0).is_ok());
+    }
+
+    #[test]
+    fn test_exec_state_resets_caught_handler_preserves_ignore() {
+        let mut proc = Process::new(1);
+        proc.signals.set_handler(2, SignalHandler::Ignore).unwrap(); // SIGINT -> IGN
+        proc.signals.set_handler(15, SignalHandler::Handler(42)).unwrap(); // SIGTERM -> caught
+
+        let mut buf = vec![0u8; 64 * 1024];
+        let written = serialize_exec_state(&proc, &mut buf).unwrap();
+        let restored = deserialize_exec_state(&buf[..written], 1).unwrap();
+
+        assert_eq!(restored.signals.get_handler(2), SignalHandler::Ignore); // preserved
+        assert_eq!(restored.signals.get_handler(15), SignalHandler::Default); // reset
+    }
+
+    #[test]
+    fn test_exec_state_preserves_pending_signals() {
+        let mut proc = Process::new(1);
+        proc.signals.raise(2); // SIGINT pending
+        proc.signals.raise(15); // SIGTERM pending
+
+        let mut buf = vec![0u8; 64 * 1024];
+        let written = serialize_exec_state(&proc, &mut buf).unwrap();
+        let restored = deserialize_exec_state(&buf[..written], 1).unwrap();
+
+        assert!(restored.signals.is_pending(2));
+        assert!(restored.signals.is_pending(15));
+    }
+
+    #[test]
+    fn test_exec_preserves_ppid() {
+        let mut proc = Process::new(5);
+        proc.ppid = 3;
+
+        let mut buf = vec![0u8; 64 * 1024];
+        let written = serialize_exec_state(&proc, &mut buf).unwrap();
+        let restored = deserialize_exec_state(&buf[..written], 5).unwrap();
+
+        assert_eq!(restored.ppid, 3); // ppid preserved
     }
 }
