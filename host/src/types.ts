@@ -18,51 +18,51 @@ export interface StatResult {
 }
 
 export interface PlatformIO {
-  open(path: string, flags: number, mode: number): Promise<number>;
-  close(handle: number): Promise<number>;
+  open(path: string, flags: number, mode: number): number;
+  close(handle: number): number;
   read(
     handle: number,
     buffer: Uint8Array,
     offset: number,
     length: number,
-  ): Promise<number>;
+  ): number;
   write(
     handle: number,
     buffer: Uint8Array,
     offset: number,
     length: number,
-  ): Promise<number>;
-  seek(handle: number, offset: number, whence: number): Promise<number>;
-  fstat(handle: number): Promise<StatResult>;
+  ): number;
+  seek(handle: number, offset: number, whence: number): number;
+  fstat(handle: number): StatResult;
 
   // Path-based operations
-  stat(path: string): Promise<StatResult>;
-  lstat(path: string): Promise<StatResult>;
-  mkdir(path: string, mode: number): Promise<void>;
-  rmdir(path: string): Promise<void>;
-  unlink(path: string): Promise<void>;
-  rename(oldPath: string, newPath: string): Promise<void>;
-  link(existingPath: string, newPath: string): Promise<void>;
-  symlink(target: string, path: string): Promise<void>;
-  readlink(path: string): Promise<string>;
-  chmod(path: string, mode: number): Promise<void>;
-  chown(path: string, uid: number, gid: number): Promise<void>;
-  access(path: string, mode: number): Promise<void>;
+  stat(path: string): StatResult;
+  lstat(path: string): StatResult;
+  mkdir(path: string, mode: number): void;
+  rmdir(path: string): void;
+  unlink(path: string): void;
+  rename(oldPath: string, newPath: string): void;
+  link(existingPath: string, newPath: string): void;
+  symlink(target: string, path: string): void;
+  readlink(path: string): string;
+  chmod(path: string, mode: number): void;
+  chown(path: string, uid: number, gid: number): void;
+  access(path: string, mode: number): void;
 
   // Directory iteration
-  opendir(path: string): Promise<number>;
+  opendir(path: string): number;
   readdir(
     handle: number,
-  ): Promise<{ name: string; type: number; ino: number } | null>;
-  closedir(handle: number): Promise<void>;
+  ): { name: string; type: number; ino: number } | null;
+  closedir(handle: number): void;
 
   // File operations
-  ftruncate(handle: number, length: number): Promise<void>;
-  fsync(handle: number): Promise<void>;
-  fchmod(handle: number, mode: number): Promise<void>;
-  fchown(handle: number, uid: number, gid: number): Promise<void>;
+  ftruncate(handle: number, length: number): void;
+  fsync(handle: number): void;
+  fchmod(handle: number, mode: number): void;
+  fchown(handle: number, uid: number, gid: number): void;
 
   // Time
-  clockGettime(clockId: number): Promise<{ sec: number; nsec: number }>;
-  nanosleep(sec: number, nsec: number): Promise<void>;
+  clockGettime(clockId: number): { sec: number; nsec: number };
+  nanosleep(sec: number, nsec: number): void;
 }

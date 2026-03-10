@@ -321,27 +321,7 @@ export class WasmPosixKernel {
       const mem = this.getMemoryBuffer();
       const pathBytes = mem.slice(pathPtr, pathPtr + pathLen);
       const path = new TextDecoder().decode(pathBytes);
-
-      // PlatformIO.open is async but NodePlatformIO resolves synchronously.
-      // We use a synchronous extraction pattern here.
-      let result = -1;
-      let error: unknown = null;
-
-      // Since NodePlatformIO wraps sync fs calls in async, the promise
-      // settles in the same microtask. We capture the value via .then().
-      this.io
-        .open(path, flags, mode)
-        .then((r) => {
-          result = r;
-        })
-        .catch((e: unknown) => {
-          error = e;
-        });
-
-      if (error) {
-        return BigInt(-1);
-      }
-      return BigInt(result);
+      return BigInt(this.io.open(path, flags, mode));
     } catch {
       return BigInt(-1);
     }
@@ -375,16 +355,7 @@ export class WasmPosixKernel {
     }
 
     try {
-      let result = -1;
-      this.io
-        .close(h)
-        .then((r) => {
-          result = r;
-        })
-        .catch(() => {
-          result = -1;
-        });
-      return result;
+      return this.io.close(h);
     } catch {
       return -1;
     }
@@ -415,17 +386,7 @@ export class WasmPosixKernel {
     try {
       const mem = this.getMemoryBuffer();
       const buf = mem.subarray(bufPtr, bufPtr + bufLen);
-
-      let result = 0;
-      this.io
-        .read(h, buf, 0, bufLen)
-        .then((n) => {
-          result = n;
-        })
-        .catch(() => {
-          result = -1;
-        });
-      return result;
+      return this.io.read(h, buf, 0, bufLen);
     } catch {
       return -1;
     }
@@ -462,16 +423,7 @@ export class WasmPosixKernel {
     }
 
     try {
-      let result = 0;
-      this.io
-        .write(h, data, 0, bufLen)
-        .then((n) => {
-          result = n;
-        })
-        .catch(() => {
-          result = -1;
-        });
-      return result;
+      return this.io.write(h, data, 0, bufLen);
     } catch {
       return -1;
     }
@@ -494,16 +446,7 @@ export class WasmPosixKernel {
     const offset = offsetHi * 0x100000000 + (offsetLo >>> 0);
 
     try {
-      let result = -1;
-      this.io
-        .seek(h, offset, whence)
-        .then((pos) => {
-          result = pos;
-        })
-        .catch(() => {
-          result = -1;
-        });
-      return BigInt(result);
+      return BigInt(this.io.seek(h, offset, whence));
     } catch {
       return BigInt(-1);
     }
@@ -536,21 +479,7 @@ export class WasmPosixKernel {
     const h = Number(handle);
 
     try {
-      let stat: StatResult | null = null;
-      let failed = false;
-      this.io
-        .fstat(h)
-        .then((s) => {
-          stat = s;
-        })
-        .catch(() => {
-          failed = true;
-        });
-
-      if (failed || !stat) {
-        return -1;
-      }
-
+      const stat = this.io.fstat(h);
       this.writeStatToMemory(statPtr, stat);
       return 0;
     } catch {
@@ -615,17 +544,7 @@ export class WasmPosixKernel {
   ): number {
     try {
       const path = this.readPathFromMemory(pathPtr, pathLen);
-      let stat: StatResult | null = null;
-      let failed = false;
-      this.io
-        .stat(path)
-        .then((s) => {
-          stat = s;
-        })
-        .catch(() => {
-          failed = true;
-        });
-      if (failed || !stat) return -1;
+      const stat = this.io.stat(path);
       this.writeStatToMemory(statPtr, stat);
       return 0;
     } catch {
@@ -643,17 +562,7 @@ export class WasmPosixKernel {
   ): number {
     try {
       const path = this.readPathFromMemory(pathPtr, pathLen);
-      let stat: StatResult | null = null;
-      let failed = false;
-      this.io
-        .lstat(path)
-        .then((s) => {
-          stat = s;
-        })
-        .catch(() => {
-          failed = true;
-        });
-      if (failed || !stat) return -1;
+      const stat = this.io.lstat(path);
       this.writeStatToMemory(statPtr, stat);
       return 0;
     } catch {
@@ -671,16 +580,8 @@ export class WasmPosixKernel {
   ): number {
     try {
       const path = this.readPathFromMemory(pathPtr, pathLen);
-      let result = 0;
-      this.io
-        .mkdir(path, mode)
-        .then(() => {
-          result = 0;
-        })
-        .catch(() => {
-          result = -1;
-        });
-      return result;
+      this.io.mkdir(path, mode);
+      return 0;
     } catch {
       return -1;
     }
@@ -692,16 +593,8 @@ export class WasmPosixKernel {
   private hostRmdir(pathPtr: number, pathLen: number): number {
     try {
       const path = this.readPathFromMemory(pathPtr, pathLen);
-      let result = 0;
-      this.io
-        .rmdir(path)
-        .then(() => {
-          result = 0;
-        })
-        .catch(() => {
-          result = -1;
-        });
-      return result;
+      this.io.rmdir(path);
+      return 0;
     } catch {
       return -1;
     }
@@ -713,16 +606,8 @@ export class WasmPosixKernel {
   private hostUnlink(pathPtr: number, pathLen: number): number {
     try {
       const path = this.readPathFromMemory(pathPtr, pathLen);
-      let result = 0;
-      this.io
-        .unlink(path)
-        .then(() => {
-          result = 0;
-        })
-        .catch(() => {
-          result = -1;
-        });
-      return result;
+      this.io.unlink(path);
+      return 0;
     } catch {
       return -1;
     }
@@ -740,16 +625,8 @@ export class WasmPosixKernel {
     try {
       const oldPath = this.readPathFromMemory(oldPtr, oldLen);
       const newPath = this.readPathFromMemory(newPtr, newLen);
-      let result = 0;
-      this.io
-        .rename(oldPath, newPath)
-        .then(() => {
-          result = 0;
-        })
-        .catch(() => {
-          result = -1;
-        });
-      return result;
+      this.io.rename(oldPath, newPath);
+      return 0;
     } catch {
       return -1;
     }
@@ -767,16 +644,8 @@ export class WasmPosixKernel {
     try {
       const existingPath = this.readPathFromMemory(oldPtr, oldLen);
       const newPath = this.readPathFromMemory(newPtr, newLen);
-      let result = 0;
-      this.io
-        .link(existingPath, newPath)
-        .then(() => {
-          result = 0;
-        })
-        .catch(() => {
-          result = -1;
-        });
-      return result;
+      this.io.link(existingPath, newPath);
+      return 0;
     } catch {
       return -1;
     }
@@ -794,16 +663,8 @@ export class WasmPosixKernel {
     try {
       const target = this.readPathFromMemory(targetPtr, targetLen);
       const linkPath = this.readPathFromMemory(linkPtr, linkLen);
-      let result = 0;
-      this.io
-        .symlink(target, linkPath)
-        .then(() => {
-          result = 0;
-        })
-        .catch(() => {
-          result = -1;
-        });
-      return result;
+      this.io.symlink(target, linkPath);
+      return 0;
     } catch {
       return -1;
     }
@@ -822,17 +683,7 @@ export class WasmPosixKernel {
   ): number {
     try {
       const path = this.readPathFromMemory(pathPtr, pathLen);
-      let target: string | null = null;
-      let failed = false;
-      this.io
-        .readlink(path)
-        .then((t) => {
-          target = t;
-        })
-        .catch(() => {
-          failed = true;
-        });
-      if (failed || target === null) return -1;
+      const target = this.io.readlink(path);
       const encoded = new TextEncoder().encode(target);
       const n = Math.min(encoded.length, bufLen);
       const mem = this.getMemoryBuffer();
@@ -853,16 +704,8 @@ export class WasmPosixKernel {
   ): number {
     try {
       const path = this.readPathFromMemory(pathPtr, pathLen);
-      let result = 0;
-      this.io
-        .chmod(path, mode)
-        .then(() => {
-          result = 0;
-        })
-        .catch(() => {
-          result = -1;
-        });
-      return result;
+      this.io.chmod(path, mode);
+      return 0;
     } catch {
       return -1;
     }
@@ -879,16 +722,8 @@ export class WasmPosixKernel {
   ): number {
     try {
       const path = this.readPathFromMemory(pathPtr, pathLen);
-      let result = 0;
-      this.io
-        .chown(path, uid, gid)
-        .then(() => {
-          result = 0;
-        })
-        .catch(() => {
-          result = -1;
-        });
-      return result;
+      this.io.chown(path, uid, gid);
+      return 0;
     } catch {
       return -1;
     }
@@ -904,16 +739,8 @@ export class WasmPosixKernel {
   ): number {
     try {
       const path = this.readPathFromMemory(pathPtr, pathLen);
-      let result = 0;
-      this.io
-        .access(path, amode)
-        .then(() => {
-          result = 0;
-        })
-        .catch(() => {
-          result = -1;
-        });
-      return result;
+      this.io.access(path, amode);
+      return 0;
     } catch {
       return -1;
     }
@@ -927,16 +754,7 @@ export class WasmPosixKernel {
   private hostOpendir(pathPtr: number, pathLen: number): bigint {
     try {
       const path = this.readPathFromMemory(pathPtr, pathLen);
-      let handle = -1;
-      this.io
-        .opendir(path)
-        .then((h) => {
-          handle = h;
-        })
-        .catch(() => {
-          handle = -1;
-        });
-      return BigInt(handle);
+      return BigInt(this.io.opendir(path));
     } catch {
       return BigInt(-1);
     }
@@ -956,22 +774,8 @@ export class WasmPosixKernel {
   ): number {
     try {
       const h = Number(dirHandle);
-      type DirEntry = { name: string; type: number; ino: number };
-      let entry: DirEntry | null | undefined = undefined;
-      let failed = false;
-      this.io
-        .readdir(h)
-        .then((e) => {
-          entry = e;
-        })
-        .catch(() => {
-          failed = true;
-        });
-      if (failed) return -1;
-      // The .then() callback runs synchronously for NodePlatformIO,
-      // so entry is populated by this point.
-      const dirEntry = entry as DirEntry | null | undefined;
-      if (dirEntry === null || dirEntry === undefined) return 0; // end of directory
+      const dirEntry = this.io.readdir(h);
+      if (dirEntry === null) return 0; // end of directory
 
       const dv = this.getMemoryDataView();
       const mem = this.getMemoryBuffer();
@@ -999,16 +803,8 @@ export class WasmPosixKernel {
   private hostClosedir(dirHandle: bigint): number {
     try {
       const h = Number(dirHandle);
-      let result = 0;
-      this.io
-        .closedir(h)
-        .then(() => {
-          result = 0;
-        })
-        .catch(() => {
-          result = -1;
-        });
-      return result;
+      this.io.closedir(h);
+      return 0;
     } catch {
       return -1;
     }
@@ -1028,23 +824,10 @@ export class WasmPosixKernel {
     nsecPtr: number,
   ): number {
     try {
-      type TimeResult = { sec: number; nsec: number };
-      let result: TimeResult | null = null;
-      let failed = false;
-      this.io
-        .clockGettime(clockId)
-        .then((r) => {
-          result = r;
-        })
-        .catch(() => {
-          failed = true;
-        });
-      if (failed) return -1;
-      const timeResult = result as TimeResult | null;
-      if (!timeResult) return -1;
+      const result = this.io.clockGettime(clockId);
       const dv = this.getMemoryDataView();
-      dv.setBigInt64(secPtr, BigInt(timeResult.sec), true);
-      dv.setBigInt64(nsecPtr, BigInt(timeResult.nsec), true);
+      dv.setBigInt64(secPtr, BigInt(result.sec), true);
+      dv.setBigInt64(nsecPtr, BigInt(result.nsec), true);
       return 0;
     } catch {
       return -1;
@@ -1059,14 +842,7 @@ export class WasmPosixKernel {
    */
   private hostNanosleep(sec: bigint, nsec: bigint): number {
     try {
-      let failed = false;
-      this.io
-        .nanosleep(Number(sec), Number(nsec))
-        .then(() => {})
-        .catch(() => {
-          failed = true;
-        });
-      if (failed) return -1;
+      this.io.nanosleep(Number(sec), Number(nsec));
       return 0;
     } catch {
       return -1;
@@ -1076,37 +852,18 @@ export class WasmPosixKernel {
   // ---- Phase 11: ftruncate/fsync/fchmod/fchown host imports ----
 
   private hostFtruncate(handle: bigint, length: bigint): number {
-    const h = Number(handle);
-    const l = Number(length);
     try {
-      let result = 0;
-      this.io
-        .ftruncate(h, l)
-        .then(() => {
-          result = 0;
-        })
-        .catch(() => {
-          result = -1;
-        });
-      return result;
+      this.io.ftruncate(Number(handle), Number(length));
+      return 0;
     } catch {
       return -1;
     }
   }
 
   private hostFsync(handle: bigint): number {
-    const h = Number(handle);
     try {
-      let result = 0;
-      this.io
-        .fsync(h)
-        .then(() => {
-          result = 0;
-        })
-        .catch(() => {
-          result = -1;
-        });
-      return result;
+      this.io.fsync(Number(handle));
+      return 0;
     } catch {
       return -1;
     }
@@ -1116,18 +873,9 @@ export class WasmPosixKernel {
    * host_fchmod(handle: i64, mode: u32) -> i32
    */
   private hostFchmod(handle: bigint, mode: number): number {
-    const h = Number(handle);
     try {
-      let result = 0;
-      this.io
-        .fchmod(h, mode)
-        .then(() => {
-          result = 0;
-        })
-        .catch(() => {
-          result = -1;
-        });
-      return result;
+      this.io.fchmod(Number(handle), mode);
+      return 0;
     } catch {
       return -1;
     }
@@ -1137,18 +885,9 @@ export class WasmPosixKernel {
    * host_fchown(handle: i64, uid: u32, gid: u32) -> i32
    */
   private hostFchown(handle: bigint, uid: number, gid: number): number {
-    const h = Number(handle);
     try {
-      let result = 0;
-      this.io
-        .fchown(h, uid, gid)
-        .then(() => {
-          result = 0;
-        })
-        .catch(() => {
-          result = -1;
-        });
-      return result;
+      this.io.fchown(Number(handle), uid, gid);
+      return 0;
     } catch {
       return -1;
     }

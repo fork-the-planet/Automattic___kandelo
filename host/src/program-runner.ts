@@ -77,6 +77,15 @@ export class ProgramRunner {
         const module = await WebAssembly.compile(programBytes);
         const instance = await WebAssembly.instantiate(module, importObject);
 
+        // Set the kernel's program break to the program's __heap_base.
+        // Without this, the kernel uses a default break (16MB) which may
+        // be beyond the allocated Wasm memory, causing OOB errors on malloc.
+        const heapBase = instance.exports.__heap_base;
+        if (heapBase instanceof WebAssembly.Global) {
+            const kernelBrk = kernelExports.kernel_brk as Function;
+            kernelBrk(heapBase.value);
+        }
+
         // Call the program's _start entry point.
         const startFn = instance.exports._start as Function;
         try {

@@ -397,7 +397,27 @@ unsafe fn get_process() -> &'static mut Process {
 }
 
 // ---------------------------------------------------------------------------
-// 3b. Signal delivery at syscall boundaries
+// 3b. Memory growth helper
+// ---------------------------------------------------------------------------
+
+/// Grow Wasm memory if `end_addr` exceeds the current memory size.
+/// Wasm pages are 64KB each. Returns true if memory was sufficient or grown.
+#[cfg(target_arch = "wasm32")]
+fn ensure_memory_covers(end_addr: u32) {
+    let current_pages = core::arch::wasm32::memory_size(0) as u32;
+    let current_bytes = current_pages * 65536;
+    if end_addr > current_bytes {
+        let needed_pages = (end_addr - current_bytes + 65535) / 65536;
+        core::arch::wasm32::memory_grow(0, needed_pages as usize);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ensure_memory_covers(_end_addr: u32) {
+    // No-op on non-Wasm targets (tests)
+}
+
+// 3c. Signal delivery at syscall boundaries
 // ---------------------------------------------------------------------------
 
 /// Check for and deliver pending signals before/after syscall.
@@ -1391,6 +1411,13 @@ pub extern "C" fn kernel_mmap(addr: u32, len: u32, prot: u32, flags: u32, fd: i3
         Ok(a) => a,
         Err(_) => wasm_posix_shared::mmap::MAP_FAILED,
     };
+
+    // Ensure Wasm memory covers the mapped region.
+    if result != wasm_posix_shared::mmap::MAP_FAILED {
+        let end = result.saturating_add(len);
+        ensure_memory_covers(end);
+    }
+
     let mut host = WasmHostIO;
     deliver_pending_signals(proc, &mut host);
     result
@@ -1410,10 +1437,17 @@ pub extern "C" fn kernel_munmap(addr: u32, len: u32) -> i32 {
 }
 
 /// brk. Returns the current or new program break.
+/// Grows Wasm memory if the new break exceeds the current memory size.
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_brk(addr: u32) -> u32 {
     let proc = unsafe { get_process() };
     let result = syscalls::sys_brk(proc, addr);
+
+    // Ensure Wasm memory covers the new program break.
+    if result > 0 {
+        ensure_memory_covers(result);
+    }
+
     let mut host = WasmHostIO;
     deliver_pending_signals(proc, &mut host);
     result

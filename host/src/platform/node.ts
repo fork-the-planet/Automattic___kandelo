@@ -3,60 +3,94 @@
  *
  * Implements the PlatformIO interface using synchronous Node.js `fs`
  * operations. Synchronous methods are used because the kernel runs in
- * a worker context and we need deterministic, blocking behavior that
- * aligns with the Wasm import calling convention.
+ * a Wasm import context which requires blocking, synchronous behavior.
  */
 
 import * as fs from "node:fs";
 import type { PlatformIO, StatResult } from "../types";
 
+/**
+ * Translate Linux/POSIX open flags (as used by musl libc) to the
+ * platform-native flag values that Node.js `fs.openSync` expects.
+ * The numeric values differ between Linux and macOS/BSD.
+ */
+function translateOpenFlags(linuxFlags: number): number {
+  // Linux flag constants (octal)
+  const L_O_WRONLY = 0o1;
+  const L_O_RDWR = 0o2;
+  const L_O_CREAT = 0o100;
+  const L_O_EXCL = 0o200;
+  const L_O_NOCTTY = 0o400;
+  const L_O_TRUNC = 0o1000;
+  const L_O_APPEND = 0o2000;
+  const L_O_NONBLOCK = 0o4000;
+  const L_O_DIRECTORY = 0o200000;
+  const L_O_NOFOLLOW = 0o400000;
+
+  let native = 0;
+
+  // Access mode (bottom 2 bits)
+  if (linuxFlags & L_O_RDWR) native |= fs.constants.O_RDWR;
+  else if (linuxFlags & L_O_WRONLY) native |= fs.constants.O_WRONLY;
+  // else O_RDONLY = 0
+
+  if (linuxFlags & L_O_CREAT) native |= fs.constants.O_CREAT;
+  if (linuxFlags & L_O_EXCL) native |= fs.constants.O_EXCL;
+  if (linuxFlags & L_O_TRUNC) native |= fs.constants.O_TRUNC;
+  if (linuxFlags & L_O_APPEND) native |= fs.constants.O_APPEND;
+  if (linuxFlags & L_O_NONBLOCK) native |= fs.constants.O_NONBLOCK;
+  if ((linuxFlags & L_O_DIRECTORY) && fs.constants.O_DIRECTORY)
+    native |= fs.constants.O_DIRECTORY;
+  if ((linuxFlags & L_O_NOFOLLOW) && fs.constants.O_NOFOLLOW)
+    native |= fs.constants.O_NOFOLLOW;
+  if ((linuxFlags & L_O_NOCTTY) && fs.constants.O_NOCTTY)
+    native |= fs.constants.O_NOCTTY;
+  // O_LARGEFILE and O_CLOEXEC have no Node.js equivalent; ignored.
+
+  return native;
+}
+
 export class NodePlatformIO implements PlatformIO {
   private dirHandles = new Map<number, fs.Dir>();
   private nextDirHandle = 1;
 
-  async open(path: string, flags: number, mode: number): Promise<number> {
-    return fs.openSync(path, flags, mode);
+  open(path: string, flags: number, mode: number): number {
+    return fs.openSync(path, translateOpenFlags(flags), mode);
   }
 
-  async close(handle: number): Promise<number> {
+  close(handle: number): number {
     fs.closeSync(handle);
     return 0;
   }
 
-  async read(
+  read(
     handle: number,
     buffer: Uint8Array,
     offset: number,
     length: number,
-  ): Promise<number> {
+  ): number {
     return fs.readSync(handle, buffer, 0, length, offset);
   }
 
-  async write(
+  write(
     handle: number,
     buffer: Uint8Array,
     offset: number,
     length: number,
-  ): Promise<number> {
+  ): number {
     return fs.writeSync(handle, buffer, 0, length, offset);
   }
 
-  async seek(
+  seek(
     handle: number,
     offset: number,
     whence: number,
-  ): Promise<number> {
-    // Node.js does not have a direct seekSync equivalent. We calculate
-    // the new position ourselves by reading the current stats when
-    // needed and using pread/pwrite for positional I/O.
-    //
+  ): number {
     // SEEK_SET=0, SEEK_CUR=1, SEEK_END=2
     switch (whence) {
       case 0: // SEEK_SET
         return offset;
-      case 1: // SEEK_CUR — not directly supportable without tracking
-        // position state; return the offset as a relative delta indicator.
-        // The caller (kernel) maintains the canonical position.
+      case 1: // SEEK_CUR — the kernel maintains the canonical position
         return offset;
       case 2: {
         // SEEK_END — compute from file size
@@ -68,7 +102,7 @@ export class NodePlatformIO implements PlatformIO {
     }
   }
 
-  async fstat(handle: number): Promise<StatResult> {
+  fstat(handle: number): StatResult {
     const stat = fs.fstatSync(handle);
     return {
       dev: stat.dev,
@@ -84,7 +118,7 @@ export class NodePlatformIO implements PlatformIO {
     };
   }
 
-  async stat(path: string): Promise<StatResult> {
+  stat(path: string): StatResult {
     const s = fs.statSync(path);
     return {
       dev: s.dev,
@@ -100,7 +134,7 @@ export class NodePlatformIO implements PlatformIO {
     };
   }
 
-  async lstat(path: string): Promise<StatResult> {
+  lstat(path: string): StatResult {
     const s = fs.lstatSync(path);
     return {
       dev: s.dev,
@@ -116,56 +150,56 @@ export class NodePlatformIO implements PlatformIO {
     };
   }
 
-  async mkdir(path: string, mode: number): Promise<void> {
+  mkdir(path: string, mode: number): void {
     fs.mkdirSync(path, { mode });
   }
 
-  async rmdir(path: string): Promise<void> {
+  rmdir(path: string): void {
     fs.rmdirSync(path);
   }
 
-  async unlink(path: string): Promise<void> {
+  unlink(path: string): void {
     fs.unlinkSync(path);
   }
 
-  async rename(oldPath: string, newPath: string): Promise<void> {
+  rename(oldPath: string, newPath: string): void {
     fs.renameSync(oldPath, newPath);
   }
 
-  async link(existingPath: string, newPath: string): Promise<void> {
+  link(existingPath: string, newPath: string): void {
     fs.linkSync(existingPath, newPath);
   }
 
-  async symlink(target: string, path: string): Promise<void> {
+  symlink(target: string, path: string): void {
     fs.symlinkSync(target, path);
   }
 
-  async readlink(path: string): Promise<string> {
+  readlink(path: string): string {
     return fs.readlinkSync(path, "utf8");
   }
 
-  async chmod(path: string, mode: number): Promise<void> {
+  chmod(path: string, mode: number): void {
     fs.chmodSync(path, mode);
   }
 
-  async chown(path: string, uid: number, gid: number): Promise<void> {
+  chown(path: string, uid: number, gid: number): void {
     fs.chownSync(path, uid, gid);
   }
 
-  async access(path: string, mode: number): Promise<void> {
+  access(path: string, mode: number): void {
     fs.accessSync(path, mode);
   }
 
-  async opendir(path: string): Promise<number> {
+  opendir(path: string): number {
     const dir = fs.opendirSync(path);
     const handle = this.nextDirHandle++;
     this.dirHandles.set(handle, dir);
     return handle;
   }
 
-  async readdir(
+  readdir(
     handle: number,
-  ): Promise<{ name: string; type: number; ino: number } | null> {
+  ): { name: string; type: number; ino: number } | null {
     const dir = this.dirHandles.get(handle);
     if (!dir) throw new Error("Invalid dir handle");
     const entry = dir.readSync();
@@ -182,32 +216,32 @@ export class NodePlatformIO implements PlatformIO {
     return { name: entry.name, type: dtype, ino: 0 };
   }
 
-  async closedir(handle: number): Promise<void> {
+  closedir(handle: number): void {
     const dir = this.dirHandles.get(handle);
     if (!dir) throw new Error("Invalid dir handle");
     dir.closeSync();
     this.dirHandles.delete(handle);
   }
 
-  async ftruncate(handle: number, length: number): Promise<void> {
+  ftruncate(handle: number, length: number): void {
     fs.ftruncateSync(handle, length);
   }
 
-  async fsync(handle: number): Promise<void> {
+  fsync(handle: number): void {
     fs.fsyncSync(handle);
   }
 
-  async fchmod(handle: number, mode: number): Promise<void> {
+  fchmod(handle: number, mode: number): void {
     fs.fchmodSync(handle, mode);
   }
 
-  async fchown(handle: number, uid: number, gid: number): Promise<void> {
+  fchown(handle: number, uid: number, gid: number): void {
     fs.fchownSync(handle, uid, gid);
   }
 
-  async clockGettime(
+  clockGettime(
     clockId: number,
-  ): Promise<{ sec: number; nsec: number }> {
+  ): { sec: number; nsec: number } {
     if (clockId === 1) {
       // CLOCK_MONOTONIC: use process.hrtime.bigint()
       const ns = process.hrtime.bigint();
@@ -222,7 +256,7 @@ export class NodePlatformIO implements PlatformIO {
     return { sec, nsec };
   }
 
-  async nanosleep(sec: number, nsec: number): Promise<void> {
+  nanosleep(sec: number, nsec: number): void {
     const ms = sec * 1000 + Math.floor(nsec / 1_000_000);
     if (ms > 0) {
       const sab = new SharedArrayBuffer(4);

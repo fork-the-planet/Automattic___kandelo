@@ -53,6 +53,7 @@ echo "==> Compiling: $INPUT -> $OUTPUT"
     -fno-exceptions -fno-trapping-math \
     "$INPUT" \
     "$GLUE_DIR/syscall_glue.c" \
+    "$GLUE_DIR/compiler_rt.c" \
     "$SYSROOT/lib/crt1.o" \
     "$SYSROOT/lib/libc.a" \
     -o "$OUTPUT" \

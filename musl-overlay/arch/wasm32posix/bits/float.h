@@ -1,9 +1,7 @@
-/* Wasm32 uses IEEE 754 quad precision (128-bit) for long double with clang. */
-#ifdef __FLT_EVAL_METHOD__
-#define FLT_EVAL_METHOD __FLT_EVAL_METHOD__
-#else
+/* Wasm32 clang uses 128-bit (quad) long double.
+ * No hardware support, so compiler-rt soft-float builtins are needed.
+ * We provide stub builtins in glue/compiler_rt.c that delegate to double. */
 #define FLT_EVAL_METHOD 0
-#endif
 
 #define LDBL_TRUE_MIN 6.47517511943802511092443895822764655e-4966L
 #define LDBL_MIN     3.36210314311209350626267781732175260e-4932L
