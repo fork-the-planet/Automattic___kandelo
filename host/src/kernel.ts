@@ -397,8 +397,8 @@ export class WasmPosixKernel {
   /**
    * host_write(handle: i64, buf_ptr, buf_len) -> i32
    *
-   * For handles 1 (stdout) and 2 (stderr): decode bytes from Wasm memory
-   * and write to the console.
+   * For handles 1 (stdout) and 2 (stderr): uses callback if provided,
+   * falls back to process.stdout/stderr (Node.js), then console (browser).
    * Other handles: delegate to PlatformIO.
    */
   private hostWrite(handle: bigint, bufPtr: number, bufLen: number): number {
