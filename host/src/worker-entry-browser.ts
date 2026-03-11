@@ -3,6 +3,7 @@ import type { WorkerInitMessage } from "./worker-protocol";
 import type { PlatformIO } from "./types";
 import { VirtualPlatformIO } from "./vfs/vfs";
 import { MemoryFileSystem } from "./vfs/memory-fs";
+import { DeviceFileSystem } from "./vfs/device-fs";
 import { BrowserTimeProvider } from "./vfs/time";
 
 function createIO(initData: WorkerInitMessage): PlatformIO {
@@ -21,6 +22,8 @@ function createIO(initData: WorkerInitMessage): PlatformIO {
         ? MemoryFileSystem.create(m.sharedBuffer!)
         : MemoryFileSystem.fromExisting(m.sharedBuffer!),
     }));
+  // Auto-mount /dev with virtual device files (null, zero, urandom, random)
+  backends.push({ mountPoint: "/dev", backend: new DeviceFileSystem() });
   return new VirtualPlatformIO(backends, new BrowserTimeProvider());
 }
 

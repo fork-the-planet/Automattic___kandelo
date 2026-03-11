@@ -20,5 +20,6 @@ export type {
 } from "./worker-protocol";
 export { VirtualPlatformIO } from "./vfs/vfs";
 export { MemoryFileSystem } from "./vfs/memory-fs";
+export { DeviceFileSystem } from "./vfs/device-fs";
 export { BrowserTimeProvider } from "./vfs/time";
 export type { FileSystemBackend, TimeProvider, MountConfig, DirEntry } from "./vfs/types";

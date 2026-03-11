@@ -2,6 +2,7 @@ import { WasmPosixKernel, type KernelCallbacks } from "../../host/src/kernel";
 import { ProgramRunner } from "../../host/src/program-runner";
 import { VirtualPlatformIO } from "../../host/src/vfs/vfs";
 import { MemoryFileSystem } from "../../host/src/vfs/memory-fs";
+import { DeviceFileSystem } from "../../host/src/vfs/device-fs";
 import { BrowserTimeProvider } from "../../host/src/vfs/time";
 import kernelWasmUrl from "../../host/wasm/wasm_posix_kernel.wasm?url";
 
@@ -34,16 +35,21 @@ async function run() {
       fetch(programWasmUrl).then((r) => r.arrayBuffer()),
     ]);
 
-    // Set up virtual filesystem
+    // Set up virtual filesystem with /dev mount
     const memfs = MemoryFileSystem.create(new SharedArrayBuffer(16 * 1024 * 1024));
+    const devfs = new DeviceFileSystem();
     const io = new VirtualPlatformIO(
-      [{ mountPoint: "/", backend: memfs }],
+      [
+        { mountPoint: "/dev", backend: devfs },
+        { mountPoint: "/", backend: memfs },
+      ],
       new BrowserTimeProvider(),
     );
 
     // Pre-create common directories that example programs expect
     memfs.mkdir("/tmp", 0o777);
     memfs.mkdir("/home", 0o755);
+    memfs.mkdir("/dev", 0o755);
 
     // Create kernel with stdout/stderr callbacks
     const callbacks: KernelCallbacks = {
