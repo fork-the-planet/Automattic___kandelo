@@ -103,6 +103,15 @@ echo "==> Installing to sysroot..."
 rm -rf "$SYSROOT"
 make install
 
+# ---------------------------------------------------------------
+# 6. Build __main_void wrapper and add to libc.a
+# ---------------------------------------------------------------
+echo "==> Building __main_void wrapper..."
+"$CC" --target=wasm32-unknown-unknown -O2 -c \
+    "$OVERLAY_DIR/src/env/__main_void.c" \
+    -o "$SYSROOT/lib/__main_void.o"
+"$AR" rcs "$SYSROOT/lib/libc.a" "$SYSROOT/lib/__main_void.o"
+
 echo ""
 echo "==> musl build complete!"
 echo "    Sysroot: $SYSROOT"
