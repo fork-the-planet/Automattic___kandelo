@@ -36,9 +36,10 @@ export class ProgramRunner {
      * Run a user program to completion.
      *
      * @param programBytes - The compiled Wasm bytes of the user program
+     * @param options - Optional settings (env: KEY=VALUE strings)
      * @returns The exit code (0 for normal exit via kernel_exit trap)
      */
-    async run(programBytes: BufferSource): Promise<number> {
+    async run(programBytes: BufferSource, options?: { env?: string[] }): Promise<number> {
         const memory = this.kernel.getMemory();
         if (!memory) throw new Error("Kernel not initialized");
 
@@ -54,6 +55,25 @@ export class ProgramRunner {
         // is ready just in case.
         const kernelInit = kernelExports.kernel_init as Function;
         kernelInit(1);
+
+        // Set environment variables if provided
+        if (options?.env && options.env.length > 0) {
+            const setenv = kernelExports.kernel_setenv as Function;
+            const scratchPage = memory.grow(1);
+            const scratchPtr = scratchPage * 65536;
+            const encoder = new TextEncoder();
+            for (const entry of options.env) {
+                const eq = entry.indexOf("=");
+                if (eq < 0) continue;
+                const nameBytes = encoder.encode(entry.slice(0, eq));
+                const valBytes = encoder.encode(entry.slice(eq + 1));
+                const buf = new Uint8Array(memory.buffer);
+                const valPtr = scratchPtr + nameBytes.length;
+                buf.set(nameBytes, scratchPtr);
+                buf.set(valBytes, valPtr);
+                setenv(scratchPtr, nameBytes.length, valPtr, valBytes.length, 1);
+            }
+        }
 
         // Build import object bridging kernel exports to program imports.
         const trace = typeof process !== "undefined" && !!process.env?.TRACE_SYSCALLS;

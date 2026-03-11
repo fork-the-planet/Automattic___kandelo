@@ -81,6 +81,28 @@ export async function workerMain(
       kernelInit(initData.pid);
     }
 
+    // Set environment variables if provided
+    if (initData.env && initData.env.length > 0) {
+      const setenv = instance.exports.kernel_setenv as
+        (namePtr: number, nameLen: number, valPtr: number, valLen: number, overwrite: number) => number;
+      const memory = kernel.getMemory()!;
+      // Grow memory by 1 page for a safe scratch buffer
+      const scratchPage = memory.grow(1);
+      const scratchPtr = scratchPage * 65536;
+      const encoder = new TextEncoder();
+      for (const entry of initData.env) {
+        const eq = entry.indexOf("=");
+        if (eq < 0) continue;
+        const nameBytes = encoder.encode(entry.slice(0, eq));
+        const valBytes = encoder.encode(entry.slice(eq + 1));
+        const buf = new Uint8Array(memory.buffer);
+        const valPtr = scratchPtr + nameBytes.length;
+        buf.set(nameBytes, scratchPtr);
+        buf.set(valBytes, valPtr);
+        setenv(scratchPtr, nameBytes.length, valPtr, valBytes.length, 1);
+      }
+    }
+
     port.postMessage({
       type: "ready",
       pid: initData.pid,

@@ -68,7 +68,15 @@ async function run() {
     appendOutput(`Running ${programName}...\n\n`, "info");
 
     const runner = new ProgramRunner(kernel);
-    const exitCode = await runner.run(programBytes);
+    const exitCode = await runner.run(programBytes, {
+      env: [
+        "HOME=/home",
+        "TMPDIR=/tmp",
+        "TERM=xterm-256color",
+        "LANG=en_US.UTF-8",
+        `USER=browser`,
+      ],
+    });
 
     appendOutput(`\nExited with code ${exitCode}\n`, "info");
   } catch (e) {
