@@ -26,6 +26,8 @@ export interface KernelCallbacks {
   onKill?: (pid: number, signal: number) => number;
   onExec?: (path: string) => number;
   onAlarm?: (seconds: number) => number;
+  onStdout?: (data: Uint8Array) => void;
+  onStderr?: (data: Uint8Array) => void;
 }
 
 export class WasmPosixKernel {
@@ -410,15 +412,25 @@ export class WasmPosixKernel {
       return writeEntry.pipe.write(data);
     }
 
-    // stdout / stderr — write to console
+    // stdout / stderr — callback → process → console fallback chain
     if (h === 1) {
-      const text = new TextDecoder().decode(data);
-      process.stdout.write(text);
+      if (this.callbacks.onStdout) {
+        this.callbacks.onStdout(data);
+      } else if (typeof process !== "undefined" && process.stdout) {
+        process.stdout.write(data);
+      } else {
+        console.log(new TextDecoder().decode(data));
+      }
       return bufLen;
     }
     if (h === 2) {
-      const text = new TextDecoder().decode(data);
-      process.stderr.write(text);
+      if (this.callbacks.onStderr) {
+        this.callbacks.onStderr(data);
+      } else if (typeof process !== "undefined" && process.stderr) {
+        process.stderr.write(data);
+      } else {
+        console.error(new TextDecoder().decode(data));
+      }
       return bufLen;
     }
 
