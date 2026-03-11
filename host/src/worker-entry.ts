@@ -3,6 +3,7 @@ import { parentPort, workerData } from "node:worker_threads";
 import { WasmPosixKernel } from "./kernel";
 import type { KernelCallbacks } from "./kernel";
 import { NodePlatformIO } from "./platform/node";
+import type { PlatformIO } from "./types";
 import type {
   WorkerInitMessage,
   WorkerToHostMessage,
@@ -12,10 +13,29 @@ import type {
   DeliverSignalMessage,
   ExecReplyMessage,
 } from "./worker-protocol";
+import { VirtualPlatformIO } from "./vfs/vfs";
+import { HostFileSystem } from "./vfs/host-fs";
+import { MemoryFileSystem } from "./vfs/memory-fs";
+import { NodeTimeProvider } from "./vfs/time";
 
 interface MessagePort {
   postMessage(msg: unknown, transferList?: unknown[]): void;
   on(event: string, handler: (...args: unknown[]) => void): void;
+}
+
+function createIO(initData: WorkerInitMessage): PlatformIO {
+  if (!initData.mounts || initData.mounts.length === 0) {
+    return new NodePlatformIO();
+  }
+  const backends = initData.mounts.map(m => ({
+    mountPoint: m.mountPoint,
+    backend: m.type === "host"
+      ? new HostFileSystem(m.rootPath!)
+      : m.initialize
+        ? MemoryFileSystem.create(m.sharedBuffer!)
+        : MemoryFileSystem.fromExisting(m.sharedBuffer!),
+  }));
+  return new VirtualPlatformIO(backends, new NodeTimeProvider());
 }
 
 export async function workerMain(
@@ -51,7 +71,7 @@ export async function workerMain(
       },
     };
 
-    let kernel = new WasmPosixKernel(initData.kernelConfig, new NodePlatformIO(), callbacks);
+    let kernel = new WasmPosixKernel(initData.kernelConfig, createIO(initData), callbacks);
     await kernel.init(initData.wasmBytes);
 
     let instance = kernel.getInstance()!;
@@ -173,7 +193,7 @@ export async function workerMain(
               const execState = new Uint8Array(memory.buffer, bufPtr, written).slice();
 
               // 2. Create new kernel with new binary
-              const newKernel = new WasmPosixKernel(initData.kernelConfig, new NodePlatformIO(), callbacks);
+              const newKernel = new WasmPosixKernel(initData.kernelConfig, createIO(initData), callbacks);
               await newKernel.init(msg.wasmBytes);
               const newInstance = newKernel.getInstance()!;
               const newMemory = newKernel.getMemory()!;

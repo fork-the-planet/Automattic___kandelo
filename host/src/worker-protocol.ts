@@ -43,6 +43,7 @@ export interface WorkerInitMessage {
   cwd?: string;
   forkState?: ArrayBuffer;
   signalWakeSab?: SharedArrayBuffer;
+  mounts?: SerializedMountConfig[];
 }
 
 export interface WorkerTerminateMessage {
@@ -111,4 +112,12 @@ export interface AlarmSetMessage {
 export interface ExecReplyMessage {
   type: "exec_reply";
   wasmBytes: ArrayBuffer;
+}
+
+export interface SerializedMountConfig {
+  mountPoint: string;
+  type: "host" | "memory";
+  rootPath?: string;
+  sharedBuffer?: SharedArrayBuffer;
+  initialize?: boolean;
 }

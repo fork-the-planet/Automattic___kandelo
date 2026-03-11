@@ -1,0 +1,51 @@
+import type { StatResult } from "../types";
+
+export interface DirEntry {
+  name: string;
+  type: number;
+  ino: number;
+}
+
+export interface FileSystemBackend {
+  // File handle operations
+  open(path: string, flags: number, mode: number): number;
+  close(handle: number): number;
+  read(handle: number, buffer: Uint8Array, offset: number | null, length: number): number;
+  write(handle: number, buffer: Uint8Array, offset: number | null, length: number): number;
+  seek(handle: number, offset: number, whence: number): number;
+  fstat(handle: number): StatResult;
+  ftruncate(handle: number, length: number): void;
+  fsync(handle: number): void;
+  fchmod(handle: number, mode: number): void;
+  fchown(handle: number, uid: number, gid: number): void;
+
+  // Path operations (paths are mount-relative, already resolved)
+  stat(path: string): StatResult;
+  lstat(path: string): StatResult;
+  mkdir(path: string, mode: number): void;
+  rmdir(path: string): void;
+  unlink(path: string): void;
+  rename(oldPath: string, newPath: string): void;
+  link(existingPath: string, newPath: string): void;
+  symlink(target: string, path: string): void;
+  readlink(path: string): string;
+  chmod(path: string, mode: number): void;
+  chown(path: string, uid: number, gid: number): void;
+  access(path: string, mode: number): void;
+
+  // Directory iteration
+  opendir(path: string): number;
+  readdir(handle: number): DirEntry | null;
+  closedir(handle: number): void;
+}
+
+export interface TimeProvider {
+  clockGettime(clockId: number): { sec: number; nsec: number };
+  nanosleep(sec: number, nsec: number): void;
+}
+
+export interface MountConfig {
+  mountPoint: string;
+  backend: FileSystemBackend;
+  readonly?: boolean;
+}

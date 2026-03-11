@@ -24,4 +24,6 @@ export type {
   ExecReplyMessage,
   ExecCompleteMessage,
   AlarmSetMessage,
+  SerializedMountConfig,
 } from "./worker-protocol";
+export * from "./vfs/index";
