@@ -353,8 +353,15 @@ pub fn sys_lseek(
     }
 
     let new_offset = match whence {
-        SEEK_SET => offset,
-        SEEK_CUR => ofd.offset + offset,
+        SEEK_SET => {
+            host.host_seek(ofd.host_handle, offset, whence)?;
+            offset
+        }
+        SEEK_CUR => {
+            let pos = ofd.offset + offset;
+            host.host_seek(ofd.host_handle, pos, SEEK_SET)?;
+            pos
+        }
         SEEK_END => host.host_seek(ofd.host_handle, offset, whence)?,
         _ => return Err(Errno::EINVAL),
     };

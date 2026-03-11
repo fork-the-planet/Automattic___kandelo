@@ -23,29 +23,81 @@ pub mod wasm_api;
 #[cfg(target_arch = "wasm32")]
 mod wasm {
     use core::alloc::{GlobalAlloc, Layout};
+    use core::sync::atomic::{AtomicU32, Ordering};
 
-    struct WasmAlloc;
+    /// Bump allocator that grows upward from __heap_base.
+    ///
+    /// The kernel's heap starts at the linker-defined __heap_base and grows
+    /// upward. When the cursor exceeds the current Wasm memory size, we grow
+    /// memory just enough to cover the allocation. This avoids conflicts with
+    /// the user-space allocator (musl mallocng) which uses mmap addresses
+    /// starting at 0x10000000 — the kernel heap stays well below that.
+    struct BumpAlloc {
+        cursor: AtomicU32,
+    }
 
-    unsafe impl GlobalAlloc for WasmAlloc {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            // Grow linear memory in pages (64 KiB each).
-            let pages = (layout.size() + layout.align() + 65535) / 65536;
-            let prev = core::arch::wasm32::memory_grow(0, pages);
-            if prev == usize::MAX {
-                return core::ptr::null_mut();
+    impl BumpAlloc {
+        const fn new() -> Self {
+            BumpAlloc {
+                cursor: AtomicU32::new(0),
             }
-            let base = prev * 65536;
-            let aligned = (base + layout.align() - 1) & !(layout.align() - 1);
-            aligned as *mut u8
+        }
+    }
+
+    unsafe extern "C" {
+        static __heap_base: u32;
+    }
+
+    unsafe impl GlobalAlloc for BumpAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let align = layout.align();
+            let size = layout.size();
+
+            loop {
+                let mut cur = self.cursor.load(Ordering::Relaxed);
+
+                // Lazy-init: set cursor to __heap_base on first allocation
+                if cur == 0 {
+                    let base = unsafe { &__heap_base as *const u32 as u32 };
+                    let _ = self.cursor.compare_exchange(
+                        0, base, Ordering::Relaxed, Ordering::Relaxed,
+                    );
+                    cur = self.cursor.load(Ordering::Relaxed);
+                }
+
+                // Align the cursor
+                let aligned = (cur as usize + align - 1) & !(align - 1);
+                let new_cursor = aligned + size;
+
+                // Ensure Wasm memory covers the allocation
+                let current_bytes = core::arch::wasm32::memory_size(0) * 65536;
+                if new_cursor > current_bytes {
+                    let needed_pages = (new_cursor - current_bytes + 65535) / 65536;
+                    let prev = core::arch::wasm32::memory_grow(0, needed_pages);
+                    if prev == usize::MAX {
+                        return core::ptr::null_mut();
+                    }
+                }
+
+                // Try to claim the region atomically
+                if self
+                    .cursor
+                    .compare_exchange(cur, new_cursor as u32, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return aligned as *mut u8;
+                }
+                // Another thread won; retry with updated cursor
+            }
         }
 
         unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
-            // No-op: Wasm linear memory cannot be freed.
+            // No-op: bump allocator does not reclaim memory.
         }
     }
 
     #[global_allocator]
-    static ALLOC: WasmAlloc = WasmAlloc;
+    static ALLOC: BumpAlloc = BumpAlloc::new();
 
     #[panic_handler]
     fn panic(_info: &core::panic::PanicInfo) -> ! {
