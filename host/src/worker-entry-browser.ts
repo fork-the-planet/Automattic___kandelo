@@ -9,9 +9,13 @@ function createIO(initData: WorkerInitMessage): PlatformIO {
   if (!initData.mounts || initData.mounts.length === 0) {
     throw new Error("Browser worker requires at least one memory mount");
   }
-  const backends = initData.mounts
-    .filter(m => m.type === "memory")
-    .map(m => ({
+  const unsupported = initData.mounts.filter(m => m.type !== "memory");
+  if (unsupported.length > 0) {
+    throw new Error(
+      `Browser worker does not support mount types: ${unsupported.map(m => `${m.type} at ${m.mountPoint}`).join(", ")}`,
+    );
+  }
+  const backends = initData.mounts.map(m => ({
       mountPoint: m.mountPoint,
       backend: m.initialize
         ? MemoryFileSystem.create(m.sharedBuffer!)
