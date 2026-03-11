@@ -7,6 +7,10 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
+      "browser": {
+        "types": "./dist/browser.d.ts",
+        "default": "./dist/browser.js"
+      },
       "import": {
         "types": "./dist/index.d.ts",
         "default": "./dist/index.js"
@@ -24,6 +28,20 @@
       "require": {
         "types": "./dist/browser.d.cts",
         "default": "./dist/browser.cjs"
+      }
+    },
+    "./worker-entry": {
+      "browser": {
+        "types": "./dist/worker-entry-browser.d.ts",
+        "default": "./dist/worker-entry-browser.js"
+      },
+      "import": {
+        "types": "./dist/worker-entry.d.ts",
+        "default": "./dist/worker-entry.js"
+      },
+      "require": {
+        "types": "./dist/worker-entry.d.cts",
+        "default": "./dist/worker-entry.cjs"
       }
     },
     "./worker-entry-browser": {
