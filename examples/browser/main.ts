@@ -2,6 +2,7 @@ import { WasmPosixKernel, type KernelCallbacks } from "../../host/src/kernel";
 import { VirtualPlatformIO } from "../../host/src/vfs/vfs";
 import { MemoryFileSystem } from "../../host/src/vfs/memory-fs";
 import { BrowserTimeProvider } from "../../host/src/vfs/time";
+import kernelWasmUrl from "../../host/wasm/wasm_posix_kernel.wasm?url";
 
 const output = document.getElementById("output") as HTMLPreElement;
 const programSelect = document.getElementById("program") as HTMLSelectElement;
@@ -26,9 +27,10 @@ async function run() {
 
   try {
     // Fetch kernel and program wasm in parallel
+    const programWasmUrl = new URL(`../${programName}.wasm`, import.meta.url).href;
     const [kernelBytes, programBytes] = await Promise.all([
-      fetch("../../host/wasm/wasm_posix_kernel.wasm").then((r) => r.arrayBuffer()),
-      fetch(`../../examples/${programName}.wasm`).then((r) => r.arrayBuffer()),
+      fetch(kernelWasmUrl).then((r) => r.arrayBuffer()),
+      fetch(programWasmUrl).then((r) => r.arrayBuffer()),
     ]);
 
     // Set up virtual filesystem
