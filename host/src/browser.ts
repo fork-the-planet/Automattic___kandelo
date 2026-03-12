@@ -21,5 +21,7 @@ export type {
 export { VirtualPlatformIO } from "./vfs/vfs";
 export { MemoryFileSystem } from "./vfs/memory-fs";
 export { DeviceFileSystem } from "./vfs/device-fs";
+export { OpfsFileSystem } from "./vfs/opfs";
 export { BrowserTimeProvider } from "./vfs/time";
+export { OpfsChannel, OpfsChannelStatus, OpfsOpcode, OPFS_CHANNEL_SIZE } from "./vfs/opfs-channel";
 export type { FileSystemBackend, TimeProvider, MountConfig, DirEntry } from "./vfs/types";
