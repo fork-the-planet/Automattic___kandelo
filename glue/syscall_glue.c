@@ -144,6 +144,11 @@
 #define SYS__LLSEEK       119
 #define SYS_GETRANDOM     120
 #define SYS_FLOCK         121
+#define SYS_GETDENTS64    122
+#define SYS_CLOCK_GETRES  123
+#define SYS_CLOCK_NANOSLEEP 124
+#define SYS_UTIMENSAT     125
+#define SYS_MREMAP        126
 
 /* ENOSYS — returned for unknown syscall numbers */
 #define ENOSYS_NEG (-38)
@@ -1007,6 +1012,37 @@ static long __do_syscall(long n, long a1, long a2, long a3,
     /* flock — (fd, operation) */
     case SYS_FLOCK:
         return (long)kernel_flock((int32_t)a1, (uint32_t)a2);
+
+    /* getdents64 — (fd, buf, count) */
+    case SYS_GETDENTS64:
+        return (long)kernel_getdents64((int32_t)a1,
+                                       (uint8_t *)(uintptr_t)a2,
+                                       (uint32_t)a3);
+
+    /* clock_getres — (clk_id, ts_ptr) */
+    case SYS_CLOCK_GETRES:
+        return (long)kernel_clock_getres((uint32_t)a1,
+                                         (uint8_t *)(uintptr_t)a2);
+
+    /* clock_nanosleep — (clk_id, flags, req_ptr, rem_ptr)
+     * rem_ptr (a4) is ignored — kernel handles it internally */
+    case SYS_CLOCK_NANOSLEEP:
+        return (long)kernel_clock_nanosleep((uint32_t)a1, (uint32_t)a2,
+                                            (const uint8_t *)(uintptr_t)a3);
+
+    /* utimensat — (dirfd, path, times, flags) */
+    case SYS_UTIMENSAT: {
+        const char *p = (const char *)(uintptr_t)a2;
+        return (long)kernel_utimensat((int32_t)a1, (const uint8_t *)p,
+                                      slen(p),
+                                      (const uint8_t *)(uintptr_t)a3,
+                                      (uint32_t)a4);
+    }
+
+    /* mremap — (old_addr, old_size, new_size, flags) */
+    case SYS_MREMAP:
+        return (long)kernel_mremap((uint32_t)a1, (uint32_t)a2,
+                                   (uint32_t)a3, (uint32_t)a4);
 
     /* ============================================================== */
     /* Default: unknown syscall                                        */

@@ -226,6 +226,12 @@ export class HostFileSystem implements FileSystemBackend {
     fs.accessSync(this.safePath(path), mode);
   }
 
+  utimensat(path: string, atimeSec: number, atimeNsec: number, mtimeSec: number, mtimeNsec: number): void {
+    const atime = atimeSec + atimeNsec / 1e9;
+    const mtime = mtimeSec + mtimeNsec / 1e9;
+    fs.utimesSync(this.safePath(path), atime, mtime);
+  }
+
   // ── Directory iteration ─────────────────────────────────────
 
   opendir(path: string): number {

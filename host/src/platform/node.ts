@@ -172,6 +172,12 @@ export class NodePlatformIO implements PlatformIO {
     fs.accessSync(path, mode);
   }
 
+  utimensat(path: string, atimeSec: number, atimeNsec: number, mtimeSec: number, mtimeNsec: number): void {
+    const atime = atimeSec + atimeNsec / 1e9;
+    const mtime = mtimeSec + mtimeNsec / 1e9;
+    fs.utimesSync(path, atime, mtime);
+  }
+
   opendir(path: string): number {
     const dir = fs.opendirSync(path);
     const handle = this.nextDirHandle++;

@@ -122,6 +122,11 @@ pub enum Syscall {
     Rewinddir = 116,
     Telldir = 117,
     Seekdir = 118,
+    Getdents64 = 122,
+    ClockGetres = 123,
+    ClockNanosleep = 124,
+    Utimensat = 125,
+    Mremap = 126,
 }
 
 impl Syscall {
@@ -246,6 +251,11 @@ impl Syscall {
             116 => Some(Syscall::Rewinddir),
             117 => Some(Syscall::Telldir),
             118 => Some(Syscall::Seekdir),
+            122 => Some(Syscall::Getdents64),
+            123 => Some(Syscall::ClockGetres),
+            124 => Some(Syscall::ClockNanosleep),
+            125 => Some(Syscall::Utimensat),
+            126 => Some(Syscall::Mremap),
             _ => None,
         }
     }
@@ -322,6 +332,7 @@ pub enum Errno {
     ENETUNREACH = 101,
     ECONNABORTED = 103,
     ECONNRESET = 104,
+    ECONNREFUSED = 111,
     EISCONN = 106,
     ENOTCONN = 107,
     ESHUTDOWN = 108,
@@ -378,6 +389,7 @@ impl Errno {
             103 => Some(Errno::ECONNABORTED),
             104 => Some(Errno::ECONNRESET),
             106 => Some(Errno::EISCONN),
+            111 => Some(Errno::ECONNREFUSED),
             107 => Some(Errno::ENOTCONN),
             108 => Some(Errno::ESHUTDOWN),
             114 => Some(Errno::EALREADY),

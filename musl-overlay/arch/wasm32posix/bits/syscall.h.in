@@ -153,8 +153,7 @@
 #define __NR_getitimer      224
 #define __NR_setitimer      225
 #define __NR_clock_settime  226
-#define __NR_clock_nanosleep 227
-#define __NR_clock_getres   228
+/* clock_nanosleep and clock_getres moved to real implementations above */
 #define __NR_sched_yield    229
 #define __NR_sched_getparam 230
 #define __NR_sched_setparam 231
@@ -185,11 +184,11 @@
 #define __NR_memfd_create   256
 #define __NR_membarrier     257
 #define __NR_madvise        258
-#define __NR_mremap         259
+/* mremap moved to real implementation above */
 #define __NR_statx          260
 #define __NR_set_robust_list 261
 #define __NR_get_robust_list 262
-#define __NR_utimensat      263
+/* utimensat moved to real implementation above */
 #define __NR_fchdir         264
 #define __NR_chroot         265
 #define __NR_mount          266
@@ -289,7 +288,11 @@
 #define __NR_lsetxattr      359
 #define __NR_removexattr    360
 #define __NR_setxattr       361
-#define __NR_getdents       362
+#define __NR_getdents       122
+#define __NR_clock_getres   123
+#define __NR_clock_nanosleep 124
+#define __NR_utimensat      125
+#define __NR_mremap         126
 #define __NR_utimes         363
 #define __NR_futimesat      364
 #define __NR_clock_adjtime  365

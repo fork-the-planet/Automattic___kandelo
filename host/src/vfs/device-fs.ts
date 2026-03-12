@@ -172,6 +172,10 @@ export class DeviceFileSystem implements FileSystemBackend {
     this.stat(path); // throws ENOENT if not found
   }
 
+  utimensat(_path: string, _atimeSec: number, _atimeNsec: number, _mtimeSec: number, _mtimeNsec: number): void {
+    // No-op for device files
+  }
+
   // Directory iteration for /dev itself
   private dirHandles = new Map<number, number>();
   private nextDirHandle = 1;

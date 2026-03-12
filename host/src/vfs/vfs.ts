@@ -210,6 +210,11 @@ export class VirtualPlatformIO implements PlatformIO {
     backend.access(relativePath, mode);
   }
 
+  utimensat(path: string, atimeSec: number, atimeNsec: number, mtimeSec: number, mtimeNsec: number): void {
+    const { backend, relativePath } = this.resolve(path);
+    backend.utimensat(relativePath, atimeSec, atimeNsec, mtimeSec, mtimeNsec);
+  }
+
   // --- Directory operations ---
 
   opendir(path: string): number {

@@ -38,7 +38,11 @@ impl MemoryManager {
     }
 
     /// Allocate an anonymous mapping. Returns the base address.
-    pub fn mmap_anonymous(&mut self, len: u32, prot: u32, flags: u32) -> u32 {
+    /// If `hint` is non-zero and MAP_FIXED is set, maps at exactly that address
+    /// (unmapping any overlapping regions first).
+    pub fn mmap_anonymous(&mut self, hint: u32, len: u32, prot: u32, flags: u32) -> u32 {
+        use wasm_posix_shared::mmap::MAP_FIXED;
+
         if len == 0 {
             return wasm_posix_shared::mmap::MAP_FAILED;
         }
@@ -46,8 +50,20 @@ impl MemoryManager {
         // Align to page boundary (Wasm page = 64KB)
         let aligned_len = (len + 0xFFFF) & !0xFFFF;
 
-        let addr = self.next_mmap_addr;
-        self.next_mmap_addr += aligned_len;
+        let addr = if hint != 0 && (flags & MAP_FIXED) != 0 {
+            // MAP_FIXED: use the exact address, removing any overlapping mappings
+            let end = hint.saturating_add(aligned_len);
+            self.mappings.retain(|m| {
+                let m_end = m.addr.saturating_add(m.len);
+                // Keep mappings that don't overlap [hint, end)
+                m_end <= hint || m.addr >= end
+            });
+            hint
+        } else {
+            let a = self.next_mmap_addr;
+            self.next_mmap_addr += aligned_len;
+            a
+        };
 
         self.mappings.push(MappedRegion {
             addr,
@@ -96,7 +112,7 @@ mod tests {
     #[test]
     fn test_mmap_anonymous() {
         let mut mm = MemoryManager::new();
-        let addr = mm.mmap_anonymous(4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+        let addr = mm.mmap_anonymous(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
         assert_ne!(addr, MAP_FAILED);
         assert!(mm.is_mapped(addr));
     }
@@ -104,15 +120,15 @@ mod tests {
     #[test]
     fn test_mmap_zero_length_fails() {
         let mut mm = MemoryManager::new();
-        let addr = mm.mmap_anonymous(0, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS);
+        let addr = mm.mmap_anonymous(0, 0, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS);
         assert_eq!(addr, MAP_FAILED);
     }
 
     #[test]
     fn test_mmap_aligns_to_page() {
         let mut mm = MemoryManager::new();
-        let addr1 = mm.mmap_anonymous(1, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
-        let addr2 = mm.mmap_anonymous(1, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+        let addr1 = mm.mmap_anonymous(0, 1, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+        let addr2 = mm.mmap_anonymous(0, 1, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
         // Each allocation should be at least 64KB apart (Wasm page size)
         assert_eq!(addr2 - addr1, 0x10000);
     }
@@ -120,7 +136,7 @@ mod tests {
     #[test]
     fn test_munmap() {
         let mut mm = MemoryManager::new();
-        let addr = mm.mmap_anonymous(4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+        let addr = mm.mmap_anonymous(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
         assert!(mm.is_mapped(addr));
         // munmap with the aligned length
         assert!(mm.munmap(addr, 0x10000));
@@ -154,10 +170,32 @@ mod tests {
     #[test]
     fn test_multiple_mmaps_non_overlapping() {
         let mut mm = MemoryManager::new();
-        let addr1 = mm.mmap_anonymous(0x20000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
-        let addr2 = mm.mmap_anonymous(0x10000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+        let addr1 = mm.mmap_anonymous(0, 0x20000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+        let addr2 = mm.mmap_anonymous(0, 0x10000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
         assert!(addr2 >= addr1 + 0x20000); // Non-overlapping
         assert!(mm.is_mapped(addr1));
         assert!(mm.is_mapped(addr2));
+    }
+
+    #[test]
+    fn test_mmap_fixed_at_address() {
+        let mut mm = MemoryManager::new();
+        let target = 0x20000000;
+        let addr = mm.mmap_anonymous(target, 0x10000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED);
+        assert_eq!(addr, target);
+        assert!(mm.is_mapped(target));
+    }
+
+    #[test]
+    fn test_mmap_fixed_replaces_existing() {
+        let mut mm = MemoryManager::new();
+        let target = 0x20000000;
+        // First mapping
+        let addr1 = mm.mmap_anonymous(target, 0x10000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED);
+        assert_eq!(addr1, target);
+        // Second mapping at same address replaces it
+        let addr2 = mm.mmap_anonymous(target, 0x10000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED);
+        assert_eq!(addr2, target);
+        assert!(mm.is_mapped(target));
     }
 }

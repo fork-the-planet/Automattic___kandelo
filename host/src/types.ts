@@ -48,6 +48,7 @@ export interface PlatformIO {
   chmod(path: string, mode: number): void;
   chown(path: string, uid: number, gid: number): void;
   access(path: string, mode: number): void;
+  utimensat(path: string, atimeSec: number, atimeNsec: number, mtimeSec: number, mtimeNsec: number): void;
 
   // Directory iteration
   opendir(path: string): number;

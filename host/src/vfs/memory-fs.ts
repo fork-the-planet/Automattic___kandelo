@@ -144,6 +144,12 @@ export class MemoryFileSystem implements FileSystemBackend {
     this.fs.stat(path);
   }
 
+  utimensat(path: string, _atimeSec: number, _atimeNsec: number, _mtimeSec: number, _mtimeNsec: number): void {
+    // Verify path exists (throws ENOENT if not)
+    this.fs.stat(path);
+    // SharedFS doesn't expose timestamp mutation — no-op after existence check
+  }
+
   opendir(path: string): number {
     return this.fs.opendir(path);
   }

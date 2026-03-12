@@ -166,6 +166,9 @@ int32_t kernel_readdir(int32_t dir_handle, uint8_t *dirent_ptr,
 KERNEL_IMPORT(kernel_closedir)
 int32_t kernel_closedir(int32_t dir_handle);
 
+KERNEL_IMPORT(kernel_getdents64)
+int32_t kernel_getdents64(int32_t fd, uint8_t *buf_ptr, uint32_t buf_len);
+
 KERNEL_IMPORT(kernel_rewinddir)
 int32_t kernel_rewinddir(int32_t dir_handle);
 
@@ -247,6 +250,13 @@ int32_t kernel_pause(void);
 KERNEL_IMPORT(kernel_clock_gettime)
 int32_t kernel_clock_gettime(uint32_t clock_id, uint8_t *ts_ptr);
 
+KERNEL_IMPORT(kernel_clock_getres)
+int32_t kernel_clock_getres(uint32_t clock_id, uint8_t *ts_ptr);
+
+KERNEL_IMPORT(kernel_clock_nanosleep)
+int32_t kernel_clock_nanosleep(uint32_t clock_id, uint32_t flags,
+                               const uint8_t *req_ptr);
+
 KERNEL_IMPORT(kernel_nanosleep)
 int32_t kernel_nanosleep(const uint8_t *req_ptr);
 
@@ -310,6 +320,10 @@ uint32_t kernel_brk(uint32_t addr);
 
 KERNEL_IMPORT(kernel_mprotect)
 int32_t kernel_mprotect(uint32_t addr, uint32_t len, uint32_t prot);
+
+KERNEL_IMPORT(kernel_mremap)
+uint32_t kernel_mremap(uint32_t old_addr, uint32_t old_len, uint32_t new_len,
+                       uint32_t flags);
 
 /* ------------------------------------------------------------------ */
 /* Truncate / Sync                                                     */
@@ -542,6 +556,11 @@ int32_t kernel_getrandom(uint8_t *buf_ptr, uint32_t buf_len, uint32_t flags);
 
 KERNEL_IMPORT(kernel_flock)
 int32_t kernel_flock(int32_t fd, uint32_t operation);
+
+KERNEL_IMPORT(kernel_utimensat)
+int32_t kernel_utimensat(int32_t dirfd, const uint8_t *path_ptr,
+                         uint32_t path_len, const uint8_t *times_ptr,
+                         uint32_t flags);
 
 /* ------------------------------------------------------------------ */
 /* Argv                                                                */

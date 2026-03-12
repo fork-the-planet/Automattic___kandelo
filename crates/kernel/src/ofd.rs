@@ -24,6 +24,9 @@ pub struct OpenFileDesc {
     pub ref_count: u32,
     pub owner_pid: u32,
     pub path: Vec<u8>,  // resolved absolute path
+    /// Host directory handle for getdents64 iteration (lazily opened).
+    /// -1 means not yet opened, -2 means exhausted (EOF).
+    pub dir_host_handle: i64,
 }
 
 pub struct OfdTable {
@@ -48,6 +51,7 @@ impl OfdTable {
             ref_count: 1,
             owner_pid: 0,
             path,
+            dir_host_handle: -1,
         };
 
         // Search for a free (None) slot to reuse.
@@ -269,6 +273,7 @@ mod tests {
                 ref_count: ofd.ref_count,
                 owner_pid: ofd.owner_pid,
                 path: ofd.path.clone(),
+                dir_host_handle: -1,
             });
         }
 

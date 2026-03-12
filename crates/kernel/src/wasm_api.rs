@@ -55,6 +55,7 @@ unsafe extern "C" {
     fn host_sigsuspend_wait() -> i32;
     fn host_call_signal_handler(handler_index: u32, signum: u32) -> i32;
     fn host_getrandom(buf_ptr: *mut u8, buf_len: u32) -> i32;
+    fn host_utimensat(path_ptr: *const u8, path_len: u32, atime_sec: i64, atime_nsec: i64, mtime_sec: i64, mtime_nsec: i64) -> i32;
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +377,11 @@ impl HostIO for WasmHostIO {
         } else {
             Ok(result as usize)
         }
+    }
+
+    fn host_utimensat(&mut self, path: &[u8], atime_sec: i64, atime_nsec: i64, mtime_sec: i64, mtime_nsec: i64) -> Result<(), Errno> {
+        let result = unsafe { host_utimensat(path.as_ptr(), path.len() as u32, atime_sec, atime_nsec, mtime_sec, mtime_nsec) };
+        i32_to_result(result)
     }
 }
 
@@ -1084,6 +1090,20 @@ pub extern "C" fn kernel_closedir(dir_handle: i32) -> i32 {
     result
 }
 
+/// Read directory entries in linux_dirent64 format. Returns bytes written or negative errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_getdents64(fd: i32, buf_ptr: *mut u8, buf_len: u32) -> i32 {
+    let proc = unsafe { get_process() };
+    let buf = unsafe { slice::from_raw_parts_mut(buf_ptr, buf_len as usize) };
+    let mut host = WasmHostIO;
+    let result = match syscalls::sys_getdents64(proc, &mut host, fd, buf) {
+        Ok(n) => n as i32,
+        Err(e) => -(e as i32),
+    };
+    deliver_pending_signals(proc, &mut host);
+    result
+}
+
 /// Rewind a directory stream to the beginning. Returns 0 on success, or negative errno.
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_rewinddir(dir_handle: i32) -> i32 {
@@ -1352,6 +1372,78 @@ pub extern "C" fn kernel_nanosleep(req_ptr: *const u8) -> i32 {
     let result = match syscalls::sys_nanosleep(proc, &mut host, req) {
         Ok(()) => 0,
         Err(e) => -(e as i32),
+    };
+    deliver_pending_signals(proc, &mut host);
+    result
+}
+
+/// Get clock resolution. Returns 0 or negative errno. Writes WasmTimespec to ts_ptr.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_clock_getres(clock_id: u32, ts_ptr: *mut u8) -> i32 {
+    let proc = unsafe { get_process() };
+    let mut host = WasmHostIO;
+    let result = match syscalls::sys_clock_getres(proc, clock_id) {
+        Ok(ts) => {
+            if !ts_ptr.is_null() {
+                let ts_bytes = unsafe {
+                    slice::from_raw_parts(
+                        &ts as *const WasmTimespec as *const u8,
+                        core::mem::size_of::<WasmTimespec>(),
+                    )
+                };
+                unsafe {
+                    core::ptr::copy_nonoverlapping(ts_bytes.as_ptr(), ts_ptr, ts_bytes.len());
+                }
+            }
+            0
+        }
+        Err(e) => -(e as i32),
+    };
+    deliver_pending_signals(proc, &mut host);
+    result
+}
+
+/// Sleep with clock selection. Returns 0 or negative errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_clock_nanosleep(clock_id: u32, flags: u32, req_ptr: *const u8) -> i32 {
+    let proc = unsafe { get_process() };
+    let mut host = WasmHostIO;
+    let req = unsafe { &*(req_ptr as *const WasmTimespec) };
+    let result = match syscalls::sys_clock_nanosleep(proc, &mut host, clock_id, flags, req) {
+        Ok(()) => 0,
+        Err(e) => -(e as i32),
+    };
+    deliver_pending_signals(proc, &mut host);
+    result
+}
+
+/// Set file timestamps. Returns 0 or negative errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_utimensat(dirfd: i32, path_ptr: *const u8, path_len: u32, times_ptr: *const u8, flags: u32) -> i32 {
+    let proc = unsafe { get_process() };
+    let path = unsafe { slice::from_raw_parts(path_ptr, path_len as usize) };
+    let times = if times_ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { &*(times_ptr as *const [WasmTimespec; 2]) })
+    };
+    let mut host = WasmHostIO;
+    let result = match syscalls::sys_utimensat(proc, &mut host, dirfd, path, times, flags) {
+        Ok(()) => 0,
+        Err(e) => -(e as i32),
+    };
+    deliver_pending_signals(proc, &mut host);
+    result
+}
+
+/// Remap memory. Returns MAP_FAILED (-1 as u32) since Wasm doesn't support this.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_mremap(old_addr: u32, old_len: u32, new_len: u32, flags: u32) -> u32 {
+    let proc = unsafe { get_process() };
+    let mut host = WasmHostIO;
+    let result = match syscalls::sys_mremap(proc, old_addr, old_len, new_len, flags) {
+        Ok(addr) => addr,
+        Err(e) => (-(e as i32)) as u32,
     };
     deliver_pending_signals(proc, &mut host);
     result

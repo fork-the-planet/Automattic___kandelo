@@ -282,6 +282,16 @@ export class WasmPosixKernel {
             return -5; // EIO
           }
         },
+        host_utimensat: (
+          pathPtr: number,
+          pathLen: number,
+          atimeSec: bigint,
+          atimeNsec: bigint,
+          mtimeSec: bigint,
+          mtimeNsec: bigint,
+        ): number => {
+          return this.hostUtimensat(pathPtr, pathLen, atimeSec, atimeNsec, mtimeSec, mtimeNsec);
+        },
       },
     };
 
@@ -777,6 +787,26 @@ export class WasmPosixKernel {
     try {
       const path = this.readPathFromMemory(pathPtr, pathLen);
       this.io.access(path, amode);
+      return 0;
+    } catch {
+      return -1;
+    }
+  }
+
+  /**
+   * host_utimensat(path_ptr, path_len, atime_sec, atime_nsec, mtime_sec, mtime_nsec) -> i32
+   */
+  private hostUtimensat(
+    pathPtr: number,
+    pathLen: number,
+    atimeSec: bigint,
+    atimeNsec: bigint,
+    mtimeSec: bigint,
+    mtimeNsec: bigint,
+  ): number {
+    try {
+      const path = this.readPathFromMemory(pathPtr, pathLen);
+      this.io.utimensat(path, Number(atimeSec), Number(atimeNsec), Number(mtimeSec), Number(mtimeNsec));
       return 0;
     } catch {
       return -1;
