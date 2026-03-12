@@ -136,19 +136,19 @@
 #define __NR_rt_sigtimedwait 207
 #define __NR_rt_sigreturn   208
 #define __NR_sigaltstack    209
-#define __NR_wait4          210
+#define __NR_wait4          139
 #define __NR_execve         211
 #define __NR_fork           212
 #define __NR_vfork          213
 #define __NR_getpgid        214
 #define __NR_setreuid       215
 #define __NR_setregid       216
-#define __NR_getgroups      217
-#define __NR_setgroups      218
-#define __NR_setresuid      219
-#define __NR_getresuid      220
-#define __NR_setresgid      221
-#define __NR_getresgid      222
+#define __NR_getgroups      135
+#define __NR_setgroups      136
+#define __NR_setresuid      131
+#define __NR_getresuid      132
+#define __NR_setresgid      133
+#define __NR_getresgid      134
 #define __NR_prctl          223
 #define __NR_getitimer      224
 #define __NR_setitimer      225
@@ -200,8 +200,8 @@
 #define __NR_mknodat        272
 #define __NR_sync           273
 #define __NR_syncfs         274
-#define __NR_fstatfs        275
-#define __NR_statfs         276
+#define __NR_fstatfs        130
+#define __NR_statfs         129
 #define __NR_flock          121
 #define __NR_msync          278
 #define __NR_mlock          279
@@ -315,8 +315,8 @@
 #define __NR_accept4        384
 #define __NR__llseek        119
 #define __NR_execveat       386
-#define __NR_recvmsg        387
-#define __NR_sendmsg        388
+#define __NR_recvmsg        138
+#define __NR_sendmsg        137
 
 /* Aliases that musl expects (64-bit variants and rt_sig*) */
 #define __NR_exit_group       __NR_exit

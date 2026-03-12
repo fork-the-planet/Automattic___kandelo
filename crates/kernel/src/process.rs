@@ -59,6 +59,7 @@ pub trait HostIO {
     fn host_call_signal_handler(&mut self, handler_index: u32, signum: u32) -> Result<(), Errno>;
     fn host_getrandom(&mut self, buf: &mut [u8]) -> Result<usize, Errno>;
     fn host_utimensat(&mut self, path: &[u8], atime_sec: i64, atime_nsec: i64, mtime_sec: i64, mtime_nsec: i64) -> Result<(), Errno>;
+    fn host_waitpid(&mut self, pid: i32, options: u32) -> Result<(i32, i32), Errno>;
 }
 
 /// Process lifecycle state.

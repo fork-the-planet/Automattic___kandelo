@@ -292,6 +292,13 @@ export class WasmPosixKernel {
         ): number => {
           return this.hostUtimensat(pathPtr, pathLen, atimeSec, atimeNsec, mtimeSec, mtimeNsec);
         },
+        host_waitpid: (
+          pid: number,
+          options: number,
+          statusPtr: number,
+        ): number => {
+          return this.hostWaitpid(pid, options, statusPtr);
+        },
       },
     };
 
@@ -810,6 +817,31 @@ export class WasmPosixKernel {
       return 0;
     } catch {
       return -1;
+    }
+  }
+
+  /**
+   * host_waitpid(pid, options, status_ptr) -> i32
+   * Returns child pid on success, negative errno on error.
+   * Writes wait status to status_ptr.
+   */
+  private hostWaitpid(
+    pid: number,
+    options: number,
+    statusPtr: number,
+  ): number {
+    if (!this.io.waitpid) {
+      return -10; // -ECHILD
+    }
+    try {
+      const result = this.io.waitpid(pid, options);
+      if (statusPtr !== 0 && this.memory) {
+        const view = new DataView(this.memory.buffer);
+        view.setInt32(statusPtr, result.status, true);
+      }
+      return result.pid;
+    } catch {
+      return -10; // -ECHILD
     }
   }
 

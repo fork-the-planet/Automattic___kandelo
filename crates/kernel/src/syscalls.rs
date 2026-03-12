@@ -3028,6 +3028,103 @@ pub fn sys_realpath(
     Ok(len)
 }
 
+/// statfs — get filesystem statistics. Returns hardcoded values.
+pub fn sys_statfs(_proc: &mut Process) -> wasm_posix_shared::WasmStatfs {
+    wasm_posix_shared::WasmStatfs {
+        f_type: 0xEF53,       // EXT2_SUPER_MAGIC
+        f_bsize: 4096,
+        f_blocks: 1048576,    // 4GB
+        f_bfree: 524288,      // 2GB free
+        f_bavail: 524288,
+        f_files: 65536,
+        f_ffree: 32768,
+        f_fsid: 0,
+        f_namelen: 255,
+        f_frsize: 4096,
+        f_flags: 0,
+        _pad: 0,
+    }
+}
+
+/// fstatfs — get filesystem statistics for an open fd. Returns hardcoded values.
+pub fn sys_fstatfs(proc: &mut Process, fd: i32) -> Result<wasm_posix_shared::WasmStatfs, Errno> {
+    // Validate the fd exists
+    let _ = proc.fd_table.get(fd)?;
+    Ok(sys_statfs(proc))
+}
+
+/// setresuid — set real, effective, and saved user IDs (simulated).
+pub fn sys_setresuid(proc: &mut Process, ruid: u32, euid: u32, _suid: u32) -> Result<(), Errno> {
+    if ruid != 0xFFFFFFFF { proc.uid = ruid; }
+    if euid != 0xFFFFFFFF { proc.euid = euid; }
+    Ok(())
+}
+
+/// getresuid — get real, effective, and saved user IDs.
+pub fn sys_getresuid(proc: &Process) -> (u32, u32, u32) {
+    (proc.uid, proc.euid, proc.uid)
+}
+
+/// setresgid — set real, effective, and saved group IDs (simulated).
+pub fn sys_setresgid(proc: &mut Process, rgid: u32, egid: u32, _sgid: u32) -> Result<(), Errno> {
+    if rgid != 0xFFFFFFFF { proc.gid = rgid; }
+    if egid != 0xFFFFFFFF { proc.egid = egid; }
+    Ok(())
+}
+
+/// getresgid — get real, effective, and saved group IDs.
+pub fn sys_getresgid(proc: &Process) -> (u32, u32, u32) {
+    (proc.gid, proc.egid, proc.gid)
+}
+
+/// getgroups — get supplementary group IDs.
+/// Returns 1 group (the process's primary gid).
+pub fn sys_getgroups(proc: &Process, size: u32) -> Result<(u32, u32), Errno> {
+    if size == 0 {
+        // Return count only
+        return Ok((1, 0));
+    }
+    // Return count=1 and the group
+    Ok((1, proc.gid))
+}
+
+/// setgroups — set supplementary group IDs (no-op).
+pub fn sys_setgroups(_proc: &mut Process, _size: u32) -> Result<(), Errno> {
+    Ok(())
+}
+
+/// sendmsg — send a message on a socket (minimal: extracts iov[0] and delegates to send).
+pub fn sys_sendmsg(
+    proc: &mut Process,
+    host: &mut dyn HostIO,
+    fd: i32,
+    iov_base: &[u8],
+    flags: u32,
+) -> Result<usize, Errno> {
+    sys_send(proc, host, fd, iov_base, flags)
+}
+
+/// recvmsg — receive a message from a socket (minimal: extracts iov[0] and delegates to recv).
+pub fn sys_recvmsg(
+    proc: &mut Process,
+    host: &mut dyn HostIO,
+    fd: i32,
+    iov_buf: &mut [u8],
+    flags: u32,
+) -> Result<usize, Errno> {
+    sys_recv(proc, host, fd, iov_buf, flags)
+}
+
+/// wait4 — wait for a child process. Delegates to host.
+pub fn sys_waitpid(
+    _proc: &mut Process,
+    host: &mut dyn HostIO,
+    pid: i32,
+    options: u32,
+) -> Result<(i32, i32), Errno> {
+    host.host_waitpid(pid, options)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3227,6 +3324,9 @@ mod tests {
         }
         fn host_utimensat(&mut self, _path: &[u8], _atime_sec: i64, _atime_nsec: i64, _mtime_sec: i64, _mtime_nsec: i64) -> Result<(), Errno> {
             Ok(())
+        }
+        fn host_waitpid(&mut self, _pid: i32, _options: u32) -> Result<(i32, i32), Errno> {
+            Err(Errno::ECHILD)
         }
     }
 
@@ -6233,6 +6333,9 @@ mod tests {
         }
         fn host_utimensat(&mut self, _path: &[u8], _atime_sec: i64, _atime_nsec: i64, _mtime_sec: i64, _mtime_nsec: i64) -> Result<(), Errno> {
             Ok(())
+        }
+        fn host_waitpid(&mut self, _pid: i32, _options: u32) -> Result<(i32, i32), Errno> {
+            Err(Errno::ECHILD)
         }
     }
 

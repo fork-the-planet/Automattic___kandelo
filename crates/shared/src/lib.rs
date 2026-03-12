@@ -129,6 +129,17 @@ pub enum Syscall {
     Mremap = 126,
     Fchdir = 127,
     Madvise = 128,
+    Statfs = 129,
+    Fstatfs = 130,
+    Setresuid = 131,
+    Getresuid = 132,
+    Setresgid = 133,
+    Getresgid = 134,
+    Getgroups = 135,
+    Setgroups = 136,
+    Sendmsg = 137,
+    Recvmsg = 138,
+    Wait4 = 139,
 }
 
 impl Syscall {
@@ -260,6 +271,17 @@ impl Syscall {
             126 => Some(Syscall::Mremap),
             127 => Some(Syscall::Fchdir),
             128 => Some(Syscall::Madvise),
+            129 => Some(Syscall::Statfs),
+            130 => Some(Syscall::Fstatfs),
+            131 => Some(Syscall::Setresuid),
+            132 => Some(Syscall::Getresuid),
+            133 => Some(Syscall::Setresgid),
+            134 => Some(Syscall::Getresgid),
+            135 => Some(Syscall::Getgroups),
+            136 => Some(Syscall::Setgroups),
+            137 => Some(Syscall::Sendmsg),
+            138 => Some(Syscall::Recvmsg),
+            139 => Some(Syscall::Wait4),
             _ => None,
         }
     }
@@ -299,6 +321,7 @@ pub enum Errno {
     EIO = 5,
     ENXIO = 6,
     EBADF = 9,
+    ECHILD = 10,
     EAGAIN = 11,
     ENOMEM = 12,
     EACCES = 13,
@@ -355,6 +378,7 @@ impl Errno {
             5 => Some(Errno::EIO),
             6 => Some(Errno::ENXIO),
             9 => Some(Errno::EBADF),
+            10 => Some(Errno::ECHILD),
             11 => Some(Errno::EAGAIN),
             12 => Some(Errno::ENOMEM),
             13 => Some(Errno::EACCES),
@@ -739,4 +763,25 @@ pub struct WasmPollFd {
     pub fd: i32,
     pub events: i16,
     pub revents: i16,
+}
+
+/// Statfs structure for the Wasm POSIX interface.
+///
+/// Uses `repr(C)` for a stable, predictable memory layout matching
+/// musl's struct statfs on 32-bit targets.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct WasmStatfs {
+    pub f_type: u32,
+    pub f_bsize: u32,
+    pub f_blocks: u64,
+    pub f_bfree: u64,
+    pub f_bavail: u64,
+    pub f_files: u64,
+    pub f_ffree: u64,
+    pub f_fsid: u64,
+    pub f_namelen: u32,
+    pub f_frsize: u32,
+    pub f_flags: u32,
+    pub _pad: u32,
 }

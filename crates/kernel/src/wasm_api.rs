@@ -56,6 +56,7 @@ unsafe extern "C" {
     fn host_call_signal_handler(handler_index: u32, signum: u32) -> i32;
     fn host_getrandom(buf_ptr: *mut u8, buf_len: u32) -> i32;
     fn host_utimensat(path_ptr: *const u8, path_len: u32, atime_sec: i64, atime_nsec: i64, mtime_sec: i64, mtime_nsec: i64) -> i32;
+    fn host_waitpid(pid: i32, options: u32, status_ptr: *mut i32) -> i32;
 }
 
 // ---------------------------------------------------------------------------
@@ -382,6 +383,18 @@ impl HostIO for WasmHostIO {
     fn host_utimensat(&mut self, path: &[u8], atime_sec: i64, atime_nsec: i64, mtime_sec: i64, mtime_nsec: i64) -> Result<(), Errno> {
         let result = unsafe { host_utimensat(path.as_ptr(), path.len() as u32, atime_sec, atime_nsec, mtime_sec, mtime_nsec) };
         i32_to_result(result)
+    }
+    fn host_waitpid(&mut self, pid: i32, options: u32) -> Result<(i32, i32), Errno> {
+        let mut status: i32 = 0;
+        let result = unsafe { host_waitpid(pid, options, &mut status) };
+        if result < 0 {
+            match Errno::from_u32((-result) as u32) {
+                Some(e) => Err(e),
+                None => Err(Errno::EIO),
+            }
+        } else {
+            Ok((result, status))
+        }
     }
 }
 
@@ -1469,6 +1482,214 @@ pub extern "C" fn kernel_madvise(addr: u32, len: u32, advice: u32) -> i32 {
     let mut host = WasmHostIO;
     let result = match syscalls::sys_madvise(proc, addr, len, advice) {
         Ok(()) => 0,
+        Err(e) => -(e as i32),
+    };
+    deliver_pending_signals(proc, &mut host);
+    result
+}
+
+/// statfs — get filesystem statistics. Writes WasmStatfs struct to buf_ptr.
+/// Returns 0 on success.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_statfs(path_ptr: *const u8, path_len: u32, buf_ptr: *mut u8) -> i32 {
+    let proc = unsafe { get_process() };
+    let _path = unsafe { slice::from_raw_parts(path_ptr, path_len as usize) };
+    let statfs = syscalls::sys_statfs(proc);
+    let buf = unsafe { slice::from_raw_parts_mut(buf_ptr, core::mem::size_of::<wasm_posix_shared::WasmStatfs>()) };
+    let bytes = unsafe { core::slice::from_raw_parts(&statfs as *const _ as *const u8, core::mem::size_of::<wasm_posix_shared::WasmStatfs>()) };
+    buf.copy_from_slice(bytes);
+    let mut host = WasmHostIO;
+    deliver_pending_signals(proc, &mut host);
+    0
+}
+
+/// fstatfs — get filesystem statistics for an open fd.
+/// Returns 0 on success, negative errno on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_fstatfs(fd: i32, buf_ptr: *mut u8) -> i32 {
+    let proc = unsafe { get_process() };
+    let mut host = WasmHostIO;
+    let result = match syscalls::sys_fstatfs(proc, fd) {
+        Ok(statfs) => {
+            let buf = unsafe { slice::from_raw_parts_mut(buf_ptr, core::mem::size_of::<wasm_posix_shared::WasmStatfs>()) };
+            let bytes = unsafe { core::slice::from_raw_parts(&statfs as *const _ as *const u8, core::mem::size_of::<wasm_posix_shared::WasmStatfs>()) };
+            buf.copy_from_slice(bytes);
+            0
+        }
+        Err(e) => -(e as i32),
+    };
+    deliver_pending_signals(proc, &mut host);
+    result
+}
+
+/// setresuid — set real, effective, and saved user IDs.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_setresuid(ruid: u32, euid: u32, suid: u32) -> i32 {
+    let proc = unsafe { get_process() };
+    let result = match syscalls::sys_setresuid(proc, ruid, euid, suid) {
+        Ok(()) => 0,
+        Err(e) => -(e as i32),
+    };
+    let mut host = WasmHostIO;
+    deliver_pending_signals(proc, &mut host);
+    result
+}
+
+/// getresuid — get real, effective, and saved user IDs.
+/// Writes three u32 values to the pointers.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_getresuid(ruid_ptr: *mut u32, euid_ptr: *mut u32, suid_ptr: *mut u32) -> i32 {
+    let proc = unsafe { get_process() };
+    let (ruid, euid, suid) = syscalls::sys_getresuid(proc);
+    unsafe {
+        *ruid_ptr = ruid;
+        *euid_ptr = euid;
+        *suid_ptr = suid;
+    }
+    let mut host = WasmHostIO;
+    deliver_pending_signals(proc, &mut host);
+    0
+}
+
+/// setresgid — set real, effective, and saved group IDs.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_setresgid(rgid: u32, egid: u32, sgid: u32) -> i32 {
+    let proc = unsafe { get_process() };
+    let result = match syscalls::sys_setresgid(proc, rgid, egid, sgid) {
+        Ok(()) => 0,
+        Err(e) => -(e as i32),
+    };
+    let mut host = WasmHostIO;
+    deliver_pending_signals(proc, &mut host);
+    result
+}
+
+/// getresgid — get real, effective, and saved group IDs.
+/// Writes three u32 values to the pointers.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_getresgid(rgid_ptr: *mut u32, egid_ptr: *mut u32, sgid_ptr: *mut u32) -> i32 {
+    let proc = unsafe { get_process() };
+    let (rgid, egid, sgid) = syscalls::sys_getresgid(proc);
+    unsafe {
+        *rgid_ptr = rgid;
+        *egid_ptr = egid;
+        *sgid_ptr = sgid;
+    }
+    let mut host = WasmHostIO;
+    deliver_pending_signals(proc, &mut host);
+    0
+}
+
+/// getgroups — get supplementary group IDs.
+/// Returns count on success, negative errno on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_getgroups(size: u32, list_ptr: *mut u32) -> i32 {
+    let proc = unsafe { get_process() };
+    let result = match syscalls::sys_getgroups(proc, size) {
+        Ok((count, gid)) => {
+            if size > 0 {
+                unsafe { *list_ptr = gid; }
+            }
+            count as i32
+        }
+        Err(e) => -(e as i32),
+    };
+    let mut host = WasmHostIO;
+    deliver_pending_signals(proc, &mut host);
+    result
+}
+
+/// setgroups — set supplementary group IDs (no-op).
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_setgroups(size: u32, _list_ptr: *const u32) -> i32 {
+    let proc = unsafe { get_process() };
+    let result = match syscalls::sys_setgroups(proc, size) {
+        Ok(()) => 0,
+        Err(e) => -(e as i32),
+    };
+    let mut host = WasmHostIO;
+    deliver_pending_signals(proc, &mut host);
+    result
+}
+
+/// sendmsg — send a message on a socket.
+/// Parses msghdr to extract iov[0] and delegates to sys_sendmsg.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sendmsg(fd: i32, msg_ptr: *const u8, flags: u32) -> i32 {
+    let proc = unsafe { get_process() };
+    let mut host = WasmHostIO;
+
+    // Parse msghdr: msg_iov at offset 8, msg_iovlen at offset 12
+    let msg = unsafe { slice::from_raw_parts(msg_ptr, 28) };
+    let iov_ptr = u32::from_le_bytes([msg[8], msg[9], msg[10], msg[11]]) as usize;
+    let iov_len = u32::from_le_bytes([msg[12], msg[13], msg[14], msg[15]]);
+
+    if iov_len == 0 {
+        deliver_pending_signals(proc, &mut host);
+        return 0;
+    }
+
+    // Parse first iovec: iov_base at offset 0, iov_len at offset 4
+    let iov = unsafe { slice::from_raw_parts(iov_ptr as *const u8, 8) };
+    let base = u32::from_le_bytes([iov[0], iov[1], iov[2], iov[3]]) as usize;
+    let len = u32::from_le_bytes([iov[4], iov[5], iov[6], iov[7]]) as usize;
+
+    let buf = unsafe { slice::from_raw_parts(base as *const u8, len) };
+    let result = match syscalls::sys_sendmsg(proc, &mut host, fd, buf, flags) {
+        Ok(n) => n as i32,
+        Err(e) => -(e as i32),
+    };
+    deliver_pending_signals(proc, &mut host);
+    result
+}
+
+/// recvmsg — receive a message from a socket.
+/// Parses msghdr to extract iov[0] and delegates to sys_recvmsg.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_recvmsg(fd: i32, msg_ptr: *mut u8, flags: u32) -> i32 {
+    let proc = unsafe { get_process() };
+    let mut host = WasmHostIO;
+
+    // Parse msghdr: msg_iov at offset 8, msg_iovlen at offset 12
+    let msg = unsafe { slice::from_raw_parts(msg_ptr, 28) };
+    let iov_ptr = u32::from_le_bytes([msg[8], msg[9], msg[10], msg[11]]) as usize;
+    let iov_len = u32::from_le_bytes([msg[12], msg[13], msg[14], msg[15]]);
+
+    if iov_len == 0 {
+        deliver_pending_signals(proc, &mut host);
+        return 0;
+    }
+
+    // Parse first iovec
+    let iov = unsafe { slice::from_raw_parts(iov_ptr as *const u8, 8) };
+    let base = u32::from_le_bytes([iov[0], iov[1], iov[2], iov[3]]) as usize;
+    let len = u32::from_le_bytes([iov[4], iov[5], iov[6], iov[7]]) as usize;
+
+    let buf = unsafe { slice::from_raw_parts_mut(base as *mut u8, len) };
+    let result = match syscalls::sys_recvmsg(proc, &mut host, fd, buf, flags) {
+        Ok(n) => n as i32,
+        Err(e) => -(e as i32),
+    };
+    // Zero out msg_controllen to indicate no ancillary data
+    let msg_mut = unsafe { slice::from_raw_parts_mut(msg_ptr, 28) };
+    msg_mut[20..24].copy_from_slice(&0u32.to_le_bytes());
+    deliver_pending_signals(proc, &mut host);
+    result
+}
+
+/// wait4 — wait for child process. Writes status to wstatus_ptr, ignores rusage.
+/// Returns child pid on success, negative errno on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_wait4(pid: i32, wstatus_ptr: *mut i32, options: u32, _rusage_ptr: *mut u8) -> i32 {
+    let proc = unsafe { get_process() };
+    let mut host = WasmHostIO;
+    let result = match syscalls::sys_waitpid(proc, &mut host, pid, options) {
+        Ok((child_pid, status)) => {
+            if !wstatus_ptr.is_null() {
+                unsafe { *wstatus_ptr = status; }
+            }
+            child_pid
+        }
         Err(e) => -(e as i32),
     };
     deliver_pending_signals(proc, &mut host);

@@ -569,6 +569,59 @@ KERNEL_IMPORT(kernel_madvise)
 int32_t kernel_madvise(uint32_t addr, uint32_t len, uint32_t advice);
 
 /* ------------------------------------------------------------------ */
+/* Filesystem info                                                     */
+/* ------------------------------------------------------------------ */
+
+KERNEL_IMPORT(kernel_statfs)
+int32_t kernel_statfs(const uint8_t *path_ptr, uint32_t path_len,
+                      uint8_t *buf_ptr);
+
+KERNEL_IMPORT(kernel_fstatfs)
+int32_t kernel_fstatfs(int32_t fd, uint8_t *buf_ptr);
+
+/* ------------------------------------------------------------------ */
+/* Identity (res* variants)                                            */
+/* ------------------------------------------------------------------ */
+
+KERNEL_IMPORT(kernel_setresuid)
+int32_t kernel_setresuid(uint32_t ruid, uint32_t euid, uint32_t suid);
+
+KERNEL_IMPORT(kernel_getresuid)
+int32_t kernel_getresuid(uint32_t *ruid_ptr, uint32_t *euid_ptr,
+                         uint32_t *suid_ptr);
+
+KERNEL_IMPORT(kernel_setresgid)
+int32_t kernel_setresgid(uint32_t rgid, uint32_t egid, uint32_t sgid);
+
+KERNEL_IMPORT(kernel_getresgid)
+int32_t kernel_getresgid(uint32_t *rgid_ptr, uint32_t *egid_ptr,
+                         uint32_t *sgid_ptr);
+
+KERNEL_IMPORT(kernel_getgroups)
+int32_t kernel_getgroups(uint32_t size, uint32_t *list_ptr);
+
+KERNEL_IMPORT(kernel_setgroups)
+int32_t kernel_setgroups(uint32_t size, const uint32_t *list_ptr);
+
+/* ------------------------------------------------------------------ */
+/* Message-based socket I/O                                            */
+/* ------------------------------------------------------------------ */
+
+KERNEL_IMPORT(kernel_sendmsg)
+int32_t kernel_sendmsg(int32_t fd, const uint8_t *msg_ptr, uint32_t flags);
+
+KERNEL_IMPORT(kernel_recvmsg)
+int32_t kernel_recvmsg(int32_t fd, uint8_t *msg_ptr, uint32_t flags);
+
+/* ------------------------------------------------------------------ */
+/* Process waiting                                                     */
+/* ------------------------------------------------------------------ */
+
+KERNEL_IMPORT(kernel_wait4)
+int32_t kernel_wait4(int32_t pid, int32_t *wstatus_ptr, uint32_t options,
+                     uint8_t *rusage_ptr);
+
+/* ------------------------------------------------------------------ */
 /* Argv                                                                */
 /* ------------------------------------------------------------------ */
 

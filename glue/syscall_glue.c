@@ -151,6 +151,18 @@
 #define SYS_MREMAP        126
 #define SYS_FCHDIR        127
 #define SYS_MADVISE       128
+#define SYS_STATFS        129
+#define SYS_FSTATFS       130
+#define SYS_SETRESUID     131
+#define SYS_GETRESUID     132
+#define SYS_SETRESGID     133
+#define SYS_GETRESGID     134
+#define SYS_GETGROUPS     135
+#define SYS_SETGROUPS     136
+#define SYS_SENDMSG       137
+#define SYS_RECVMSG       138
+#define SYS_WAIT4         139
+#define SYS_PRLIMIT64     250
 
 /* ENOSYS — returned for unknown syscall numbers */
 #define ENOSYS_NEG (-38)
@@ -1053,6 +1065,104 @@ static long __do_syscall(long n, long a1, long a2, long a3,
     /* madvise — (addr, length, advice) → no-op */
     case SYS_MADVISE:
         return (long)kernel_madvise((uint32_t)a1, (uint32_t)a2, (uint32_t)a3);
+
+    /* ============================================================== */
+    /* Filesystem info                                                 */
+    /* ============================================================== */
+
+    /* statfs — (path, buf) */
+    case SYS_STATFS: {
+        const char *p = (const char *)(uintptr_t)a1;
+        return (long)kernel_statfs((const uint8_t *)p, slen(p),
+                                   (uint8_t *)(uintptr_t)a2);
+    }
+
+    /* fstatfs — (fd, buf) */
+    case SYS_FSTATFS:
+        return (long)kernel_fstatfs((int32_t)a1, (uint8_t *)(uintptr_t)a2);
+
+    /* ============================================================== */
+    /* Identity (res* variants)                                        */
+    /* ============================================================== */
+
+    /* setresuid — (ruid, euid, suid) */
+    case SYS_SETRESUID:
+        return (long)kernel_setresuid((uint32_t)a1, (uint32_t)a2, (uint32_t)a3);
+
+    /* getresuid — (ruid_ptr, euid_ptr, suid_ptr) */
+    case SYS_GETRESUID:
+        return (long)kernel_getresuid((uint32_t *)(uintptr_t)a1,
+                                      (uint32_t *)(uintptr_t)a2,
+                                      (uint32_t *)(uintptr_t)a3);
+
+    /* setresgid — (rgid, egid, sgid) */
+    case SYS_SETRESGID:
+        return (long)kernel_setresgid((uint32_t)a1, (uint32_t)a2, (uint32_t)a3);
+
+    /* getresgid — (rgid_ptr, egid_ptr, sgid_ptr) */
+    case SYS_GETRESGID:
+        return (long)kernel_getresgid((uint32_t *)(uintptr_t)a1,
+                                      (uint32_t *)(uintptr_t)a2,
+                                      (uint32_t *)(uintptr_t)a3);
+
+    /* getgroups — (size, list_ptr) */
+    case SYS_GETGROUPS:
+        return (long)kernel_getgroups((uint32_t)a1,
+                                      (uint32_t *)(uintptr_t)a2);
+
+    /* setgroups — (size, list_ptr) */
+    case SYS_SETGROUPS:
+        return (long)kernel_setgroups((uint32_t)a1,
+                                      (const uint32_t *)(uintptr_t)a2);
+
+    /* ============================================================== */
+    /* Message-based socket I/O                                        */
+    /* ============================================================== */
+
+    /* sendmsg — (fd, msg_ptr, flags) */
+    case SYS_SENDMSG:
+        return (long)kernel_sendmsg((int32_t)a1,
+                                    (const uint8_t *)(uintptr_t)a2,
+                                    (uint32_t)a3);
+
+    /* recvmsg — (fd, msg_ptr, flags) */
+    case SYS_RECVMSG:
+        return (long)kernel_recvmsg((int32_t)a1,
+                                    (uint8_t *)(uintptr_t)a2,
+                                    (uint32_t)a3);
+
+    /* ============================================================== */
+    /* Process waiting                                                 */
+    /* ============================================================== */
+
+    /* wait4 — (pid, wstatus, options, rusage) */
+    case SYS_WAIT4:
+        return (long)kernel_wait4((int32_t)a1,
+                                  (int32_t *)(uintptr_t)a2,
+                                  (uint32_t)a3,
+                                  (uint8_t *)(uintptr_t)a4);
+
+    /* ============================================================== */
+    /* prlimit64 — delegates to existing getrlimit/setrlimit           */
+    /* ============================================================== */
+
+    /* prlimit64 — (pid, resource, new_limit, old_limit)
+     * pid is ignored (single-process). If new_limit != NULL, call
+     * kernel_setrlimit; if old_limit != NULL, call kernel_getrlimit. */
+    case SYS_PRLIMIT64: {
+        uint32_t resource = (uint32_t)a2;
+        const uint8_t *new_rlim = (const uint8_t *)(uintptr_t)a3;
+        uint8_t *old_rlim = (uint8_t *)(uintptr_t)a4;
+        int32_t r = 0;
+        if (new_rlim) {
+            r = kernel_setrlimit(resource, new_rlim);
+            if (r < 0) return (long)r;
+        }
+        if (old_rlim) {
+            r = kernel_getrlimit(resource, old_rlim);
+        }
+        return (long)r;
+    }
 
     /* ============================================================== */
     /* Default: unknown syscall                                        */
