@@ -69,4 +69,15 @@ export interface PlatformIO {
 
   // Process (optional — only needed when process management is available)
   waitpid?(pid: number, options: number): { pid: number; status: number };
+
+  // Networking (optional — only needed for AF_INET support)
+  network?: NetworkIO;
+}
+
+export interface NetworkIO {
+  connect(handle: number, addr: Uint8Array, port: number): void;
+  send(handle: number, data: Uint8Array, flags: number): number;
+  recv(handle: number, maxLen: number, flags: number): Uint8Array;
+  close(handle: number): void;
+  getaddrinfo(hostname: string): Uint8Array; // Returns 4-byte IPv4
 }

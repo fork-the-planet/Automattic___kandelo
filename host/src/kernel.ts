@@ -299,6 +299,21 @@ export class WasmPosixKernel {
         ): number => {
           return this.hostWaitpid(pid, options, statusPtr);
         },
+        host_net_connect: (handle: number, addrPtr: number, addrLen: number, port: number): number => {
+          return this.hostNetConnect(handle, addrPtr, addrLen, port);
+        },
+        host_net_send: (handle: number, bufPtr: number, bufLen: number, flags: number): number => {
+          return this.hostNetSend(handle, bufPtr, bufLen, flags);
+        },
+        host_net_recv: (handle: number, bufPtr: number, bufLen: number, flags: number): number => {
+          return this.hostNetRecv(handle, bufPtr, bufLen, flags);
+        },
+        host_net_close: (handle: number): number => {
+          return this.hostNetClose(handle);
+        },
+        host_getaddrinfo: (namePtr: number, nameLen: number, resultPtr: number, resultLen: number): number => {
+          return this.hostGetaddrinfo(namePtr, nameLen, resultPtr, resultLen);
+        },
       },
     };
 
@@ -1548,5 +1563,68 @@ export class WasmPosixKernel {
       writeReady: extractReady(writePtr, writefds),
       exceptReady: extractReady(exceptPtr, exceptfds),
     };
+  }
+
+  // ---- Networking host imports ----
+
+  private hostNetConnect(handle: number, addrPtr: number, addrLen: number, port: number): number {
+    if (!this.io.network) return -111; // -ECONNREFUSED
+    try {
+      const mem = new Uint8Array(this.memory!.buffer);
+      const addr = mem.slice(addrPtr, addrPtr + addrLen);
+      this.io.network.connect(handle, addr, port);
+      return 0;
+    } catch {
+      return -111; // -ECONNREFUSED
+    }
+  }
+
+  private hostNetSend(handle: number, bufPtr: number, bufLen: number, flags: number): number {
+    if (!this.io.network) return -107; // -ENOTCONN
+    try {
+      const mem = new Uint8Array(this.memory!.buffer);
+      const data = mem.slice(bufPtr, bufPtr + bufLen);
+      return this.io.network.send(handle, data, flags);
+    } catch {
+      return -32; // -EPIPE
+    }
+  }
+
+  private hostNetRecv(handle: number, bufPtr: number, bufLen: number, flags: number): number {
+    if (!this.io.network) return -107; // -ENOTCONN
+    try {
+      const data = this.io.network.recv(handle, bufLen, flags);
+      if (data.length > 0 && this.memory) {
+        const mem = new Uint8Array(this.memory.buffer);
+        mem.set(data, bufPtr);
+      }
+      return data.length;
+    } catch {
+      return -104; // -ECONNRESET
+    }
+  }
+
+  private hostNetClose(handle: number): number {
+    if (!this.io.network) return 0;
+    try {
+      this.io.network.close(handle);
+      return 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  private hostGetaddrinfo(namePtr: number, nameLen: number, resultPtr: number, resultLen: number): number {
+    if (!this.io.network) return -2; // -ENOENT
+    try {
+      const mem = new Uint8Array(this.memory!.buffer);
+      const name = new TextDecoder().decode(mem.slice(namePtr, namePtr + nameLen));
+      const addr = this.io.network.getaddrinfo(name);
+      if (addr.length > resultLen) return -22; // -EINVAL
+      mem.set(addr, resultPtr);
+      return addr.length;
+    } catch {
+      return -2; // -ENOENT
+    }
   }
 }
