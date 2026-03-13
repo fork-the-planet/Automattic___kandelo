@@ -162,6 +162,7 @@
 #define SYS_SENDMSG       137
 #define SYS_RECVMSG       138
 #define SYS_WAIT4         139
+#define SYS_GETADDRINFO   140
 #define SYS_PRLIMIT64     250
 
 /* ENOSYS — returned for unknown syscall numbers */
@@ -1130,6 +1131,13 @@ static long __do_syscall(long n, long a1, long a2, long a3,
         return (long)kernel_recvmsg((int32_t)a1,
                                     (uint8_t *)(uintptr_t)a2,
                                     (uint32_t)a3);
+
+    /* getaddrinfo — (name, result_ptr) */
+    case SYS_GETADDRINFO: {
+        const char *name = (const char *)a1;
+        unsigned name_len = __builtin_strlen(name);
+        return kernel_getaddrinfo((const uint8_t *)name, name_len, (uint8_t *)a2);
+    }
 
     /* ============================================================== */
     /* Process waiting                                                 */

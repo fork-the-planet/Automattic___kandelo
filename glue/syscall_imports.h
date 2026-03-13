@@ -613,6 +613,10 @@ int32_t kernel_sendmsg(int32_t fd, const uint8_t *msg_ptr, uint32_t flags);
 KERNEL_IMPORT(kernel_recvmsg)
 int32_t kernel_recvmsg(int32_t fd, uint8_t *msg_ptr, uint32_t flags);
 
+KERNEL_IMPORT(kernel_getaddrinfo)
+int32_t kernel_getaddrinfo(const uint8_t *name_ptr, uint32_t name_len,
+                           uint8_t *result_ptr);
+
 /* ------------------------------------------------------------------ */
 /* Process waiting                                                     */
 /* ------------------------------------------------------------------ */
