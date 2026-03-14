@@ -1,0 +1,22 @@
+{
+  "name": "wasm-posix-sdk",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "wasm32posix-cc": "./src/bin/cc.ts",
+    "wasm32posix-c++": "./src/bin/c++.ts",
+    "wasm32posix-ar": "./src/bin/ar.ts",
+    "wasm32posix-ranlib": "./src/bin/ranlib.ts",
+    "wasm32posix-nm": "./src/bin/nm.ts",
+    "wasm32posix-strip": "./src/bin/strip.ts",
+    "wasm32posix-pkg-config": "./src/bin/pkg-config.ts",
+    "wasm32posix-configure": "./src/bin/configure.ts"
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "vitest": "^3.0.0"
+  }
+}
