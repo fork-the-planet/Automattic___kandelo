@@ -288,6 +288,12 @@ int32_t kernel_setenv(const uint8_t *name_ptr, uint32_t name_len,
 KERNEL_IMPORT(kernel_unsetenv)
 int32_t kernel_unsetenv(const uint8_t *name_ptr, uint32_t name_len);
 
+KERNEL_IMPORT(kernel_environ_count)
+uint32_t kernel_environ_count(void);
+
+KERNEL_IMPORT(kernel_environ_get)
+int32_t kernel_environ_get(uint32_t index, uint8_t *buf_ptr, uint32_t buf_len);
+
 /* ------------------------------------------------------------------ */
 /* Terminal                                                            */
 /* ------------------------------------------------------------------ */

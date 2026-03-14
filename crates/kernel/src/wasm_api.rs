@@ -1819,6 +1819,31 @@ pub extern "C" fn kernel_unsetenv(name_ptr: *const u8, name_len: u32) -> i32 {
     result
 }
 
+/// Return the number of environment variables in proc.environ.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_environ_count() -> u32 {
+    let proc = unsafe { get_process() };
+    proc.environ.len() as u32
+}
+
+/// Read the environment variable at `index` as "KEY=VALUE" into buf.
+/// Returns the number of bytes written, or negative errno on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_environ_get(index: u32, buf_ptr: *mut u8, buf_len: u32) -> i32 {
+    let proc = unsafe { get_process() };
+    let idx = index as usize;
+    if idx >= proc.environ.len() {
+        return -(Errno::EINVAL as i32);
+    }
+    let entry = &proc.environ[idx];
+    let buf = unsafe { slice::from_raw_parts_mut(buf_ptr, buf_len as usize) };
+    if buf.len() < entry.len() {
+        return -(Errno::ERANGE as i32);
+    }
+    buf[..entry.len()].copy_from_slice(entry);
+    entry.len() as i32
+}
+
 // ---------------------------------------------------------------------------
 // Argv support — host pushes args, program reads them at startup
 // ---------------------------------------------------------------------------
