@@ -23,9 +23,9 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
-        SSL_CTX_load_verify_locations(ctx, "/etc/ssl/certs/ca-certificates.crt", NULL);
-    }
+    /* In wasm, there are no system CA certs — skip verification for now.
+       Real integrations would populate /etc/ssl/certs/ in the VFS. */
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
 
     struct addrinfo hints = {0};
     hints.ai_family = AF_INET;
@@ -54,9 +54,12 @@ int main(int argc, char **argv)
     SSL_set_fd(ssl, fd);
     SSL_set_tlsext_host_name(ssl, hostname);
 
-    if (SSL_connect(ssl) != 1) {
-        printf("FAIL: SSL_connect\n");
+    int ret = SSL_connect(ssl);
+    if (ret != 1) {
+        int sslerr = SSL_get_error(ssl, ret);
+        printf("FAIL: SSL_connect ret=%d sslerr=%d\n", ret, sslerr);
         ERR_print_errors_fp(stdout);
+        fflush(stdout);
         return 1;
     }
     printf("OK: TLS handshake complete (%s)\n", SSL_get_version(ssl));

@@ -190,32 +190,42 @@ pub fn sys_read(
             }
         }
         FileType::Socket => {
+            use crate::socket::SocketDomain;
             let sock_idx = (-(host_handle + 1)) as usize;
             let sock = proc.sockets.get(sock_idx).ok_or(Errno::EBADF)?;
             if sock.shut_rd {
                 return Ok(0);
             }
-            let recv_buf_idx = sock.recv_buf_idx.ok_or(Errno::ENOTCONN)?;
-            loop {
-                let pipe = proc
-                    .pipes
-                    .get_mut(recv_buf_idx)
-                    .and_then(|p| p.as_mut())
-                    .ok_or(Errno::EBADF)?;
-                let n = pipe.read(buf);
-                if n > 0 {
-                    return Ok(n);
+            match sock.domain {
+                SocketDomain::Inet | SocketDomain::Inet6 => {
+                    // AF_INET: delegate to host network backend (same as sys_recv)
+                    let net_handle = sock.host_net_handle.ok_or(Errno::ENOTCONN)?;
+                    host.host_net_recv(net_handle, buf.len() as u32, 0, buf)
                 }
-                if !pipe.is_write_end_open() {
-                    return Ok(0); // EOF — peer closed
+                SocketDomain::Unix => {
+                    let recv_buf_idx = sock.recv_buf_idx.ok_or(Errno::ENOTCONN)?;
+                    loop {
+                        let pipe = proc
+                            .pipes
+                            .get_mut(recv_buf_idx)
+                            .and_then(|p| p.as_mut())
+                            .ok_or(Errno::EBADF)?;
+                        let n = pipe.read(buf);
+                        if n > 0 {
+                            return Ok(n);
+                        }
+                        if !pipe.is_write_end_open() {
+                            return Ok(0); // EOF — peer closed
+                        }
+                        if status_flags & O_NONBLOCK != 0 {
+                            return Err(Errno::EAGAIN);
+                        }
+                        if proc.signals.deliverable() != 0 {
+                            return Err(Errno::EINTR);
+                        }
+                        let _ = host.host_nanosleep(0, 1_000_000);
+                    }
                 }
-                if status_flags & O_NONBLOCK != 0 {
-                    return Err(Errno::EAGAIN);
-                }
-                if proc.signals.deliverable() != 0 {
-                    return Err(Errno::EINTR);
-                }
-                let _ = host.host_nanosleep(0, 1_000_000);
             }
         }
         _ => {
@@ -285,34 +295,44 @@ pub fn sys_write(
             }
         }
         FileType::Socket => {
+            use crate::socket::SocketDomain;
             let sock_idx = (-(host_handle + 1)) as usize;
             let sock = proc.sockets.get(sock_idx).ok_or(Errno::EBADF)?;
             if sock.shut_wr {
                 proc.signals.raise(wasm_posix_shared::signal::SIGPIPE);
                 return Err(Errno::EPIPE);
             }
-            let send_buf_idx = sock.send_buf_idx.ok_or(Errno::ENOTCONN)?;
-            loop {
-                let pipe = proc
-                    .pipes
-                    .get_mut(send_buf_idx)
-                    .and_then(|p| p.as_mut())
-                    .ok_or(Errno::EBADF)?;
-                if !pipe.is_read_end_open() {
-                    proc.signals.raise(wasm_posix_shared::signal::SIGPIPE);
-                    return Err(Errno::EPIPE);
+            match sock.domain {
+                SocketDomain::Inet | SocketDomain::Inet6 => {
+                    // AF_INET: delegate to host network backend (same as sys_send)
+                    let net_handle = sock.host_net_handle.ok_or(Errno::ENOTCONN)?;
+                    host.host_net_send(net_handle, buf, 0)
                 }
-                let n = pipe.write(buf);
-                if n > 0 {
-                    return Ok(n);
+                SocketDomain::Unix => {
+                    let send_buf_idx = sock.send_buf_idx.ok_or(Errno::ENOTCONN)?;
+                    loop {
+                        let pipe = proc
+                            .pipes
+                            .get_mut(send_buf_idx)
+                            .and_then(|p| p.as_mut())
+                            .ok_or(Errno::EBADF)?;
+                        if !pipe.is_read_end_open() {
+                            proc.signals.raise(wasm_posix_shared::signal::SIGPIPE);
+                            return Err(Errno::EPIPE);
+                        }
+                        let n = pipe.write(buf);
+                        if n > 0 {
+                            return Ok(n);
+                        }
+                        if status_flags & O_NONBLOCK != 0 {
+                            return Err(Errno::EAGAIN);
+                        }
+                        if proc.signals.deliverable() != 0 {
+                            return Err(Errno::EINTR);
+                        }
+                        let _ = host.host_nanosleep(0, 1_000_000);
+                    }
                 }
-                if status_flags & O_NONBLOCK != 0 {
-                    return Err(Errno::EAGAIN);
-                }
-                if proc.signals.deliverable() != 0 {
-                    return Err(Errno::EINTR);
-                }
-                let _ = host.host_nanosleep(0, 1_000_000);
             }
         }
         _ => {
