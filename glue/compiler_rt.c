@@ -1019,7 +1019,7 @@ int __unordtf2(fp128 a, fp128 b) {
     return a_nan || b_nan;
 }
 
-/* ===== 128-bit integer multiply (needed by scanf/printf internals) ===== */
+/* ===== 128-bit integer types ===== */
 
 typedef struct { uint64_t lo; uint64_t hi; } u128;
 
@@ -1027,6 +1027,75 @@ typedef union {
     __int128 i;
     u128 parts;
 } i128_bits;
+
+/* ===== 128-bit integer shifts (needed by OpenSSL and other libraries) ===== */
+
+/* Left shift: a << b */
+__int128 __ashlti3(__int128 a, int b) {
+    i128_bits ua;
+    ua.i = a;
+    uint64_t lo = ua.parts.lo, hi = ua.parts.hi;
+    i128_bits result;
+    if (b == 0) {
+        return a;
+    } else if (b >= 128) {
+        result.parts.lo = 0;
+        result.parts.hi = 0;
+    } else if (b >= 64) {
+        result.parts.lo = 0;
+        result.parts.hi = lo << (b - 64);
+    } else {
+        result.parts.lo = lo << b;
+        result.parts.hi = (hi << b) | (lo >> (64 - b));
+    }
+    return result.i;
+}
+
+/* Logical right shift: (unsigned)a >> b */
+__int128 __lshrti3(__int128 a, int b) {
+    i128_bits ua;
+    ua.i = a;
+    uint64_t lo = ua.parts.lo, hi = ua.parts.hi;
+    i128_bits result;
+    if (b == 0) {
+        return a;
+    } else if (b >= 128) {
+        result.parts.lo = 0;
+        result.parts.hi = 0;
+    } else if (b >= 64) {
+        result.parts.lo = hi >> (b - 64);
+        result.parts.hi = 0;
+    } else {
+        result.parts.lo = (lo >> b) | (hi << (64 - b));
+        result.parts.hi = hi >> b;
+    }
+    return result.i;
+}
+
+/* Arithmetic right shift: (signed)a >> b */
+__int128 __ashrti3(__int128 a, int b) {
+    i128_bits ua;
+    ua.i = a;
+    uint64_t lo = ua.parts.lo;
+    int64_t hi = (int64_t)ua.parts.hi;
+    i128_bits result;
+    if (b == 0) {
+        return a;
+    } else if (b >= 128) {
+        int64_t s = hi >> 63; /* all sign bits */
+        result.parts.lo = (uint64_t)s;
+        result.parts.hi = (uint64_t)s;
+    } else if (b >= 64) {
+        result.parts.lo = (uint64_t)(hi >> (b - 64));
+        result.parts.hi = (uint64_t)(hi >> 63);
+    } else {
+        result.parts.lo = (lo >> b) | ((uint64_t)hi << (64 - b));
+        result.parts.hi = (uint64_t)(hi >> b);
+    }
+    return result.i;
+}
+
+/* ===== 128-bit integer multiply (needed by scanf/printf internals) ===== */
 
 __int128 __multi3(__int128 a, __int128 b) {
     i128_bits ua, ub;
