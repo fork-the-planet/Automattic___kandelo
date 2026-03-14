@@ -21,7 +21,6 @@ export interface Toolchain {
 }
 
 const HOMEBREW_LLVM = '/opt/homebrew/opt/llvm/bin';
-const LINUX_LLVM_PREFIX = '/usr/lib/llvm-';
 
 export async function findLlvmDir(): Promise<string> {
   const envDir = process.env.WASM_POSIX_LLVM_DIR;

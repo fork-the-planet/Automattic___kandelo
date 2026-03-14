@@ -10,11 +10,20 @@ export function buildClangArgs(userArgs: string[], toolchain: Toolchain): string
   for (const w of warnings) console.error(w);
 
   const parsed = parseArgs(filtered);
+  const linking = needsLinking(parsed);
+  const hasSourceFiles = parsed.sourceFiles.length > 0;
 
-  const args: string[] = [
-    ...COMPILE_FLAGS,
-    `--sysroot=${toolchain.sysroot}`,
-  ];
+  const args: string[] = [];
+
+  // Only inject compile flags when there are source files to compile
+  if (hasSourceFiles || parsed.compileOnly || parsed.preprocessOnly || parsed.assemblyOnly) {
+    args.push(...COMPILE_FLAGS);
+  }
+  // Target is always needed (even for link-only, clang needs to know the target)
+  if (!args.includes('--target=wasm32-unknown-unknown')) {
+    args.push('--target=wasm32-unknown-unknown');
+  }
+  args.push(`--sysroot=${toolchain.sysroot}`);
 
   if (parsed.compileOnly) args.push('-c');
   if (parsed.preprocessOnly) args.push('-E');
@@ -26,7 +35,7 @@ export function buildClangArgs(userArgs: string[], toolchain: Toolchain): string
   args.push(...parsed.objectFiles);
   args.push(...parsed.archiveFiles);
 
-  if (needsLinking(parsed)) {
+  if (linking) {
     args.push(
       join(toolchain.glueDir, 'syscall_glue.c'),
       join(toolchain.glueDir, 'compiler_rt.c'),

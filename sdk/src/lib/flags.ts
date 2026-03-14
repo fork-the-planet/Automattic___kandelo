@@ -93,6 +93,8 @@ export function parseArgs(args: string[]): ParsedArgs {
     } else if (arg === '-o') {
       i++;
       result.outputFile = args[i] ?? null;
+    } else if (arg.startsWith('-o') && arg.length > 2) {
+      result.outputFile = arg.substring(2);
     } else if (!arg.startsWith('-')) {
       const ext = arg.substring(arg.lastIndexOf('.'));
       if (SOURCE_EXTS.has(ext)) {

@@ -12,7 +12,7 @@ export function run(cmd: string, args: string[]): Promise<RunResult> {
       resolve({
         stdout: stdout ?? '',
         stderr: stderr ?? '',
-        exitCode: error ? (error as any).code ?? 1 : 0,
+        exitCode: error ? (error as NodeJS.ErrnoException & { status?: number }).status ?? 1 : 0,
       });
     });
   });

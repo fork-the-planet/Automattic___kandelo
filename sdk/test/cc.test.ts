@@ -34,10 +34,14 @@ describe('buildClangArgs', () => {
     expect(args.join(' ')).toContain('libc.a');
   });
 
-  it('link-only: object files without -c get link flags', () => {
+  it('link-only: object files without -c get link flags but not compile-only flags', () => {
     const args = buildClangArgs(['foo.o', 'bar.o', '-o', 'out.wasm'], toolchain);
     expect(args).toContain('-Wl,--entry=_start');
     expect(args.join(' ')).toContain('libc.a');
+    expect(args).toContain('--target=wasm32-unknown-unknown');
+    // Compile-only flags should not be present in link-only mode
+    expect(args).not.toContain('-fno-exceptions');
+    expect(args).not.toContain('-fno-trapping-math');
   });
 
   it('preprocess-only: no link flags', () => {

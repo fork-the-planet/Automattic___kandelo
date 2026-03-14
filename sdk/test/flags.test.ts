@@ -58,6 +58,12 @@ describe('parseArgs', () => {
     expect(parsed.objectFiles).toEqual(['foo.o']);
     expect(parsed.archiveFiles).toEqual(['libbar.a']);
   });
+
+  it('handles -ofilename (no space) syntax', () => {
+    const parsed = parseArgs(['-c', 'foo.c', '-ofoo.o']);
+    expect(parsed.outputFile).toBe('foo.o');
+    expect(parsed.compileOnly).toBe(true);
+  });
 });
 
 describe('needsLinking', () => {
