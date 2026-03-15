@@ -25,6 +25,75 @@ if (typeof process !== "undefined" && process.versions?.node) {
     .catch(() => {});
 }
 
+/** Read an unsigned LEB128 integer from a byte array. */
+function readLEB128(bytes: Uint8Array, offset: number): { value: number; bytesRead: number } {
+    let value = 0;
+    let shift = 0;
+    let bytesRead = 0;
+    while (true) {
+        const byte = bytes[offset + bytesRead];
+        value |= (byte & 0x7f) << shift;
+        bytesRead++;
+        if ((byte & 0x80) === 0) break;
+        shift += 7;
+    }
+    return { value, bytesRead };
+}
+
+/**
+ * Parse a Wasm binary's import section to find the minimum memory pages
+ * required by a memory import. Returns null if no memory import is found.
+ */
+function getMemoryImportMinPages(bytes: Uint8Array): number | null {
+    if (bytes.length < 8 || bytes[0] !== 0 || bytes[1] !== 0x61 ||
+        bytes[2] !== 0x73 || bytes[3] !== 0x6d) {
+        return null;
+    }
+    let offset = 8; // skip magic + version
+    while (offset < bytes.length) {
+        const sectionId = bytes[offset++];
+        const size = readLEB128(bytes, offset);
+        offset += size.bytesRead;
+        if (sectionId !== 2) { // not import section
+            offset += size.value;
+            continue;
+        }
+        const sectionEnd = offset + size.value;
+        const numImports = readLEB128(bytes, offset);
+        offset += numImports.bytesRead;
+        for (let i = 0; i < numImports.value && offset < sectionEnd; i++) {
+            // skip module name
+            const modLen = readLEB128(bytes, offset);
+            offset += modLen.bytesRead + modLen.value;
+            // skip field name
+            const fieldLen = readLEB128(bytes, offset);
+            offset += fieldLen.bytesRead + fieldLen.value;
+            const kind = bytes[offset++];
+            if (kind === 2) { // memory import
+                const _flags = bytes[offset++];
+                const min = readLEB128(bytes, offset);
+                return min.value;
+            } else if (kind === 0) { // function
+                const t = readLEB128(bytes, offset);
+                offset += t.bytesRead;
+            } else if (kind === 1) { // table
+                offset++; // elemtype
+                const flags = bytes[offset++];
+                const min = readLEB128(bytes, offset);
+                offset += min.bytesRead;
+                if (flags & 1) {
+                    const max = readLEB128(bytes, offset);
+                    offset += max.bytesRead;
+                }
+            } else if (kind === 3) { // global
+                offset += 2; // valtype + mut
+            }
+        }
+        return null;
+    }
+    return null;
+}
+
 export class ProgramRunner {
     private kernel: WasmPosixKernel;
 
@@ -111,15 +180,43 @@ export class ProgramRunner {
             }
         }
 
-        const importObject: WebAssembly.Imports = {
-            kernel: kernelImports,
-            env: { memory },
-        };
-
         // Compile and instantiate the program module.
         // The start section (__wasm_call_ctors) runs automatically during
         // instantiation, setting up C global constructors.
         const module = await WebAssembly.compile(programBytes);
+
+        // Ensure shared memory has enough pages for the program's declared minimum.
+        // Large programs (e.g. PHP) may need more initial pages than the kernel allocates.
+        const programBuf = programBytes instanceof ArrayBuffer
+            ? new Uint8Array(programBytes)
+            : new Uint8Array((programBytes as ArrayBufferView).buffer,
+                (programBytes as ArrayBufferView).byteOffset,
+                (programBytes as ArrayBufferView).byteLength);
+        const requiredPages = getMemoryImportMinPages(programBuf);
+        if (requiredPages !== null) {
+            const currentPages = memory.buffer.byteLength / 65536;
+            if (currentPages < requiredPages) {
+                memory.grow(requiredPages - currentPages);
+            }
+        }
+
+        // Build env imports: memory + stub any unresolved function imports.
+        // Programs compiled with --allow-undefined may import functions that
+        // don't exist in the kernel (e.g. DNS, fibers). Stub them to trap.
+        const envImports: Record<string, WebAssembly.ExportValue> = { memory };
+        for (const imp of WebAssembly.Module.imports(module)) {
+            if (imp.module === "env" && imp.kind === "function") {
+                envImports[imp.name] = () => {
+                    throw new Error(`Unimplemented import: env.${imp.name}`);
+                };
+            }
+        }
+
+        const importObject: WebAssembly.Imports = {
+            kernel: kernelImports,
+            env: envImports,
+        };
+
         const instance = await WebAssembly.instantiate(module, importObject);
 
         // Set the kernel's program break to the program's __heap_base.

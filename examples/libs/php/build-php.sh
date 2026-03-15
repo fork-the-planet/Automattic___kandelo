@@ -47,7 +47,7 @@ if [ ! -f Makefile ]; then
         --disable-zend-signals \
         --cache-file="$SCRIPT_DIR/config.cache" \
         --prefix="$INSTALL_DIR" \
-        CFLAGS="-DZEND_USE_ASM_ARITHMETIC=0"
+        CFLAGS="-O2 -DZEND_USE_ASM_ARITHMETIC=0"
 
     # Patch config.h: disable features that pass link-time checks (--allow-undefined)
     # but don't actually exist in our musl sysroot

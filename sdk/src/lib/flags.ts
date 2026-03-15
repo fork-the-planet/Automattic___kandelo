@@ -2,6 +2,8 @@ export const COMPILE_FLAGS: string[] = [
   '--target=wasm32-unknown-unknown',
   '-matomics',
   '-mbulk-memory',
+  '-mexception-handling',
+  '-mllvm', '-wasm-enable-sjlj',
   '-fno-exceptions',
   '-fno-trapping-math',
 ];
@@ -10,10 +12,12 @@ export const LINK_FLAGS: string[] = [
   '-nostdlib',
   '-Wl,--entry=_start',
   '-Wl,--export=_start',
+  '-Wl,--export=__heap_base',
   '-Wl,--import-memory',
   '-Wl,--shared-memory',
   '-Wl,--max-memory=1073741824',
   '-Wl,--allow-undefined',
+  '-Wl,--global-base=1114112',
 ];
 
 const IGNORED_EXACT = new Set([
