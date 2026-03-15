@@ -1,6 +1,8 @@
 /**
  * Browser test harness — runs PHP CLI via wasm-posix-kernel using
  * VirtualPlatformIO + MemoryFileSystem (the browser code path).
+ *
+ * Runs multiple PHP invocations and reports results as JSON in #results.
  */
 
 import { WasmPosixKernel, type KernelCallbacks } from "../../../../../host/src/kernel";
@@ -15,6 +17,49 @@ const stdoutEl = document.getElementById("stdout")!;
 const stderrEl = document.getElementById("stderr")!;
 const exitCodeEl = document.getElementById("exit-code")!;
 const statusEl = document.getElementById("status")!;
+const resultsEl = document.getElementById("results")!;
+
+async function runPhp(
+  phpBytes: ArrayBuffer,
+  kernelBytes: ArrayBuffer,
+  memfs: MemoryFileSystem,
+  devfs: DeviceFileSystem,
+  argv: string[],
+): Promise<{ stdout: string; exitCode: number }> {
+  let stdout = "";
+  const io = new VirtualPlatformIO(
+    [
+      { mountPoint: "/dev", backend: devfs },
+      { mountPoint: "/", backend: memfs },
+    ],
+    new BrowserTimeProvider(),
+  );
+
+  const decoder = new TextDecoder();
+  const callbacks: KernelCallbacks = {
+    onStdout: (data) => { stdout += decoder.decode(data); },
+    onStderr: (data) => { stderrEl.textContent += decoder.decode(data); },
+  };
+
+  const kernel = new WasmPosixKernel(
+    { maxWorkers: 1, dataBufferSize: 65536, useSharedMemory: true },
+    io,
+    callbacks,
+  );
+
+  await kernel.init(kernelBytes);
+  const runner = new ProgramRunner(kernel);
+  const exitCode = await runner.run(phpBytes, {
+    argv,
+    env: [
+      "HOME=/home",
+      "TMPDIR=/tmp",
+      "TERM=xterm-256color",
+    ],
+  });
+
+  return { stdout, exitCode };
+}
 
 async function main() {
   try {
@@ -30,39 +75,27 @@ async function main() {
     memfs.mkdir("/home", 0o755);
     memfs.mkdir("/dev", 0o755);
 
-    const io = new VirtualPlatformIO(
-      [
-        { mountPoint: "/dev", backend: devfs },
-        { mountPoint: "/", backend: memfs },
-      ],
-      new BrowserTimeProvider(),
-    );
+    // Test 1: Hello World
+    const r1 = await runPhp(phpBytes, kernelBytes, memfs, devfs,
+      ["php", "-r", 'echo "Hello World\n";']);
 
-    const decoder = new TextDecoder();
-    const callbacks: KernelCallbacks = {
-      onStdout: (data) => { stdoutEl.textContent += decoder.decode(data); },
-      onStderr: (data) => { stderrEl.textContent += decoder.decode(data); },
+    // Test 2: Session
+    const r2 = await runPhp(phpBytes, kernelBytes, memfs, devfs,
+      ["php", "-r", 'session_start(); echo strlen(session_id()) > 0 ? "session-ok" : "fail";']);
+
+    // Test 3: SQLite3 in-memory
+    const r3 = await runPhp(phpBytes, kernelBytes, memfs, devfs,
+      ["php", "-r", '$db=new SQLite3(":memory:");$db->exec("CREATE TABLE t(v TEXT)");$db->exec("INSERT INTO t VALUES(\'sqlite-ok\')");echo $db->querySingle("SELECT v FROM t");']);
+
+    const results = {
+      hello: r1.stdout.trim(),
+      session: r2.stdout.trim(),
+      sqlite: r3.stdout.trim(),
     };
 
-    const kernel = new WasmPosixKernel(
-      { maxWorkers: 1, dataBufferSize: 65536, useSharedMemory: true },
-      io,
-      callbacks,
-    );
-
-    await kernel.init(kernelBytes);
-
-    const runner = new ProgramRunner(kernel);
-    const exitCode = await runner.run(phpBytes, {
-      argv: ["php", "-r", 'echo "Hello World\n";'],
-      env: [
-        "HOME=/home",
-        "TMPDIR=/tmp",
-        "TERM=xterm-256color",
-      ],
-    });
-
-    exitCodeEl.textContent = String(exitCode);
+    stdoutEl.textContent = r1.stdout;
+    exitCodeEl.textContent = String(r1.exitCode);
+    resultsEl.textContent = JSON.stringify(results);
     statusEl.textContent = "done";
   } catch (e) {
     stderrEl.textContent += String(e);

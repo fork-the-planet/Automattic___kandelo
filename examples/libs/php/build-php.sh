@@ -11,6 +11,24 @@ if ! command -v wasm32posix-cc &>/dev/null; then
     exit 1
 fi
 
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+SYSROOT="$REPO_ROOT/sysroot"
+SQLITE_DIR="$SCRIPT_DIR/../sqlite/sqlite-install"
+
+# Build SQLite if not already built
+if [ ! -f "$SQLITE_DIR/lib/libsqlite3.a" ]; then
+    echo "==> Building SQLite..."
+    bash "$SCRIPT_DIR/../sqlite/build-sqlite.sh"
+fi
+
+# Install SQLite into sysroot so pkg-config can find it
+echo "==> Installing SQLite into sysroot..."
+cp "$SQLITE_DIR/include/sqlite3.h" "$SQLITE_DIR/include/sqlite3ext.h" "$SYSROOT/include/"
+cp "$SQLITE_DIR/lib/libsqlite3.a" "$SYSROOT/lib/"
+mkdir -p "$SYSROOT/lib/pkgconfig"
+sed "s|^prefix=.*|prefix=$SYSROOT|" "$SQLITE_DIR/lib/pkgconfig/sqlite3.pc" \
+    > "$SYSROOT/lib/pkgconfig/sqlite3.pc"
+
 if [ ! -d "$SRC_DIR" ]; then
     echo "==> Downloading PHP $PHP_VERSION..."
     TARBALL="php-${PHP_VERSION}.tar.gz"
@@ -45,6 +63,10 @@ if [ ! -f Makefile ]; then
         --without-pcre-jit \
         --disable-fiber-asm \
         --disable-zend-signals \
+        --enable-session \
+        --with-sqlite3 \
+        --enable-pdo \
+        --with-pdo-sqlite \
         --cache-file="$SCRIPT_DIR/config.cache" \
         --prefix="$INSTALL_DIR" \
         CFLAGS="-O2 -DZEND_USE_ASM_ARITHMETIC=0"
@@ -65,6 +87,14 @@ if [ ! -f Makefile ]; then
         -e 's/^#define HAVE_SETPROCTITLE 1/\/* #undef HAVE_SETPROCTITLE *\//' \
         -e 's/^#define HAVE_PRCTL 1/\/* #undef HAVE_PRCTL *\//' \
         main/php_config.h && rm -f main/php_config.h.bak
+
+    # Remove -MMD/-MF/-MT dependency tracking flags from Makefile.
+    # libtool doesn't understand these flags and misidentifies the source file,
+    # causing "mv: rename foo.o" errors during compilation.
+    echo "==> Patching Makefile to remove dependency tracking flags..."
+    sed -i.bak \
+        -e 's/ -MMD -MF [^ ]* -MT [^ ]*//g' \
+        Makefile && rm -f Makefile.bak
 fi
 
 echo "==> Building PHP..."

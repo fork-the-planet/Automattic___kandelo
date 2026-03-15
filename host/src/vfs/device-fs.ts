@@ -31,12 +31,15 @@ const zeroDevice: DeviceNode = {
 function makeRandomDevice(): DeviceNode {
   return {
     reader: (buf, len) => {
-      const target = buf.subarray(0, len);
       if (typeof globalThis.crypto !== "undefined" && globalThis.crypto.getRandomValues) {
-        globalThis.crypto.getRandomValues(target);
+        // crypto.getRandomValues rejects SharedArrayBuffer-backed views in browsers,
+        // so generate into a temporary non-shared buffer and copy.
+        const tmp = new Uint8Array(len);
+        globalThis.crypto.getRandomValues(tmp);
+        buf.set(tmp, 0);
       } else {
         // Fallback: not cryptographically secure, but functional
-        for (let i = 0; i < len; i++) target[i] = (Math.random() * 256) | 0;
+        for (let i = 0; i < len; i++) buf[i] = (Math.random() * 256) | 0;
       }
       return len;
     },

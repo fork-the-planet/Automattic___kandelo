@@ -10,30 +10,31 @@
 
 import { test, expect } from "@playwright/test";
 
-test("PHP CLI runs 'echo Hello World' in the browser", async ({ page }) => {
+test("PHP CLI runs Hello World, session, and SQLite in the browser", async ({ page }) => {
   await page.goto("/");
 
-  // Wait for the test harness to finish (up to 60s for PHP startup)
+  // Wait for the test harness to finish (up to 120s for multiple PHP runs)
   await page.waitForFunction(
     () => {
       const status = document.getElementById("status");
       return status && (status.textContent === "done" || status.textContent === "error");
     },
-    { timeout: 60_000 },
+    { timeout: 120_000 },
   );
 
   const status = await page.locator("#status").textContent();
-  const stdout = await page.locator("#stdout").textContent();
   const stderr = await page.locator("#stderr").textContent();
-  const exitCode = await page.locator("#exit-code").textContent();
+  const resultsText = await page.locator("#results").textContent();
 
-  if (status === "error" || exitCode !== "0") {
-    console.log("STDOUT:", stdout);
+  if (status === "error") {
     console.log("STDERR:", stderr);
-    console.log("EXIT CODE:", exitCode);
+    console.log("RESULTS:", resultsText);
   }
 
   expect(status).toBe("done");
-  expect(stdout).toContain("Hello World");
-  expect(exitCode).toBe("0");
+
+  const results = JSON.parse(resultsText!);
+  expect(results.hello).toContain("Hello World");
+  expect(results.session).toContain("session-ok");
+  expect(results.sqlite).toContain("sqlite-ok");
 });
