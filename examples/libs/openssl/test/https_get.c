@@ -1,3 +1,10 @@
+/*
+ * https_get.c — Perform an HTTPS GET using OpenSSL over raw POSIX sockets.
+ *
+ * Usage: the host must provide networking (TcpNetworkBackend or TLS fetch backend).
+ * Expects one argument: the hostname to connect to.
+ * Connects to port 443, does TLS handshake, sends GET /, prints response.
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,8 +20,10 @@ int main(int argc, char **argv)
     const char *hostname = argc > 1 ? argv[1] : "example.com";
     int port = 443;
 
+    /* Initialize OpenSSL */
     OPENSSL_init_ssl(0, NULL);
 
+    /* Create SSL context */
     const SSL_METHOD *method = TLS_client_method();
     SSL_CTX *ctx = SSL_CTX_new(method);
     if (!ctx) {
@@ -23,19 +32,10 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* In wasm, there are no system CA certs — skip verification for now.
-       Real integrations would populate /etc/ssl/certs/ in the VFS. */
+    /* Don't verify peer certificate (simplifies testing) */
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
 
-    /* The TLS MITM proxy (from WordPress Playground) implements TLS 1.2 but
-       does not support the secure renegotiation extension (RFC 5746).
-       OpenSSL 3.x aborts by default; allow legacy connections here. */
-    SSL_CTX_set_options(ctx, SSL_OP_LEGACY_SERVER_CONNECT);
-
-    /* Restrict to TLS 1.2 since the MITM proxy only supports TLS 1.2. */
-    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-    SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION);
-
+    /* Resolve hostname */
     struct addrinfo hints = {0};
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
@@ -46,8 +46,12 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* Create socket and connect */
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) { printf("FAIL: socket\n"); return 1; }
+    if (fd < 0) {
+        printf("FAIL: socket\n");
+        return 1;
+    }
 
     struct sockaddr_in addr;
     memcpy(&addr, res->ai_addr, sizeof(addr));
@@ -55,36 +59,41 @@ int main(int argc, char **argv)
     freeaddrinfo(res);
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        printf("FAIL: connect\n"); return 1;
+        printf("FAIL: connect\n");
+        return 1;
     }
     printf("OK: connected to %s:%d\n", hostname, port);
 
+    /* Create SSL connection */
     SSL *ssl = SSL_new(ctx);
     SSL_set_fd(ssl, fd);
     SSL_set_tlsext_host_name(ssl, hostname);
 
-    int ret = SSL_connect(ssl);
-    if (ret != 1) {
-        int sslerr = SSL_get_error(ssl, ret);
-        printf("FAIL: SSL_connect ret=%d sslerr=%d\n", ret, sslerr);
+    if (SSL_connect(ssl) != 1) {
+        printf("FAIL: SSL_connect\n");
         ERR_print_errors_fp(stdout);
-        fflush(stdout);
         return 1;
     }
     printf("OK: TLS handshake complete (%s)\n", SSL_get_version(ssl));
 
+    /* Send HTTP GET request */
     char request[512];
     int reqlen = snprintf(request, sizeof(request),
-        "GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", hostname);
+        "GET / HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Connection: close\r\n"
+        "\r\n", hostname);
     SSL_write(ssl, request, reqlen);
     printf("OK: sent HTTP request\n");
 
+    /* Read response */
     char buf[4096];
     int total = 0;
     int n;
     while ((n = SSL_read(ssl, buf, sizeof(buf) - 1)) > 0) {
         buf[n] = '\0';
         if (total == 0) {
+            /* Print first line of response (status line) */
             char *eol = strchr(buf, '\r');
             if (eol) *eol = '\0';
             printf("OK: response: %s\n", buf);
@@ -94,6 +103,7 @@ int main(int argc, char **argv)
     }
     printf("OK: received %d bytes total\n", total);
 
+    /* Cleanup */
     SSL_shutdown(ssl);
     SSL_free(ssl);
     close(fd);
