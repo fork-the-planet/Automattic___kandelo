@@ -30,6 +30,7 @@ const IGNORED_EXACT = new Set([
 const IGNORED_PREFIXES = [
   '-Wl,-rpath,',
   '-Wl,-soname,',
+  '-Wl,--version-script',
 ];
 
 const WARN_FLAGS = new Set([
