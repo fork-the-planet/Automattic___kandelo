@@ -1,10 +1,44 @@
+# Build artifacts
 /target
-node_modules/
-host/dist/
-.worktrees/
 /sysroot/
+host/dist/
+
+# Dependencies
+node_modules/
+
+# Worktrees
+.worktrees/
+
+# musl build artifacts
 /musl/config.mak
 /musl/obj/
 /musl/lib/
 /musl/arch/wasm32posix/
+
+# Wasm binaries (except committed kernel/userspace in host/wasm/)
 *.wasm
+!host/wasm/*.wasm
+
+# OS noise
+.DS_Store
+
+# Editor/tool caches
+.vite/
+.playwright-mcp/
+
+# Browser example build output
+examples/browser/dist/
+
+# libc-test suite (downloaded, not part of the project)
+libc-test/
+
+# Debug/trace artifacts
+examples/fp128*.c
+examples/fp128*.wasm
+examples/strtod_debug*.c
+examples/strtod_debug*.wasm
+examples/div_trace.c
+examples/div_trace.wasm
+examples/mul_*.c
+examples/mul_*.wasm
+examples/snprintf_debug.wasm
