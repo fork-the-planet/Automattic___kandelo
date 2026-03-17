@@ -82,6 +82,7 @@ This document tracks the implementation status of POSIX APIs in the wasm-posix-k
 | `setpgid()` | Partial | Sets process group ID. pid=0 means self. pgid=0 means use target pid. Only supports setting own pgid; other processes return ESRCH. |
 | `getsid()` | Full | Returns session ID (simulated, defaults to pid). pid=0 means self. |
 | `setsid()` | Full | Creates new session. Sets sid=pid, pgid=pid. Returns new session ID. Returns EPERM if already session leader (POSIX-compliant). |
+| `prctl()` | Partial | PR_SET_NAME and PR_GET_NAME store/retrieve thread name (16 bytes). All other operations return success (no-op). |
 
 ## Signals
 
@@ -89,7 +90,7 @@ This document tracks the implementation status of POSIX APIs in the wasm-posix-k
 |----------|--------|-------|
 | `kill()` | Partial | Marks signal as pending. sig=0 validity check. Cross-process delivery via host_kill import and ProcessManager.deliverSignal(). Pending signals delivered at syscall boundaries. |
 | `signal()` | Full | Legacy API. Returns previous handler. Wraps sigaction() semantics. SIGKILL/SIGSTOP immutable. |
-| `sigaction()` | Partial | Sets handler disposition (SIG_DFL, SIG_IGN, or function pointer). SIGKILL/SIGSTOP immutable. Handlers invoked at syscall boundaries via host_call_signal_handler. **Gap:** No sa_flags support (SA_RESTART, SA_SIGINFO, SA_NOCLDWAIT, SA_NOCLDSTOP all missing). |
+| `sigaction()` | Partial | Sets handler disposition (SIG_DFL, SIG_IGN, or function pointer) plus sa_flags and sa_mask. SIGKILL/SIGSTOP immutable. SA_RESTART supported: blocking read/write/recv/poll auto-restart instead of returning EINTR. SA_NOCLDSTOP/SA_NOCLDWAIT/SA_SIGINFO stored but not yet acted upon. |
 | `sigprocmask()` | Full | Block/unblock/setmask operations on 64-bit signal mask. SIGKILL and SIGSTOP cannot be blocked per POSIX. |
 | `sigsuspend()` | Full | Atomically replaces signal mask and blocks until deliverable signal arrives. Uses SharedArrayBuffer + Atomics.wait/notify for cross-thread wake. Always returns EINTR. |
 | `pause()` | Full | Suspends until a signal is delivered. Delegates to sigsuspend with current mask. Always returns EINTR. |
@@ -138,7 +139,7 @@ This document tracks the implementation status of POSIX APIs in the wasm-posix-k
 | `connect()` | Stub | Returns ENOSYS. Requires host network stack. |
 | `send()` / `recv()` | Partial | Works for connected Unix domain sockets (via socketpair). MSG_PEEK supported. **Gap:** MSG_WAITALL, MSG_DONTWAIT not supported. |
 | `sendto()` / `recvfrom()` | Stub | Returns ENOSYS. Requires host network stack for UDP. |
-| `setsockopt()` / `getsockopt()` | Partial | SOL_SOCKET level: SO_TYPE, SO_DOMAIN, SO_ERROR, SO_ACCEPTCONN, SO_RCVBUF, SO_SNDBUF readable. SO_REUSEADDR, SO_KEEPALIVE accepted (no-op). |
+| `setsockopt()` / `getsockopt()` | Partial | SOL_SOCKET: SO_TYPE, SO_DOMAIN, SO_ERROR, SO_ACCEPTCONN, SO_RCVBUF, SO_SNDBUF readable; SO_REUSEADDR, SO_KEEPALIVE, SO_LINGER, SO_RCVTIMEO, SO_SNDTIMEO, SO_BROADCAST accepted/stored. IPPROTO_TCP: TCP_NODELAY stored. |
 | `shutdown()` | Full | SHUT_RD, SHUT_WR, SHUT_RDWR. Properly closes buffer endpoints. |
 | `select()` | Partial | Wrapper around poll(). Converts fd_set bitmasks to pollfd array. Timeout supported via polling loop. |
 | `poll()` | Partial | Checks readiness for regular files, pipes, and sockets. Timeout supported via polling loop with 1ms sleep intervals. Returns EINTR on pending signals. POLLERR for fully shut down sockets. |
@@ -159,7 +160,7 @@ This document tracks the implementation status of POSIX APIs in the wasm-posix-k
 |----------|--------|-------|
 | `isatty()` | Full | Returns 1 for CharDevice fds (stdin/stdout/stderr), ENOTTY for others. |
 | `tcgetattr()` / `tcsetattr()` | Partial | Kernel-simulated terminal state (c_iflag, c_oflag, c_cflag, c_lflag, c_cc). Does not affect actual host I/O. TCSANOW/TCSADRAIN/TCSAFLUSH all treated the same. **Gap:** VMIN/VTIME values stored but not interpreted by read(). ICANON flag tracked but no line buffering applied. |
-| `ioctl()` (TIOC*) | Partial | TIOCGWINSZ and TIOCSWINSZ supported. Default 24x80. Other ioctls return ENOTTY. |
+| `ioctl()` | Partial | TIOCGWINSZ and TIOCSWINSZ (terminal). FIONREAD (available bytes for pipe/socket/regular), FIONBIO (toggle O_NONBLOCK), FIOCLEX/FIONCLEX (set/clear FD_CLOEXEC). Generic ioctls work on any fd type; terminal ioctls require CharDevice. |
 
 ## Environment
 
@@ -201,7 +202,7 @@ Systematic audit of all subsystems against POSIX specifications. Gaps are catego
 | **EINTR partially implemented** | all | read, write, recv, poll, select return EINTR when a signal is pending during a blocking wait. close() and other non-blocking syscalls do not check. Tied to signal handler invocation gap. |
 | **PIPE_BUF atomicity not enforced** | pipe | Writes ≤ PIPE_BUF (4096) are not guaranteed atomic. POSIX requires no interleaving of concurrent writes ≤ PIPE_BUF. Ring buffer has no boundary tracking. |
 | **O_APPEND not atomic** | write | Writes with O_APPEND do not atomically seek-to-end then write. In multi-process scenarios, concurrent O_APPEND writes could interleave. |
-| **sigaction() missing sa_flags** | signals | No support for SA_RESTART (auto-restart interrupted syscalls), SA_SIGINFO (detailed signal info), SA_NOCLDWAIT, SA_NOCLDSTOP. Only handler disposition is tracked. |
+| ~~**sigaction() missing sa_flags**~~ | signals | **Resolved.** SA_RESTART supported (auto-restart blocking syscalls). sa_flags and sa_mask stored. SA_SIGINFO/SA_NOCLDWAIT/SA_NOCLDSTOP accepted but not yet acted upon. |
 | **No signal queuing** | signals | Pending signals stored as 64-bit bitmask — one bit per signal. Multiple instances of the same signal are coalesced. POSIX real-time signals require queuing. |
 | ~~**`*at()` functions with real dirfd**~~ | filesystem | **Resolved.** All *at() syscalls now support real dirfd via stored OFD paths. |
 | ~~**No seekdir/telldir/rewinddir**~~ | directory | **Resolved.** DirStream now tracks path and position. rewinddir/telldir/seekdir implemented. |
@@ -213,7 +214,7 @@ Systematic audit of all subsystems against POSIX specifications. Gaps are catego
 | **RLIMIT_FSIZE partial enforcement** | rlimits | write() and ftruncate() check FSIZE limit (EFBIG + SIGXFSZ). truncate() delegates to ftruncate so also enforced. |
 | **setpgid() self-only** | process | Only supports setting own pgid. Setting another process's pgid returns ESRCH. |
 | **realpath() no symlink resolution** | filesystem | Normalizes `.`/`..` and verifies existence but does not resolve intermediate symlinks. |
-| **Socket options silently no-op** | socket | SO_REUSEADDR, SO_KEEPALIVE accepted but have no effect. |
+| **Socket options partially no-op** | socket | SO_REUSEADDR, SO_KEEPALIVE, SO_LINGER, SO_BROADCAST, SO_RCVTIMEO, SO_SNDTIMEO, TCP_NODELAY accepted and stored but have no effect on data transfer. |
 | **POLLERR partial** | I/O multiplex | poll() reports POLLERR for sockets with both read and write shut down. No POLLERR for other error conditions. |
 | **pread/pwrite not multi-process safe** | I/O | Uses save/seek/read/restore pattern — safe in single process but races with shared OFDs across processes. |
 | ~~**brk not inherited on fork**~~ | memory | **Resolved.** Program break now serialized/deserialized in fork/exec state. |
@@ -233,6 +234,21 @@ Systematic audit of all subsystems against POSIX specifications. Gaps are catego
 | **Setuid/setgid enforcement** | process | Single-user Wasm environment; privilege checks simulated only. |
 | **Permission checks** | filesystem | Delegated to host. Kernel does not independently verify file permissions. |
 | **getrusage() zeroed** | sysinfo | No actual resource tracking available in Wasm. Returns zero-filled struct. |
+
+### Future Work — Planned for later batches
+
+**Medium-term (Batch 3+):**
+- PIPE_BUF atomicity enforcement (ring buffer boundary tracking for writes ≤ 4096)
+- Multi-process F_SETLKW blocking (currently returns immediately)
+- VMIN/VTIME terminal interpretation (read behavior based on c_cc values)
+- brk() shrinking (currently only grows)
+- Guest-initiated fork()/exec() syscalls (currently host-initiated only)
+- epoll stub (epoll_create, epoll_ctl, epoll_wait — returning ENOSYS initially)
+
+**Hard / Architectural:**
+- File-backed mmap() (requires host cooperation and shared memory semantics)
+- Signal queuing for real-time signals (replace 64-bit bitmask with queue)
+- True async poll/select (replace polling loop with host-based event notification)
 
 ---
 

@@ -8,6 +8,24 @@ pub enum SignalHandler {
     Handler(u32), // Function pointer (index) in guest Wasm -- for future use
 }
 
+/// Full sigaction information: handler + flags + mask.
+#[derive(Debug, Clone, Copy)]
+pub struct SignalAction {
+    pub handler: SignalHandler,
+    pub flags: u32,
+    pub mask: u64,
+}
+
+impl SignalAction {
+    pub const fn default() -> Self {
+        SignalAction {
+            handler: SignalHandler::Default,
+            flags: 0,
+            mask: 0,
+        }
+    }
+}
+
 /// Default action for each signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DefaultAction {
@@ -36,8 +54,8 @@ pub fn default_action(signum: u32) -> DefaultAction {
 
 /// Per-process signal state.
 pub struct SignalState {
-    /// Handler for each signal (indexed by signal number, 0 unused).
-    handlers: [SignalHandler; 64],
+    /// Full action for each signal (indexed by signal number, 0 unused).
+    actions: [SignalAction; 64],
     /// Bitmask of blocked signals.
     pub blocked: u64,
     /// Bitmask of pending signals.
@@ -47,7 +65,7 @@ pub struct SignalState {
 impl SignalState {
     pub fn new() -> Self {
         SignalState {
-            handlers: [SignalHandler::Default; 64],
+            actions: [SignalAction::default(); 64],
             blocked: 0,
             pending: 0,
         }
@@ -58,7 +76,7 @@ impl SignalState {
         if signum == 0 || signum >= 64 {
             return SignalHandler::Default;
         }
-        self.handlers[signum as usize]
+        self.actions[signum as usize].handler
     }
 
     /// Set the handler for a signal. Returns the old handler.
@@ -71,8 +89,30 @@ impl SignalState {
         if signum == SIGKILL || signum == SIGSTOP {
             return Err(());
         }
-        let old = self.handlers[signum as usize];
-        self.handlers[signum as usize] = handler;
+        let old = self.actions[signum as usize].handler;
+        self.actions[signum as usize].handler = handler;
+        Ok(old)
+    }
+
+    /// Get the full action for a signal.
+    pub fn get_action(&self, signum: u32) -> SignalAction {
+        if signum == 0 || signum >= 64 {
+            return SignalAction::default();
+        }
+        self.actions[signum as usize]
+    }
+
+    /// Set the full action for a signal. Returns the old action.
+    pub fn set_action(&mut self, signum: u32, action: SignalAction) -> Result<SignalAction, ()> {
+        use wasm_posix_shared::signal::*;
+        if signum == 0 || signum >= 64 {
+            return Err(());
+        }
+        if signum == SIGKILL || signum == SIGSTOP {
+            return Err(());
+        }
+        let old = self.actions[signum as usize];
+        self.actions[signum as usize] = action;
         Ok(old)
     }
 
@@ -121,20 +161,46 @@ impl SignalState {
         Some(signum)
     }
 
+    /// Check if the next deliverable signal has SA_RESTART set.
+    pub fn should_restart(&self) -> bool {
+        use wasm_posix_shared::signal::SA_RESTART;
+        let deliverable = self.pending & !self.blocked;
+        if deliverable == 0 {
+            return false;
+        }
+        let signum = deliverable.trailing_zeros();
+        if signum >= 64 {
+            return false;
+        }
+        (self.actions[signum as usize].flags & SA_RESTART) != 0
+    }
+
     /// Reconstruct signal state from parts. Used by fork deserialization.
     /// Pending signals are cleared (per POSIX, child starts with no pending signals).
     pub fn from_parts(handlers: [SignalHandler; 64], blocked: u64) -> Self {
-        SignalState { handlers, blocked, pending: 0 }
+        let mut actions = [SignalAction::default(); 64];
+        for (i, h) in handlers.iter().enumerate() {
+            actions[i].handler = *h;
+        }
+        SignalState { actions, blocked, pending: 0 }
     }
 
     /// Reconstruct signal state for exec. Preserves pending signals (POSIX).
     pub fn from_parts_with_pending(handlers: [SignalHandler; 64], blocked: u64, pending: u64) -> Self {
-        SignalState { handlers, blocked, pending }
+        let mut actions = [SignalAction::default(); 64];
+        for (i, h) in handlers.iter().enumerate() {
+            actions[i].handler = *h;
+        }
+        SignalState { actions, blocked, pending }
     }
 
     /// Get the raw handlers array for serialization.
-    pub fn handlers(&self) -> &[SignalHandler; 64] {
-        &self.handlers
+    pub fn handlers(&self) -> [SignalHandler; 64] {
+        let mut handlers = [SignalHandler::Default; 64];
+        for (i, a) in self.actions.iter().enumerate() {
+            handlers[i] = a.handler;
+        }
+        handlers
     }
 }
 
@@ -272,5 +338,60 @@ mod tests {
         let handlers = state.handlers();
         assert_eq!(handlers[SIGINT as usize], SignalHandler::Ignore);
         assert_eq!(handlers[SIGTERM as usize], SignalHandler::Default);
+    }
+
+    #[test]
+    fn test_set_action() {
+        let mut state = SignalState::new();
+        let action = SignalAction {
+            handler: SignalHandler::Handler(42),
+            flags: wasm_posix_shared::signal::SA_RESTART,
+            mask: 0x04,
+        };
+        let old = state.set_action(SIGINT, action).unwrap();
+        assert_eq!(old.handler, SignalHandler::Default);
+        assert_eq!(old.flags, 0);
+
+        let current = state.get_action(SIGINT);
+        assert_eq!(current.flags, wasm_posix_shared::signal::SA_RESTART);
+        assert_eq!(current.mask, 0x04);
+    }
+
+    #[test]
+    fn test_set_action_cannot_change_sigkill() {
+        let mut state = SignalState::new();
+        let action = SignalAction {
+            handler: SignalHandler::Ignore,
+            flags: 0,
+            mask: 0,
+        };
+        assert!(state.set_action(SIGKILL, action).is_err());
+    }
+
+    #[test]
+    fn test_should_restart() {
+        let mut state = SignalState::new();
+        let action = SignalAction {
+            handler: SignalHandler::Handler(10),
+            flags: wasm_posix_shared::signal::SA_RESTART,
+            mask: 0,
+        };
+        state.set_action(SIGINT, action).unwrap();
+        state.raise(SIGINT);
+        assert!(state.should_restart());
+    }
+
+    #[test]
+    fn test_should_not_restart_without_flag() {
+        let mut state = SignalState::new();
+        state.set_handler(SIGINT, SignalHandler::Handler(10)).unwrap();
+        state.raise(SIGINT);
+        assert!(!state.should_restart());
+    }
+
+    #[test]
+    fn test_should_restart_no_pending() {
+        let state = SignalState::new();
+        assert!(!state.should_restart());
     }
 }

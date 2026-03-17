@@ -45,6 +45,8 @@ pub struct SocketInfo {
     pub shut_wr: bool,
     /// Host-side network handle for AF_INET sockets (assigned on connect).
     pub host_net_handle: Option<i32>,
+    /// Stored socket options as (level, optname, value) tuples.
+    pub options: Vec<(u32, u32, u32)>,
 }
 
 impl SocketInfo {
@@ -60,7 +62,29 @@ impl SocketInfo {
             shut_rd: false,
             shut_wr: false,
             host_net_handle: None,
+            options: Vec::new(),
         }
+    }
+
+    /// Set or update a stored socket option.
+    pub fn set_option(&mut self, level: u32, optname: u32, value: u32) {
+        for opt in self.options.iter_mut() {
+            if opt.0 == level && opt.1 == optname {
+                opt.2 = value;
+                return;
+            }
+        }
+        self.options.push((level, optname, value));
+    }
+
+    /// Get a stored socket option value.
+    pub fn get_option(&self, level: u32, optname: u32) -> Option<u32> {
+        for opt in &self.options {
+            if opt.0 == level && opt.1 == optname {
+                return Some(opt.2);
+            }
+        }
+        None
     }
 }
 

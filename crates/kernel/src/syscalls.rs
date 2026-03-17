@@ -191,7 +191,9 @@ pub fn sys_read(
                     }
                     // Block: check for signals then sleep 1ms
                     if proc.signals.deliverable() != 0 {
-                        return Err(Errno::EINTR);
+                        if !proc.signals.should_restart() {
+                            return Err(Errno::EINTR);
+                        }
                     }
                     let _ = host.host_nanosleep(0, 1_000_000);
                 }
@@ -228,7 +230,9 @@ pub fn sys_read(
                             return Err(Errno::EAGAIN);
                         }
                         if proc.signals.deliverable() != 0 {
-                            return Err(Errno::EINTR);
+                            if !proc.signals.should_restart() {
+                                return Err(Errno::EINTR);
+                            }
                         }
                         let _ = host.host_nanosleep(0, 1_000_000);
                     }
@@ -295,7 +299,9 @@ pub fn sys_write(
                     }
                     // Block: check for signals then sleep 1ms
                     if proc.signals.deliverable() != 0 {
-                        return Err(Errno::EINTR);
+                        if !proc.signals.should_restart() {
+                            return Err(Errno::EINTR);
+                        }
                     }
                     let _ = host.host_nanosleep(0, 1_000_000);
                 }
@@ -334,7 +340,9 @@ pub fn sys_write(
                             return Err(Errno::EAGAIN);
                         }
                         if proc.signals.deliverable() != 0 {
-                            return Err(Errno::EINTR);
+                            if !proc.signals.should_restart() {
+                                return Err(Errno::EINTR);
+                            }
                         }
                         let _ = host.host_nanosleep(0, 1_000_000);
                     }
@@ -1402,9 +1410,15 @@ pub fn sys_pause(proc: &mut Process, host: &mut dyn HostIO) -> Result<(), Errno>
     sys_sigsuspend(proc, host, current_mask)
 }
 
-/// Set signal handler. Returns the previous handler disposition as a u32.
-/// handler_val: 0=SIG_DFL, 1=SIG_IGN, anything else=function pointer (future use)
-pub fn sys_sigaction(proc: &mut Process, sig: u32, handler_val: u32) -> Result<u32, Errno> {
+/// Set signal action. Accepts full sigaction struct fields.
+/// Returns the old action as (handler, flags, mask).
+pub fn sys_sigaction(
+    proc: &mut Process,
+    sig: u32,
+    handler_val: u32,
+    flags: u32,
+    mask: u64,
+) -> Result<(u32, u32, u64), Errno> {
     if sig == 0 || sig >= NSIG {
         return Err(Errno::EINVAL);
     }
@@ -1418,16 +1432,22 @@ pub fn sys_sigaction(proc: &mut Process, sig: u32, handler_val: u32) -> Result<u
         ptr => SignalHandler::Handler(ptr),
     };
 
-    let old = proc.signals.set_handler(sig, new_handler)
+    let new_action = crate::signal::SignalAction {
+        handler: new_handler,
+        flags,
+        mask,
+    };
+
+    let old = proc.signals.set_action(sig, new_action)
         .map_err(|_| Errno::EINVAL)?;
 
-    let old_val = match old {
+    let old_handler_val = match old.handler {
         SignalHandler::Default => SIG_DFL,
         SignalHandler::Ignore => SIG_IGN,
         SignalHandler::Handler(ptr) => ptr,
     };
 
-    Ok(old_val)
+    Ok((old_handler_val, old.flags, old.mask))
 }
 
 /// signal() — set signal handler (legacy API, wraps sigaction semantics)
@@ -2064,7 +2084,9 @@ pub fn sys_recv(
                     return Err(Errno::EAGAIN);
                 }
                 if proc.signals.deliverable() != 0 {
-                    return Err(Errno::EINTR);
+                    if !proc.signals.should_restart() {
+                        return Err(Errno::EINTR);
+                    }
                 }
                 let _ = host.host_nanosleep(0, 1_000_000);
             }
@@ -2091,23 +2113,29 @@ pub fn sys_getsockopt(
     let sock_idx = (-(ofd.host_handle + 1)) as usize;
     let sock = proc.sockets.get(sock_idx).ok_or(Errno::EBADF)?;
 
-    if level != SOL_SOCKET {
-        return Err(Errno::ENOPROTOOPT);
-    }
-
-    match optname {
-        SO_TYPE => Ok(match sock.sock_type {
-            SocketType::Stream => SOCK_STREAM,
-            SocketType::Dgram => SOCK_DGRAM,
-        }),
-        SO_DOMAIN => Ok(match sock.domain {
-            SocketDomain::Unix => AF_UNIX,
-            SocketDomain::Inet => AF_INET,
-            SocketDomain::Inet6 => AF_INET6,
-        }),
-        SO_ERROR => Ok(0),
-        SO_ACCEPTCONN => Ok(if sock.state == SocketState::Listening { 1 } else { 0 }),
-        SO_RCVBUF | SO_SNDBUF => Ok(DEFAULT_PIPE_CAPACITY as u32),
+    match level {
+        SOL_SOCKET => match optname {
+            SO_TYPE => Ok(match sock.sock_type {
+                SocketType::Stream => SOCK_STREAM,
+                SocketType::Dgram => SOCK_DGRAM,
+            }),
+            SO_DOMAIN => Ok(match sock.domain {
+                SocketDomain::Unix => AF_UNIX,
+                SocketDomain::Inet => AF_INET,
+                SocketDomain::Inet6 => AF_INET6,
+            }),
+            SO_ERROR => Ok(0),
+            SO_ACCEPTCONN => Ok(if sock.state == SocketState::Listening { 1 } else { 0 }),
+            SO_RCVBUF | SO_SNDBUF => Ok(DEFAULT_PIPE_CAPACITY as u32),
+            SO_LINGER | SO_RCVTIMEO | SO_SNDTIMEO | SO_BROADCAST => {
+                Ok(sock.get_option(level, optname).unwrap_or(0))
+            }
+            _ => Err(Errno::ENOPROTOOPT),
+        },
+        IPPROTO_TCP => match optname {
+            TCP_NODELAY => Ok(sock.get_option(level, optname).unwrap_or(0)),
+            _ => Err(Errno::ENOPROTOOPT),
+        },
         _ => Err(Errno::ENOPROTOOPT),
     }
 }
@@ -2118,7 +2146,7 @@ pub fn sys_setsockopt(
     fd: i32,
     level: u32,
     optname: u32,
-    _value: u32,
+    value: u32,
 ) -> Result<(), Errno> {
     use wasm_posix_shared::socket::*;
 
@@ -2128,12 +2156,25 @@ pub fn sys_setsockopt(
         return Err(Errno::ENOTSOCK);
     }
 
-    if level != SOL_SOCKET {
-        return Err(Errno::ENOPROTOOPT);
-    }
+    let sock_idx = (-(ofd.host_handle + 1)) as usize;
+    let sock = proc.sockets.get_mut(sock_idx).ok_or(Errno::EBADF)?;
 
-    match optname {
-        SO_REUSEADDR | SO_KEEPALIVE | SO_RCVBUF | SO_SNDBUF => Ok(()),
+    match level {
+        SOL_SOCKET => match optname {
+            SO_REUSEADDR | SO_KEEPALIVE | SO_RCVBUF | SO_SNDBUF |
+            SO_LINGER | SO_RCVTIMEO | SO_SNDTIMEO | SO_BROADCAST => {
+                sock.set_option(level, optname, value);
+                Ok(())
+            }
+            _ => Err(Errno::ENOPROTOOPT),
+        },
+        IPPROTO_TCP => match optname {
+            TCP_NODELAY => {
+                sock.set_option(level, optname, value);
+                Ok(())
+            }
+            _ => Err(Errno::ENOPROTOOPT),
+        },
         _ => Err(Errno::ENOPROTOOPT),
     }
 }
@@ -2281,7 +2322,9 @@ pub fn sys_poll(
     loop {
         // Check for pending signals — POSIX: poll is interruptible
         if proc.signals.deliverable() != 0 {
-            return Err(Errno::EINTR);
+            if !proc.signals.should_restart() {
+                return Err(Errno::EINTR);
+            }
         }
 
         // Sleep 1ms
@@ -2621,10 +2664,86 @@ pub fn sys_tcsetattr(proc: &mut Process, fd: i32, _action: u32, buf: &[u8]) -> R
 }
 
 /// ioctl -- device control.
-/// Only terminal ioctls supported: TIOCGWINSZ (0x5413), TIOCSWINSZ (0x5414).
+/// Supports generic ioctls (FIONREAD, FIONBIO, FIOCLEX, FIONCLEX) on any fd type,
+/// plus terminal ioctls (TIOCGWINSZ, TIOCSWINSZ) on CharDevice fds only.
 pub fn sys_ioctl(proc: &mut Process, fd: i32, request: u32, buf: &mut [u8]) -> Result<(), Errno> {
+    // FIOCLEX / FIONCLEX operate on the fd entry directly, not the OFD.
+    match request {
+        0x5451 => { // FIOCLEX — set FD_CLOEXEC
+            let entry = proc.fd_table.get_mut(fd)?;
+            entry.fd_flags |= wasm_posix_shared::fd_flags::FD_CLOEXEC;
+            return Ok(());
+        }
+        0x5450 => { // FIONCLEX — clear FD_CLOEXEC
+            let entry = proc.fd_table.get_mut(fd)?;
+            entry.fd_flags &= !wasm_posix_shared::fd_flags::FD_CLOEXEC;
+            return Ok(());
+        }
+        _ => {}
+    }
+
     let entry = proc.fd_table.get(fd)?;
     let ofd_idx = entry.ofd_ref.0;
+
+    // FIONBIO — toggle O_NONBLOCK on the OFD status_flags
+    if request == 0x5421 {
+        if buf.len() < 4 {
+            return Err(Errno::EINVAL);
+        }
+        let val = i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let ofd = proc.ofd_table.get_mut(ofd_idx).ok_or(Errno::EBADF)?;
+        if val != 0 {
+            ofd.status_flags |= wasm_posix_shared::flags::O_NONBLOCK;
+        } else {
+            ofd.status_flags &= !wasm_posix_shared::flags::O_NONBLOCK;
+        }
+        return Ok(());
+    }
+
+    // FIONREAD — return available bytes
+    if request == 0x541B {
+        if buf.len() < 4 {
+            return Err(Errno::EINVAL);
+        }
+        let ofd = proc.ofd_table.get(ofd_idx).ok_or(Errno::EBADF)?;
+        let avail: i32 = match ofd.file_type {
+            FileType::Pipe => {
+                if ofd.host_handle < 0 {
+                    let pipe_idx = (-(ofd.host_handle + 1)) as usize;
+                    proc.pipes.get(pipe_idx)
+                        .and_then(|p| p.as_ref())
+                        .map(|p| p.available() as i32)
+                        .unwrap_or(0)
+                } else {
+                    0
+                }
+            }
+            FileType::Socket => {
+                if ofd.host_handle < 0 {
+                    let sock_idx = (-(ofd.host_handle + 1)) as usize;
+                    if let Some(sock) = proc.sockets.get(sock_idx) {
+                        if let Some(recv_idx) = sock.recv_buf_idx {
+                            proc.pipes.get(recv_idx)
+                                .and_then(|p| p.as_ref())
+                                .map(|p| p.available() as i32)
+                                .unwrap_or(0)
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        };
+        buf[0..4].copy_from_slice(&avail.to_le_bytes());
+        return Ok(());
+    }
+
+    // Terminal-specific ioctls: require CharDevice
     let ofd = proc.ofd_table.get(ofd_idx).ok_or(Errno::EBADF)?;
     if ofd.file_type != FileType::CharDevice {
         return Err(Errno::ENOTTY);
@@ -2653,6 +2772,33 @@ pub fn sys_ioctl(proc: &mut Process, fd: i32, request: u32, buf: &mut [u8]) -> R
             Ok(())
         }
         _ => Err(Errno::ENOTTY),
+    }
+}
+
+/// prctl — process control operations.
+/// PR_SET_NAME (15) stores thread name, PR_GET_NAME (16) returns it.
+/// All other operations are no-ops returning success.
+pub fn sys_prctl(proc: &mut Process, option: u32, _arg2: u32, buf: &mut [u8]) -> Result<(), Errno> {
+    const PR_SET_NAME: u32 = 15;
+    const PR_GET_NAME: u32 = 16;
+
+    match option {
+        PR_SET_NAME => {
+            // arg2 is a pointer to the name string in our buffer
+            // The name comes in via buf (up to 16 bytes, null-terminated)
+            let name_len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len()).min(15);
+            proc.thread_name = [0u8; 16];
+            proc.thread_name[..name_len].copy_from_slice(&buf[..name_len]);
+            Ok(())
+        }
+        PR_GET_NAME => {
+            if buf.len() < 16 {
+                return Err(Errno::EINVAL);
+            }
+            buf[..16].copy_from_slice(&proc.thread_name);
+            Ok(())
+        }
+        _ => Ok(()), // no-op for unrecognized operations
     }
 }
 
@@ -4128,16 +4274,29 @@ mod tests {
     #[test]
     fn test_sigaction_set_ignore() {
         let mut proc = Process::new(1);
-        let old = sys_sigaction(&mut proc, 2, 1).unwrap(); // SIGINT, SIG_IGN
-        assert_eq!(old, 0); // was SIG_DFL
-        let old = sys_sigaction(&mut proc, 2, 0).unwrap(); // back to SIG_DFL
-        assert_eq!(old, 1); // was SIG_IGN
+        let (old_h, old_f, old_m) = sys_sigaction(&mut proc, 2, 1, 0, 0).unwrap(); // SIGINT, SIG_IGN
+        assert_eq!(old_h, 0); // was SIG_DFL
+        assert_eq!(old_f, 0);
+        assert_eq!(old_m, 0);
+        let (old_h, _, _) = sys_sigaction(&mut proc, 2, 0, 0, 0).unwrap(); // back to SIG_DFL
+        assert_eq!(old_h, 1); // was SIG_IGN
+    }
+
+    #[test]
+    fn test_sigaction_with_flags_and_mask() {
+        use wasm_posix_shared::signal::SA_RESTART;
+        let mut proc = Process::new(1);
+        let _ = sys_sigaction(&mut proc, 2, 42, SA_RESTART, 0x04).unwrap();
+        let (old_h, old_f, old_m) = sys_sigaction(&mut proc, 2, 0, 0, 0).unwrap();
+        assert_eq!(old_h, 42);
+        assert_eq!(old_f, SA_RESTART);
+        assert_eq!(old_m, 0x04);
     }
 
     #[test]
     fn test_sigaction_cannot_change_sigkill() {
         let mut proc = Process::new(1);
-        let result = sys_sigaction(&mut proc, 9, 1); // SIGKILL, SIG_IGN
+        let result = sys_sigaction(&mut proc, 9, 1, 0, 0); // SIGKILL, SIG_IGN
         assert_eq!(result, Err(Errno::EINVAL));
     }
 
@@ -4743,6 +4902,47 @@ mod tests {
     }
 
     #[test]
+    fn test_setsockopt_tcp_nodelay() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::socket::*;
+        let fd = sys_socket(&mut proc, &mut host, AF_UNIX, SOCK_STREAM, 0).unwrap();
+        assert!(sys_setsockopt(&mut proc, fd, IPPROTO_TCP, TCP_NODELAY, 1).is_ok());
+        let val = sys_getsockopt(&mut proc, fd, IPPROTO_TCP, TCP_NODELAY).unwrap();
+        assert_eq!(val, 1);
+    }
+
+    #[test]
+    fn test_setsockopt_so_linger() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::socket::*;
+        let fd = sys_socket(&mut proc, &mut host, AF_UNIX, SOCK_STREAM, 0).unwrap();
+        assert!(sys_setsockopt(&mut proc, fd, SOL_SOCKET, SO_LINGER, 5).is_ok());
+        let val = sys_getsockopt(&mut proc, fd, SOL_SOCKET, SO_LINGER).unwrap();
+        assert_eq!(val, 5);
+    }
+
+    #[test]
+    fn test_setsockopt_so_broadcast() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::socket::*;
+        let fd = sys_socket(&mut proc, &mut host, AF_UNIX, SOCK_STREAM, 0).unwrap();
+        assert!(sys_setsockopt(&mut proc, fd, SOL_SOCKET, SO_BROADCAST, 1).is_ok());
+    }
+
+    #[test]
+    fn test_getsockopt_default_tcp_nodelay() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::socket::*;
+        let fd = sys_socket(&mut proc, &mut host, AF_UNIX, SOCK_STREAM, 0).unwrap();
+        let val = sys_getsockopt(&mut proc, fd, IPPROTO_TCP, TCP_NODELAY).unwrap();
+        assert_eq!(val, 0); // default
+    }
+
+    #[test]
     fn test_shutdown_not_socket() {
         let mut proc = Process::new(1);
         let mut host = MockHostIO::new();
@@ -5200,6 +5400,79 @@ mod tests {
         let mut buf = [0u8; 8];
         let result = sys_ioctl(&mut proc, 0, 0x9999, &mut buf);
         assert_eq!(result, Err(Errno::ENOTTY));
+    }
+
+    #[test]
+    fn test_ioctl_fionbio_set_nonblock() {
+        let mut proc = Process::new(1);
+        // Set O_NONBLOCK via FIONBIO on stdout (fd 1)
+        let mut buf = 1i32.to_le_bytes();
+        let result = sys_ioctl(&mut proc, 1, 0x5421, &mut buf);
+        assert!(result.is_ok());
+        let ofd = proc.ofd_table.get(proc.fd_table.get(1).unwrap().ofd_ref.0).unwrap();
+        assert_ne!(ofd.status_flags & wasm_posix_shared::flags::O_NONBLOCK, 0);
+        // Clear it
+        let mut buf = 0i32.to_le_bytes();
+        sys_ioctl(&mut proc, 1, 0x5421, &mut buf).unwrap();
+        let ofd = proc.ofd_table.get(proc.fd_table.get(1).unwrap().ofd_ref.0).unwrap();
+        assert_eq!(ofd.status_flags & wasm_posix_shared::flags::O_NONBLOCK, 0);
+    }
+
+    #[test]
+    fn test_ioctl_fioclex_fionclex() {
+        let mut proc = Process::new(1);
+        let mut buf = [0u8; 4];
+        // Set FD_CLOEXEC via FIOCLEX on fd 0
+        sys_ioctl(&mut proc, 0, 0x5451, &mut buf).unwrap();
+        assert_ne!(proc.fd_table.get(0).unwrap().fd_flags & wasm_posix_shared::fd_flags::FD_CLOEXEC, 0);
+        // Clear via FIONCLEX
+        sys_ioctl(&mut proc, 0, 0x5450, &mut buf).unwrap();
+        assert_eq!(proc.fd_table.get(0).unwrap().fd_flags & wasm_posix_shared::fd_flags::FD_CLOEXEC, 0);
+    }
+
+    #[test]
+    fn test_ioctl_fionread_pipe() {
+        let mut proc = Process::new(1);
+        let (read_fd, write_fd) = sys_pipe(&mut proc).unwrap();
+        let mut host = MockHostIO::new();
+        // Write some data
+        sys_write(&mut proc, &mut host, write_fd, b"hello").unwrap();
+        // FIONREAD should return 5
+        let mut buf = [0u8; 4];
+        sys_ioctl(&mut proc, read_fd, 0x541B, &mut buf).unwrap();
+        let avail = i32::from_le_bytes(buf);
+        assert_eq!(avail, 5);
+    }
+
+    #[test]
+    fn test_ioctl_fionread_regular() {
+        let mut proc = Process::new(1);
+        // FIONREAD on a CharDevice returns 0
+        let mut buf = [0u8; 4];
+        sys_ioctl(&mut proc, 0, 0x541B, &mut buf).unwrap();
+        let avail = i32::from_le_bytes(buf);
+        assert_eq!(avail, 0);
+    }
+
+    // ---- prctl tests ----
+
+    #[test]
+    fn test_prctl_set_get_name() {
+        let mut proc = Process::new(1);
+        let mut buf = [0u8; 16];
+        buf[..5].copy_from_slice(b"hello");
+        sys_prctl(&mut proc, 15, 0, &mut buf).unwrap(); // PR_SET_NAME
+        let mut out = [0u8; 16];
+        sys_prctl(&mut proc, 16, 0, &mut out).unwrap(); // PR_GET_NAME
+        assert_eq!(&out[..5], b"hello");
+        assert_eq!(out[5], 0);
+    }
+
+    #[test]
+    fn test_prctl_unknown_is_noop() {
+        let mut proc = Process::new(1);
+        let mut buf = [0u8; 16];
+        assert!(sys_prctl(&mut proc, 999, 0, &mut buf).is_ok());
     }
 
     #[test]

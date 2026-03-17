@@ -525,6 +525,12 @@ pub mod socket {
     pub const SHUT_RD: u32 = 0;
     pub const SHUT_WR: u32 = 1;
     pub const SHUT_RDWR: u32 = 2;
+    pub const SO_BROADCAST: u32 = 6;
+    pub const SO_LINGER: u32 = 13;
+    pub const SO_RCVTIMEO: u32 = 20;
+    pub const SO_SNDTIMEO: u32 = 21;
+    pub const IPPROTO_TCP: u32 = 6;
+    pub const TCP_NODELAY: u32 = 1;
     pub const MSG_PEEK: u32 = 2;
     pub const MSG_DONTWAIT: u32 = 64;
     pub const MSG_NOSIGNAL: u32 = 0x4000;
@@ -704,6 +710,13 @@ pub mod signal {
     pub const SIG_BLOCK: u32 = 0;
     pub const SIG_UNBLOCK: u32 = 1;
     pub const SIG_SETMASK: u32 = 2;
+
+    // sigaction sa_flags
+    pub const SA_RESTART: u32 = 0x10000000;
+    pub const SA_NOCLDSTOP: u32 = 1;
+    pub const SA_NOCLDWAIT: u32 = 2;
+    pub const SA_SIGINFO: u32 = 4;
+    pub const SA_RESTORER: u32 = 0x04000000;
 
     // Default actions
     pub const SA_DEFAULT_TERM: u32 = 0;   // Terminate

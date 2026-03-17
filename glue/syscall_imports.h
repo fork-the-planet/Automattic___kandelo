@@ -229,7 +229,8 @@ KERNEL_IMPORT(kernel_raise)
 int32_t kernel_raise(uint32_t sig);
 
 KERNEL_IMPORT(kernel_sigaction)
-int32_t kernel_sigaction(uint32_t sig, uint32_t handler);
+int32_t kernel_sigaction(uint32_t sig, const uint8_t *act_ptr,
+                         uint8_t *oldact_ptr);
 
 KERNEL_IMPORT(kernel_signal)
 int32_t kernel_signal(uint32_t signum, uint32_t handler);
@@ -393,6 +394,10 @@ int32_t kernel_getrusage(int32_t who, uint8_t *buf_ptr, uint32_t buf_len);
 /* ------------------------------------------------------------------ */
 /* System info                                                         */
 /* ------------------------------------------------------------------ */
+
+KERNEL_IMPORT(kernel_prctl)
+int32_t kernel_prctl(uint32_t option, uint32_t arg2, uint8_t *buf_ptr,
+                     uint32_t buf_len);
 
 KERNEL_IMPORT(kernel_umask)
 uint32_t kernel_umask(uint32_t mask);

@@ -163,6 +163,7 @@
 #define SYS_RECVMSG       138
 #define SYS_WAIT4         139
 #define SYS_GETADDRINFO   140
+#define SYS_PRCTL         172
 #define SYS_PRLIMIT64     250
 
 /* ENOSYS — returned for unknown syscall numbers */
@@ -505,22 +506,47 @@ static long __do_syscall(long n, long a1, long a2, long a3,
      * the old handler into oldact if requested.
      */
     case SYS_SIGACTION: {
+        /* musl k_sigaction layout (wasm32):
+         *   offset 0: handler (void (*)(int))  — 4 bytes
+         *   offset 4: flags (unsigned long)    — 4 bytes
+         *   offset 8: restorer (void (*)(void))— 4 bytes  (unused)
+         *   offset 12: mask[2] (unsigned long) — 8 bytes
+         *
+         * Kernel struct layout (16 bytes):
+         *   [0..4] handler, [4..8] flags, [8..16] mask (u64)
+         */
         const uint32_t *act = (const uint32_t *)(uintptr_t)a2;
         uint32_t *oldact = (uint32_t *)(uintptr_t)a3;
-        uint32_t handler = 0;
+
+        /* Build kernel-format struct from musl k_sigaction */
+        uint8_t k_act[16];
+        const uint8_t *act_ptr = 0;
         if (act) {
-            handler = act[0]; /* handler is first field */
+            uint32_t handler = act[0];
+            uint32_t flags   = act[1];
+            uint32_t mask_lo = act[3]; /* offset 12 = act[3] */
+            uint32_t mask_hi = act[4]; /* offset 16 = act[4] */
+            __builtin_memcpy(k_act + 0,  &handler, 4);
+            __builtin_memcpy(k_act + 4,  &flags,   4);
+            __builtin_memcpy(k_act + 8,  &mask_lo, 4);
+            __builtin_memcpy(k_act + 12, &mask_hi, 4);
+            act_ptr = k_act;
         }
-        int32_t r = kernel_sigaction((uint32_t)a1, act ? handler : 0);
-        if (r >= 0 && oldact) {
-            oldact[0] = (uint32_t)r;  /* old handler */
-            oldact[1] = 0;            /* flags */
-            oldact[2] = 0;            /* mask[0] */
-            oldact[3] = 0;            /* mask[1] */
-            oldact[4] = 0;            /* unused */
-            r = 0;
-        } else if (r >= 0) {
-            r = 0;
+
+        uint8_t k_oldact[16] = {0};
+        int32_t r = kernel_sigaction((uint32_t)a1, act_ptr,
+                                     oldact ? k_oldact : (uint8_t *)0);
+        if (r == 0 && oldact) {
+            uint32_t old_handler, old_flags, old_mask_lo, old_mask_hi;
+            __builtin_memcpy(&old_handler, k_oldact + 0,  4);
+            __builtin_memcpy(&old_flags,   k_oldact + 4,  4);
+            __builtin_memcpy(&old_mask_lo, k_oldact + 8,  4);
+            __builtin_memcpy(&old_mask_hi, k_oldact + 12, 4);
+            oldact[0] = old_handler;
+            oldact[1] = old_flags;
+            oldact[2] = 0;            /* restorer (unused) */
+            oldact[3] = old_mask_lo;
+            oldact[4] = old_mask_hi;
         }
         return (long)r;
     }
@@ -1170,6 +1196,22 @@ static long __do_syscall(long n, long a1, long a2, long a3,
             r = kernel_getrlimit(resource, old_rlim);
         }
         return (long)r;
+    }
+
+    /* ============================================================== */
+    /* Process control                                                 */
+    /* ============================================================== */
+
+    case SYS_PRCTL: {
+        /* prctl(option, arg2, arg3, arg4, arg5)
+         * For PR_SET_NAME(15): arg2 is pointer to name string
+         * For PR_GET_NAME(16): arg2 is pointer to name buffer
+         * We pass arg2 as buf_ptr for both cases.
+         */
+        uint32_t option = (uint32_t)a1;
+        uint8_t *buf = (uint8_t *)(uintptr_t)a2;
+        uint32_t buf_len = 16; /* thread name is always 16 bytes */
+        return (long)kernel_prctl(option, (uint32_t)a3, buf, buf_len);
     }
 
     /* ============================================================== */

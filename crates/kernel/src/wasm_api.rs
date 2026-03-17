@@ -1400,12 +1400,50 @@ pub extern "C" fn kernel_raise(sig: u32) -> i32 {
     result
 }
 
-/// Set signal handler. Returns old handler value (>= 0) or negative errno.
+/// Set signal action. act_ptr/oldact_ptr point to structs:
+///   [0..4] handler (u32), [4..8] flags (u32), [8..16] mask (u64)
+/// If act_ptr is null (0), only reads the old action.
+/// Returns 0 on success, negative errno on error.
 #[unsafe(no_mangle)]
-pub extern "C" fn kernel_sigaction(sig: u32, handler: u32) -> i32 {
+pub extern "C" fn kernel_sigaction(sig: u32, act_ptr: *const u8, oldact_ptr: *mut u8) -> i32 {
     let proc = unsafe { get_process() };
-    let result = match syscalls::sys_sigaction(proc, sig, handler) {
-        Ok(old) => old as i32,
+
+    // Parse new action from act_ptr (if non-null)
+    let (handler_val, flags, mask) = if !act_ptr.is_null() {
+        let act = unsafe { core::slice::from_raw_parts(act_ptr, 16) };
+        let handler = u32::from_le_bytes([act[0], act[1], act[2], act[3]]);
+        let flags = u32::from_le_bytes([act[4], act[5], act[6], act[7]]);
+        let mask = u64::from_le_bytes([act[8], act[9], act[10], act[11], act[12], act[13], act[14], act[15]]);
+        (handler, flags, mask)
+    } else {
+        // No new action — just read old
+        let old_action = proc.signals.get_action(sig);
+        if !oldact_ptr.is_null() {
+            let old = unsafe { core::slice::from_raw_parts_mut(oldact_ptr, 16) };
+            let h = match old_action.handler {
+                crate::signal::SignalHandler::Default => 0u32,
+                crate::signal::SignalHandler::Ignore => 1u32,
+                crate::signal::SignalHandler::Handler(ptr) => ptr,
+            };
+            old[0..4].copy_from_slice(&h.to_le_bytes());
+            old[4..8].copy_from_slice(&old_action.flags.to_le_bytes());
+            old[8..16].copy_from_slice(&old_action.mask.to_le_bytes());
+        }
+        let mut host = WasmHostIO;
+        deliver_pending_signals(proc, &mut host);
+        return 0;
+    };
+
+    let result = match syscalls::sys_sigaction(proc, sig, handler_val, flags, mask) {
+        Ok((old_handler, old_flags, old_mask)) => {
+            if !oldact_ptr.is_null() {
+                let old = unsafe { core::slice::from_raw_parts_mut(oldact_ptr, 16) };
+                old[0..4].copy_from_slice(&old_handler.to_le_bytes());
+                old[4..8].copy_from_slice(&old_flags.to_le_bytes());
+                old[8..16].copy_from_slice(&old_mask.to_le_bytes());
+            }
+            0
+        }
         Err(e) => -(e as i32),
     };
     let mut host = WasmHostIO;
@@ -2397,6 +2435,21 @@ pub extern "C" fn kernel_ioctl(fd: i32, request: u32, buf_ptr: *mut u8, buf_len:
     let proc = unsafe { get_process() };
     let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, buf_len as usize) };
     let result = match syscalls::sys_ioctl(proc, fd, request, buf) {
+        Ok(()) => 0,
+        Err(e) => -(e as i32),
+    };
+    let mut host = WasmHostIO;
+    deliver_pending_signals(proc, &mut host);
+    result
+}
+
+/// prctl — process control. Returns 0 on success, or negative errno.
+/// buf_ptr is used for PR_SET_NAME (read name from buf) and PR_GET_NAME (write name to buf).
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_prctl(option: u32, arg2: u32, buf_ptr: *mut u8, buf_len: u32) -> i32 {
+    let proc = unsafe { get_process() };
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, buf_len as usize) };
+    let result = match syscalls::sys_prctl(proc, option, arg2, buf) {
         Ok(()) => 0,
         Err(e) => -(e as i32),
     };
