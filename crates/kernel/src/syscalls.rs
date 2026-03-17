@@ -355,6 +355,22 @@ pub fn sys_read(
             }
         }
         _ => {
+            // Virtual character devices — handle in-kernel
+            if file_type == FileType::CharDevice {
+                if let Some(dev) = VirtualDevice::from_host_handle(host_handle) {
+                    let n = match dev {
+                        VirtualDevice::Null => 0,
+                        VirtualDevice::Zero | VirtualDevice::Full => {
+                            for b in buf.iter_mut() { *b = 0; }
+                            buf.len()
+                        }
+                        VirtualDevice::Urandom => {
+                            host.host_getrandom(buf)?
+                        }
+                    };
+                    return Ok(n);
+                }
+            }
             let n = host.host_read(host_handle, buf)?;
             if let Some(ofd) = proc.ofd_table.get_mut(ofd_idx) {
                 ofd.offset += n as i64;
@@ -465,6 +481,15 @@ pub fn sys_write(
             }
         }
         _ => {
+            // Virtual character devices — handle in-kernel
+            if file_type == FileType::CharDevice {
+                if let Some(dev) = VirtualDevice::from_host_handle(host_handle) {
+                    return match dev {
+                        VirtualDevice::Full => Err(Errno::ENOSPC),
+                        _ => Ok(buf.len()), // Null, Zero, Urandom: discard
+                    };
+                }
+            }
             // O_APPEND: seek to end before writing (POSIX atomicity for single-process)
             if status_flags & O_APPEND != 0 {
                 let end = host.host_seek(host_handle, 0, 2)?; // SEEK_END
@@ -7739,6 +7764,79 @@ mod tests {
     }
 
     // ---- virtual device tests ----
+
+    #[test]
+    fn test_read_dev_null_eof() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_open(&mut proc, &mut host, b"/dev/null", O_RDONLY, 0).unwrap();
+        let mut buf = [0u8; 64];
+        let n = sys_read(&mut proc, &mut host, fd, &mut buf).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_write_dev_null_discards() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_open(&mut proc, &mut host, b"/dev/null", O_WRONLY, 0).unwrap();
+        let n = sys_write(&mut proc, &mut host, fd, b"hello world").unwrap();
+        assert_eq!(n, 11);
+    }
+
+    #[test]
+    fn test_read_dev_zero_fills() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_open(&mut proc, &mut host, b"/dev/zero", O_RDONLY, 0).unwrap();
+        let mut buf = [0xFFu8; 32];
+        let n = sys_read(&mut proc, &mut host, fd, &mut buf).unwrap();
+        assert_eq!(n, 32);
+        assert!(buf.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_read_dev_urandom_returns_bytes() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_open(&mut proc, &mut host, b"/dev/urandom", O_RDONLY, 0).unwrap();
+        let mut buf = [0xFFu8; 32];
+        let n = sys_read(&mut proc, &mut host, fd, &mut buf).unwrap();
+        assert_eq!(n, 32);
+        // MockHostIO.host_getrandom fills with (i & 0xFF) pattern
+        assert_eq!(buf[0], 0);
+        assert_eq!(buf[1], 1);
+        assert_eq!(buf[31], 31);
+    }
+
+    #[test]
+    fn test_read_dev_full_fills_zeros() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_open(&mut proc, &mut host, b"/dev/full", O_RDONLY, 0).unwrap();
+        let mut buf = [0xFFu8; 16];
+        let n = sys_read(&mut proc, &mut host, fd, &mut buf).unwrap();
+        assert_eq!(n, 16);
+        assert!(buf.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_write_dev_full_enospc() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_open(&mut proc, &mut host, b"/dev/full", O_WRONLY, 0).unwrap();
+        let result = sys_write(&mut proc, &mut host, fd, b"data");
+        assert_eq!(result, Err(Errno::ENOSPC));
+    }
+
+    #[test]
+    fn test_write_dev_zero_discards() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_open(&mut proc, &mut host, b"/dev/zero", O_WRONLY, 0).unwrap();
+        let n = sys_write(&mut proc, &mut host, fd, b"data").unwrap();
+        assert_eq!(n, 4);
+    }
 
     #[test]
     fn test_open_dev_null() {
