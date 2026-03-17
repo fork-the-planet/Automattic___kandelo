@@ -22,6 +22,99 @@ use wasm_posix_shared::mmap::{MAP_ANONYMOUS, MAP_FAILED};
 /// Creation flags that are stripped from status_flags after open.
 const CREATION_FLAGS: u32 = O_CREAT | O_EXCL | O_TRUNC | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW;
 
+/// Virtual character devices handled entirely in-kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtualDevice {
+    Null,     // /dev/null     host_handle = -1
+    Zero,     // /dev/zero     host_handle = -2
+    Urandom,  // /dev/urandom  host_handle = -3
+    Full,     // /dev/full     host_handle = -4
+}
+
+impl VirtualDevice {
+    /// Encode as a negative host_handle for CharDevice OFDs.
+    pub fn host_handle(self) -> i64 {
+        match self {
+            VirtualDevice::Null => -1,
+            VirtualDevice::Zero => -2,
+            VirtualDevice::Urandom => -3,
+            VirtualDevice::Full => -4,
+        }
+    }
+
+    /// Decode a negative CharDevice host_handle back to a VirtualDevice.
+    pub fn from_host_handle(h: i64) -> Option<VirtualDevice> {
+        match h {
+            -1 => Some(VirtualDevice::Null),
+            -2 => Some(VirtualDevice::Zero),
+            -3 => Some(VirtualDevice::Urandom),
+            -4 => Some(VirtualDevice::Full),
+            _ => None,
+        }
+    }
+
+    /// Synthetic inode number for stat.
+    pub fn ino(self) -> u64 {
+        match self {
+            VirtualDevice::Null => 1,
+            VirtualDevice::Zero => 2,
+            VirtualDevice::Urandom => 3,
+            VirtualDevice::Full => 4,
+        }
+    }
+}
+
+/// Check if a resolved path is a virtual device node.
+fn match_virtual_device(path: &[u8]) -> Option<VirtualDevice> {
+    match path {
+        b"/dev/null" => Some(VirtualDevice::Null),
+        b"/dev/zero" => Some(VirtualDevice::Zero),
+        b"/dev/urandom" | b"/dev/random" => Some(VirtualDevice::Urandom),
+        b"/dev/full" => Some(VirtualDevice::Full),
+        _ => None,
+    }
+}
+
+/// Check if path is a /dev/fd/N or /dev/stdin|stdout|stderr alias.
+/// Returns Some(target_fd) if so.
+fn match_dev_fd(path: &[u8]) -> Option<i32> {
+    if path == b"/dev/stdin" { return Some(0); }
+    if path == b"/dev/stdout" { return Some(1); }
+    if path == b"/dev/stderr" { return Some(2); }
+    if path.starts_with(b"/dev/fd/") {
+        let num_bytes = &path[8..];
+        if num_bytes.is_empty() { return None; }
+        let mut n: i32 = 0;
+        for &b in num_bytes {
+            if b < b'0' || b > b'9' { return None; }
+            n = n.checked_mul(10)?.checked_add((b - b'0') as i32)?;
+        }
+        return Some(n);
+    }
+    None
+}
+
+/// Build a synthetic WasmStat for a virtual device.
+fn virtual_device_stat(dev: VirtualDevice, uid: u32, gid: u32) -> WasmStat {
+    use wasm_posix_shared::mode::S_IFCHR;
+    WasmStat {
+        st_dev: 5,
+        st_ino: dev.ino(),
+        st_mode: S_IFCHR | 0o666,
+        st_nlink: 1,
+        st_uid: uid,
+        st_gid: gid,
+        st_size: 0,
+        st_atime_sec: 0,
+        st_atime_nsec: 0,
+        st_mtime_sec: 0,
+        st_mtime_nsec: 0,
+        st_ctime_sec: 0,
+        st_ctime_nsec: 0,
+        _pad: 0,
+    }
+}
+
 /// Open a file, returning the new file descriptor number.
 pub fn sys_open(
     proc: &mut Process,
@@ -7600,5 +7693,40 @@ mod tests {
         let result = sys_statx(&mut proc, &mut host, -100, b"/test/file", 0, 0);
         assert!(result.is_ok());
         assert_eq!(host.last_stat_path, b"/test/file");
+    }
+
+    // ---- virtual device tests ----
+
+    #[test]
+    fn test_match_virtual_device() {
+        assert_eq!(match_virtual_device(b"/dev/null"), Some(VirtualDevice::Null));
+        assert_eq!(match_virtual_device(b"/dev/zero"), Some(VirtualDevice::Zero));
+        assert_eq!(match_virtual_device(b"/dev/urandom"), Some(VirtualDevice::Urandom));
+        assert_eq!(match_virtual_device(b"/dev/random"), Some(VirtualDevice::Urandom));
+        assert_eq!(match_virtual_device(b"/dev/full"), Some(VirtualDevice::Full));
+        assert_eq!(match_virtual_device(b"/dev/tty"), None);
+        assert_eq!(match_virtual_device(b"/tmp/foo"), None);
+    }
+
+    #[test]
+    fn test_match_dev_fd() {
+        assert_eq!(match_dev_fd(b"/dev/stdin"), Some(0));
+        assert_eq!(match_dev_fd(b"/dev/stdout"), Some(1));
+        assert_eq!(match_dev_fd(b"/dev/stderr"), Some(2));
+        assert_eq!(match_dev_fd(b"/dev/fd/0"), Some(0));
+        assert_eq!(match_dev_fd(b"/dev/fd/5"), Some(5));
+        assert_eq!(match_dev_fd(b"/dev/fd/123"), Some(123));
+        assert_eq!(match_dev_fd(b"/dev/fd/"), None);
+        assert_eq!(match_dev_fd(b"/dev/fd/abc"), None);
+        assert_eq!(match_dev_fd(b"/tmp/foo"), None);
+    }
+
+    #[test]
+    fn test_virtual_device_roundtrip() {
+        for dev in [VirtualDevice::Null, VirtualDevice::Zero, VirtualDevice::Urandom, VirtualDevice::Full] {
+            assert_eq!(VirtualDevice::from_host_handle(dev.host_handle()), Some(dev));
+        }
+        assert_eq!(VirtualDevice::from_host_handle(0), None);
+        assert_eq!(VirtualDevice::from_host_handle(-5), None);
     }
 }
