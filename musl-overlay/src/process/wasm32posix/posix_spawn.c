@@ -20,7 +20,7 @@
 #include <sys/wait.h>
 #include <stdlib.h>
 #include <stdint.h>
-#include "fdop.h"
+#include "../fdop.h"
 
 /* Kernel imports for fork child state */
 extern int32_t kernel_set_fork_exec(const uint8_t *, uint32_t,

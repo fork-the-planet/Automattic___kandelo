@@ -46,6 +46,8 @@ export interface WorkerInitMessage {
   signalWakeSab?: SharedArrayBuffer;
   lockTableSab?: SharedArrayBuffer;
   forkSab?: SharedArrayBuffer;
+  waitpidSab?: SharedArrayBuffer;
+  programBytes?: ArrayBuffer;
   mounts?: SerializedMountConfig[];
 }
 
@@ -64,7 +66,8 @@ export type WorkerToHostMessage =
   | ExecRequestMessage
   | ExecCompleteMessage
   | AlarmSetMessage
-  | ForkRequestMessage;
+  | ForkRequestMessage
+  | WaitpidRequestMessage;
 
 export interface WorkerReadyMessage {
   type: "ready";
@@ -117,11 +120,21 @@ export interface ForkRequestMessage {
   type: "fork_request";
   pid: number;
   forkSab: SharedArrayBuffer;
+  forkState: ArrayBuffer;
+}
+
+export interface WaitpidRequestMessage {
+  type: "waitpid_request";
+  pid: number;
+  targetPid: number;
+  options: number;
+  waitpidSab: SharedArrayBuffer;
 }
 
 export interface ExecReplyMessage {
   type: "exec_reply";
   wasmBytes: ArrayBuffer;
+  programBytes?: ArrayBuffer;
 }
 
 export interface SerializedMountConfig {

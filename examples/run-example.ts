@@ -1,6 +1,8 @@
 /**
  * run-example.ts — Run any compiled .wasm example on the kernel.
  *
+ * Uses ProcessManager with worker threads so fork/exec/posix_spawn work.
+ *
  * Usage:
  *   npx tsx examples/run-example.ts <name>
  *
@@ -11,9 +13,8 @@
 
 import { readFileSync } from "fs";
 import { resolve } from "path";
-import { WasmPosixKernel } from "../host/src/kernel";
-import { ProgramRunner } from "../host/src/program-runner";
-import { NodePlatformIO } from "../host/src/platform/node";
+import { ProcessManager } from "../host/src/process-manager";
+import { NodeWorkerAdapter } from "../host/src/worker-adapter";
 
 async function main() {
     const name = process.argv[2];
@@ -31,28 +32,28 @@ async function main() {
     const kernelBytes = readFileSync(kernelPath);
     const programBytes = readFileSync(programPath);
 
-    const io = new NodePlatformIO();
+    const pm = new ProcessManager({
+        wasmBytes: kernelBytes.buffer.slice(
+            kernelBytes.byteOffset,
+            kernelBytes.byteOffset + kernelBytes.byteLength,
+        ),
+        kernelConfig: { maxWorkers: 4, dataBufferSize: 65536, useSharedMemory: true },
+        workerAdapter: new NodeWorkerAdapter(),
+    });
 
-    const kernel = new WasmPosixKernel(
-        { maxWorkers: 1, dataBufferSize: 65536, useSharedMemory: true },
-        io,
-        {
-            onStdout: (data) => process.stdout.write(data),
-            onStderr: (data) => process.stderr.write(data),
-        },
-    );
-
-    await kernel.init(kernelBytes);
-
-    const runner = new ProgramRunner(kernel);
-    const exitCode = await runner.run(programBytes, {
+    const pid = await pm.spawn({
         env: Object.entries(process.env)
             .filter(([, v]) => v !== undefined)
             .map(([k, v]) => `${k}=${v}`),
         argv: [programPath, ...process.argv.slice(3)],
+        programBytes: programBytes.buffer.slice(
+            programBytes.byteOffset,
+            programBytes.byteOffset + programBytes.byteLength,
+        ),
     });
 
-    process.exit(exitCode);
+    const result = await pm.waitpid(pid);
+    process.exit(result.status);
 }
 
 main().catch((e) => {

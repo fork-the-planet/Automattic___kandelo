@@ -28,6 +28,7 @@ export interface KernelCallbacks {
   onExec?: (path: string) => number;
   onAlarm?: (seconds: number) => number;
   onFork?: (forkSab: SharedArrayBuffer) => void;
+  onWaitpid?: (targetPid: number, options: number) => void;
   onStdout?: (data: Uint8Array) => void;
   onStderr?: (data: Uint8Array) => void;
   /** Read up to maxLen bytes from stdin. Return a Uint8Array with available data, or empty/null for EOF. */
@@ -45,6 +46,7 @@ export class WasmPosixKernel {
   private sharedLockTable: SharedLockTable | null = null;
   private programFuncTable: WebAssembly.Table | null = null;
   private forkSab: SharedArrayBuffer | null = null;
+  private waitpidSab: SharedArrayBuffer | null = null;
 
   /**
    * Set the user program's indirect function table so signal handlers
@@ -83,6 +85,10 @@ export class WasmPosixKernel {
 
   registerForkSab(sab: SharedArrayBuffer): void {
     this.forkSab = sab;
+  }
+
+  registerWaitpidSab(sab: SharedArrayBuffer): void {
+    this.waitpidSab = sab;
   }
 
   /**
@@ -878,6 +884,33 @@ export class WasmPosixKernel {
     options: number,
     statusPtr: number,
   ): number {
+    // If we have a waitpid callback + SAB, use blocking host delegation
+    if (this.waitpidSab && this.callbacks.onWaitpid) {
+      const view = new Int32Array(this.waitpidSab);
+      Atomics.store(view, 0, 0); // flag = waiting
+      Atomics.store(view, 1, 0); // result pid
+      Atomics.store(view, 2, 0); // status
+
+      this.callbacks.onWaitpid(pid, options);
+
+      // Block until host signals completion
+      Atomics.wait(view, 0, 0);
+
+      const resultPid = Atomics.load(view, 1);
+      const resultStatus = Atomics.load(view, 2);
+
+      if (resultPid < 0) {
+        return resultPid; // negative errno
+      }
+
+      if (statusPtr !== 0 && this.memory) {
+        const dv = new DataView(this.memory.buffer);
+        dv.setInt32(statusPtr, resultStatus, true);
+      }
+      return resultPid;
+    }
+
+    // Fallback to PlatformIO
     if (!this.io.waitpid) {
       return -10; // -ECHILD
     }

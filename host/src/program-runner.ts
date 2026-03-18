@@ -100,6 +100,108 @@ function getMemoryImportMinPages(bytes: Uint8Array): number | null {
     return null;
 }
 
+/**
+ * Instantiate and run a user program on an already-initialized kernel.
+ * The kernel must have been init'd (kernel_init or kernel_init_from_fork/exec)
+ * and env/argv must already be set.
+ *
+ * @returns The exit code (0 for normal exit via kernel_exit trap)
+ */
+export async function instantiateAndRunProgram(
+    kernel: WasmPosixKernel,
+    programBytes: BufferSource,
+): Promise<number> {
+    const memory = kernel.getMemory();
+    if (!memory) throw new Error("Kernel not initialized");
+
+    const kernelInstance = kernel.getInstance();
+    if (!kernelInstance) throw new Error("Kernel not initialized");
+
+    const kernelExports = kernelInstance.exports;
+
+    // Build import object bridging kernel exports to program imports.
+    const trace = typeof process !== "undefined" && !!process.env?.TRACE_SYSCALLS;
+    const kernelImports: Record<string, WebAssembly.ExportValue> = {};
+    for (const [name, exp] of Object.entries(kernelExports)) {
+        if (name.startsWith("kernel_") && typeof exp === "function") {
+            if (trace) {
+                const fn = exp as Function;
+                kernelImports[name] = (...args: unknown[]) => {
+                    const result = fn(...args);
+                    console.error(`[trace] ${name}(${args.map(a => typeof a === 'bigint' ? `${a}n` : a).join(', ')}) => ${typeof result === 'bigint' ? `${result}n` : result}`);
+                    return result;
+                };
+            } else {
+                kernelImports[name] = exp;
+            }
+        }
+    }
+
+    // Compile and instantiate the program module.
+    const module = await WebAssembly.compile(programBytes);
+
+    // Ensure shared memory has enough pages for the program's declared minimum.
+    const programBuf = programBytes instanceof ArrayBuffer
+        ? new Uint8Array(programBytes)
+        : new Uint8Array((programBytes as ArrayBufferView).buffer,
+            (programBytes as ArrayBufferView).byteOffset,
+            (programBytes as ArrayBufferView).byteLength);
+    const requiredPages = getMemoryImportMinPages(programBuf);
+    if (requiredPages !== null) {
+        const currentPages = memory.buffer.byteLength / 65536;
+        if (currentPages < requiredPages) {
+            memory.grow(requiredPages - currentPages);
+        }
+    }
+
+    // Build env imports: memory + stub any unresolved function imports.
+    const envImports: Record<string, WebAssembly.ExportValue> = { memory };
+    for (const imp of WebAssembly.Module.imports(module)) {
+        if (imp.module === "env" && imp.kind === "function") {
+            envImports[imp.name] = () => {
+                throw new Error(`Unimplemented import: env.${imp.name}`);
+            };
+        }
+    }
+
+    const importObject: WebAssembly.Imports = {
+        kernel: kernelImports,
+        env: envImports,
+    };
+
+    const instance = await WebAssembly.instantiate(module, importObject);
+
+    // Give the kernel access to the program's function table so signal
+    // handlers (registered via sigaction in user code) can be dispatched.
+    const progTable = instance.exports.__indirect_function_table as WebAssembly.Table | undefined;
+    if (progTable) {
+        kernel.setProgramFuncTable(progTable);
+    }
+
+    // Set the kernel's program break to the program's __heap_base.
+    const heapBase = instance.exports.__heap_base;
+    if (heapBase instanceof WebAssembly.Global) {
+        const kernelBrk = kernelExports.kernel_brk as Function;
+        kernelBrk(heapBase.value);
+    }
+
+    // Call the program's _start entry point.
+    const startFn = instance.exports._start as Function;
+    const getExitStatus = kernelExports.kernel_get_exit_status as Function | undefined;
+    try {
+        startFn();
+        return 0;
+    } catch (e: unknown) {
+        if (e instanceof WebAssembly.RuntimeError) {
+            const msg = e.message || "";
+            if (msg.includes("unreachable")) {
+                return getExitStatus ? getExitStatus() : 0;
+            }
+        }
+        throw e;
+    }
+}
+
 export class ProgramRunner {
     private kernel: WasmPosixKernel;
 
@@ -124,10 +226,6 @@ export class ProgramRunner {
         const kernelExports = kernelInstance.exports;
 
         // Initialize kernel process state for PID 1.
-        // This must happen before program instantiation because the program's
-        // start section (__wasm_call_ctors) runs during instantiate, and while
-        // it typically doesn't call kernel functions, we ensure kernel state
-        // is ready just in case.
         const kernelInit = kernelExports.kernel_init as Function;
         kernelInit(1);
 
@@ -168,96 +266,6 @@ export class ProgramRunner {
             }
         }
 
-        // Build import object bridging kernel exports to program imports.
-        const trace = typeof process !== "undefined" && !!process.env?.TRACE_SYSCALLS;
-        const kernelImports: Record<string, WebAssembly.ExportValue> = {};
-        for (const [name, exp] of Object.entries(kernelExports)) {
-            if (name.startsWith("kernel_") && typeof exp === "function") {
-                if (trace) {
-                    const fn = exp as Function;
-                    kernelImports[name] = (...args: unknown[]) => {
-                        const result = fn(...args);
-                        console.error(`[trace] ${name}(${args.map(a => typeof a === 'bigint' ? `${a}n` : a).join(', ')}) => ${typeof result === 'bigint' ? `${result}n` : result}`);
-                        return result;
-                    };
-                } else {
-                    kernelImports[name] = exp;
-                }
-            }
-        }
-
-        // Compile and instantiate the program module.
-        // The start section (__wasm_call_ctors) runs automatically during
-        // instantiation, setting up C global constructors.
-        const module = await WebAssembly.compile(programBytes);
-
-        // Ensure shared memory has enough pages for the program's declared minimum.
-        // Large programs (e.g. PHP) may need more initial pages than the kernel allocates.
-        const programBuf = programBytes instanceof ArrayBuffer
-            ? new Uint8Array(programBytes)
-            : new Uint8Array((programBytes as ArrayBufferView).buffer,
-                (programBytes as ArrayBufferView).byteOffset,
-                (programBytes as ArrayBufferView).byteLength);
-        const requiredPages = getMemoryImportMinPages(programBuf);
-        if (requiredPages !== null) {
-            const currentPages = memory.buffer.byteLength / 65536;
-            if (currentPages < requiredPages) {
-                memory.grow(requiredPages - currentPages);
-            }
-        }
-
-        // Build env imports: memory + stub any unresolved function imports.
-        // Programs compiled with --allow-undefined may import functions that
-        // don't exist in the kernel (e.g. DNS, fibers). Stub them to trap.
-        const envImports: Record<string, WebAssembly.ExportValue> = { memory };
-        for (const imp of WebAssembly.Module.imports(module)) {
-            if (imp.module === "env" && imp.kind === "function") {
-                envImports[imp.name] = () => {
-                    throw new Error(`Unimplemented import: env.${imp.name}`);
-                };
-            }
-        }
-
-        const importObject: WebAssembly.Imports = {
-            kernel: kernelImports,
-            env: envImports,
-        };
-
-        const instance = await WebAssembly.instantiate(module, importObject);
-
-        // Give the kernel access to the program's function table so signal
-        // handlers (registered via sigaction in user code) can be dispatched.
-        const progTable = instance.exports.__indirect_function_table as WebAssembly.Table | undefined;
-        if (progTable) {
-            this.kernel.setProgramFuncTable(progTable);
-        }
-
-        // Set the kernel's program break to the program's __heap_base.
-        // Without this, the kernel uses a default break (16MB) which may
-        // be beyond the allocated Wasm memory, causing OOB errors on malloc.
-        const heapBase = instance.exports.__heap_base;
-        if (heapBase instanceof WebAssembly.Global) {
-            const kernelBrk = kernelExports.kernel_brk as Function;
-            kernelBrk(heapBase.value);
-        }
-
-        // Call the program's _start entry point.
-        const startFn = instance.exports._start as Function;
-        const getExitStatus = kernelExports.kernel_get_exit_status as Function | undefined;
-        try {
-            startFn();
-            return 0;
-        } catch (e: unknown) {
-            // kernel_exit calls wasm unreachable to unwind the stack.
-            // This manifests as a RuntimeError with "unreachable" in the message.
-            // We treat this as a normal program exit and read the stored exit code.
-            if (e instanceof WebAssembly.RuntimeError) {
-                const msg = e.message || "";
-                if (msg.includes("unreachable")) {
-                    return getExitStatus ? getExitStatus() : 0;
-                }
-            }
-            throw e;
-        }
+        return instantiateAndRunProgram(this.kernel, programBytes);
     }
 }

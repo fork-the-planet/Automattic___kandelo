@@ -18,18 +18,23 @@ export interface ProcessInfo {
   alarmTimer?: ReturnType<typeof setTimeout>;
   signalWakeSab?: SharedArrayBuffer;
   forkSab?: SharedArrayBuffer;
+  waitpidSab?: SharedArrayBuffer;
+  programBytes?: ArrayBuffer;
 }
 
 export interface ProcessManagerConfig {
   wasmBytes: ArrayBuffer;
   kernelConfig: KernelConfig;
   workerAdapter: WorkerAdapter;
+  resolveProgram?: (path: string) => Promise<ArrayBuffer | null>;
 }
 
 export interface SpawnOptions {
   ppid?: number;
   env?: string[];
+  argv?: string[];
   cwd?: string;
+  programBytes?: ArrayBuffer;
 }
 
 export interface WaitResult {
@@ -56,6 +61,7 @@ export class ProcessManager {
 
     const signalWakeSab = new SharedArrayBuffer(8);
     const forkSab = new SharedArrayBuffer(8);
+    const waitpidSab = new SharedArrayBuffer(12); // [flag, resultPid, status]
 
     const initData: WorkerInitMessage = {
       type: "init",
@@ -64,10 +70,13 @@ export class ProcessManager {
       wasmBytes: this.config.wasmBytes,
       kernelConfig: this.config.kernelConfig,
       env: options?.env,
+      argv: options?.argv,
       cwd: options?.cwd,
       signalWakeSab,
       lockTableSab: this.sharedLockTable.getBuffer(),
       forkSab,
+      waitpidSab,
+      programBytes: options?.programBytes,
     };
 
     const worker = this.config.workerAdapter.createWorker(initData);
@@ -81,6 +90,8 @@ export class ProcessManager {
       state: "starting",
       signalWakeSab,
       forkSab,
+      waitpidSab,
+      programBytes: options?.programBytes,
     };
 
     this.processes.set(pid, info);
@@ -141,16 +152,20 @@ export class ProcessManager {
             }
             break;
           case "exec_request": {
-            // Load binary — for now use same kernel binary.
-            // In the future, resolve path to different binary.
+            // Load binary — resolve program or use same binary.
             if (info.alarmTimer) {
               clearTimeout(info.alarmTimer);
               info.alarmTimer = undefined;
             }
-            const wasmBytes = this.config.wasmBytes;
-            info.worker.postMessage(
-              { type: "exec_reply", wasmBytes: wasmBytes.slice(0) },
-            );
+            (async () => {
+              const wasmBytes = this.config.wasmBytes;
+              const resolvedProgram = this.config.resolveProgram
+                ? await this.config.resolveProgram(m.path)
+                : info.programBytes;
+              info.worker.postMessage(
+                { type: "exec_reply", wasmBytes: wasmBytes.slice(0), programBytes: resolvedProgram ? resolvedProgram.slice(0) : undefined },
+              );
+            })();
             break;
           }
           case "alarm_set": {
@@ -172,7 +187,12 @@ export class ProcessManager {
             break;
           }
           case "fork_request": {
-            this.handleForkRequest(m.pid, (m as import("./worker-protocol").ForkRequestMessage).forkSab);
+            this.handleForkRequest(m.pid, (m as import("./worker-protocol").ForkRequestMessage).forkSab, (m as import("./worker-protocol").ForkRequestMessage).forkState);
+            break;
+          }
+          case "waitpid_request": {
+            const wm = m as import("./worker-protocol").WaitpidRequestMessage;
+            this.handleWaitpidRequest(wm.targetPid, wm.options, wm.waitpidSab);
             break;
           }
         }
@@ -230,6 +250,7 @@ export class ProcessManager {
       signalWakeSab,
       lockTableSab: this.sharedLockTable.getBuffer(),
       forkSab: childForkSab,
+      programBytes: parentInfo.programBytes,
     };
 
     const worker = this.config.workerAdapter.createWorker(initData);
@@ -242,6 +263,7 @@ export class ProcessManager {
       state: "starting",
       signalWakeSab,
       forkSab: childForkSab,
+      programBytes: parentInfo.programBytes,
     };
     this.processes.set(childPid, childInfo);
 
@@ -343,16 +365,20 @@ export class ProcessManager {
             }
             break;
           case "exec_request": {
-            // Load binary — for now use same kernel binary.
-            // In the future, resolve path to different binary.
+            // Load binary — resolve program or use same binary.
             if (childInfo.alarmTimer) {
               clearTimeout(childInfo.alarmTimer);
               childInfo.alarmTimer = undefined;
             }
-            const wasmBytes = this.config.wasmBytes;
-            childInfo.worker.postMessage(
-              { type: "exec_reply", wasmBytes: wasmBytes.slice(0) },
-            );
+            (async () => {
+              const wasmBytes = this.config.wasmBytes;
+              const resolvedProgram = this.config.resolveProgram
+                ? await this.config.resolveProgram(m.path)
+                : childInfo.programBytes;
+              childInfo.worker.postMessage(
+                { type: "exec_reply", wasmBytes: wasmBytes.slice(0), programBytes: resolvedProgram ? resolvedProgram.slice(0) : undefined },
+              );
+            })();
             break;
           }
           case "alarm_set": {
@@ -374,7 +400,12 @@ export class ProcessManager {
             break;
           }
           case "fork_request": {
-            this.handleForkRequest(m.pid, (m as import("./worker-protocol").ForkRequestMessage).forkSab);
+            this.handleForkRequest(m.pid, (m as import("./worker-protocol").ForkRequestMessage).forkSab, (m as import("./worker-protocol").ForkRequestMessage).forkState);
+            break;
+          }
+          case "waitpid_request": {
+            const wm = m as import("./worker-protocol").WaitpidRequestMessage;
+            this.handleWaitpidRequest(wm.targetPid, wm.options, wm.waitpidSab);
             break;
           }
         }
@@ -563,21 +594,232 @@ export class ProcessManager {
   }
 
   /**
-   * Handle a guest-initiated fork request. Forks the parent process
-   * and signals the result back via the parent's forkSab.
+   * Handle a guest-initiated fork request. Creates child worker from
+   * pre-serialized fork state (parent worker is blocked on Atomics.wait
+   * so we can't request state from it). Signals result via forkSab.
    */
-  private handleForkRequest(parentPid: number, forkSab: SharedArrayBuffer): void {
+  private handleForkRequest(parentPid: number, forkSab: SharedArrayBuffer, forkState: ArrayBuffer): void {
     const view = new Int32Array(forkSab);
-    this.fork(parentPid).then((childPid) => {
-      // Signal parent with child PID
+    this.forkWithState(parentPid, forkState).then((childPid) => {
       Atomics.store(view, 1, childPid);
       Atomics.store(view, 0, 1);
       Atomics.notify(view, 0);
     }).catch(() => {
-      // Signal parent with error
       Atomics.store(view, 1, -12); // -ENOMEM
       Atomics.store(view, 0, 1);
       Atomics.notify(view, 0);
+    });
+  }
+
+  /**
+   * Fork using pre-serialized state (for guest-initiated fork where
+   * the parent worker is blocked and can't respond to get_fork_state).
+   */
+  private async forkWithState(parentPid: number, forkState: ArrayBuffer): Promise<number> {
+    const parentInfo = this.processes.get(parentPid);
+    if (!parentInfo) {
+      throw new Error(`Cannot fork process ${parentPid}: not found`);
+    }
+
+    const childPid = this.nextPid++;
+    const signalWakeSab = new SharedArrayBuffer(8);
+    const childForkSab = new SharedArrayBuffer(8);
+    const childWaitpidSab = new SharedArrayBuffer(12);
+
+    const initData: WorkerInitMessage = {
+      type: "init",
+      pid: childPid,
+      ppid: parentPid,
+      wasmBytes: this.config.wasmBytes,
+      kernelConfig: this.config.kernelConfig,
+      forkState,
+      signalWakeSab,
+      lockTableSab: this.sharedLockTable.getBuffer(),
+      forkSab: childForkSab,
+      waitpidSab: childWaitpidSab,
+      programBytes: parentInfo.programBytes,
+    };
+
+    const worker = this.config.workerAdapter.createWorker(initData);
+    const childInfo: ProcessInfo = {
+      pid: childPid,
+      ppid: parentPid,
+      pgid: parentInfo.pgid,
+      sid: parentInfo.sid,
+      worker,
+      state: "starting",
+      signalWakeSab,
+      forkSab: childForkSab,
+      waitpidSab: childWaitpidSab,
+      programBytes: parentInfo.programBytes,
+    };
+    this.processes.set(childPid, childInfo);
+
+    return new Promise<number>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.processes.delete(childPid);
+        this.sharedLockTable.removeLocksByPid(childPid);
+        worker.terminate().catch(() => {});
+        reject(new Error(`Forked process ${childPid} timed out during initialization`));
+      }, 10_000);
+
+      worker.on("message", (msg: unknown) => {
+        const m = msg as WorkerToHostMessage;
+        switch (m.type) {
+          case "ready":
+            if (childInfo.state === "starting") {
+              clearTimeout(timeout);
+              childInfo.state = "running";
+              resolve(childPid);
+            }
+            break;
+          case "exit":
+            if (childInfo.state === "starting") {
+              clearTimeout(timeout);
+              this.processes.delete(childPid);
+              this.sharedLockTable.removeLocksByPid(childPid);
+              worker.terminate().catch(() => {});
+              reject(new Error(`Forked worker exited with status ${m.status}`));
+            } else {
+              if (childInfo.alarmTimer) {
+                clearTimeout(childInfo.alarmTimer);
+                childInfo.alarmTimer = undefined;
+              }
+              this.sharedLockTable.removeLocksByPid(childPid);
+              childInfo.state = "zombie";
+              childInfo.exitStatus = m.status;
+              if (childInfo.ppid > 0) {
+                try { this.deliverSignal(childInfo.ppid, 17); } catch { /* parent may have exited */ }
+              }
+            }
+            break;
+          case "error":
+            if (childInfo.state === "starting") {
+              clearTimeout(timeout);
+              this.processes.delete(childPid);
+              this.sharedLockTable.removeLocksByPid(childPid);
+              worker.terminate().catch(() => {});
+              reject(new Error(m.message));
+            }
+            break;
+          case "kill_request":
+            try { this.deliverSignal(m.pid, m.signal); } catch { /* target doesn't exist */ }
+            break;
+          case "exec_request": {
+            if (childInfo.alarmTimer) {
+              clearTimeout(childInfo.alarmTimer);
+              childInfo.alarmTimer = undefined;
+            }
+            (async () => {
+              const wasmBytes = this.config.wasmBytes;
+              const resolvedProgram = this.config.resolveProgram
+                ? await this.config.resolveProgram(m.path)
+                : childInfo.programBytes;
+              childInfo.worker.postMessage(
+                { type: "exec_reply", wasmBytes: wasmBytes.slice(0), programBytes: resolvedProgram ? resolvedProgram.slice(0) : undefined },
+              );
+            })();
+            break;
+          }
+          case "alarm_set": {
+            const alarmInfo = this.processes.get(m.pid);
+            if (alarmInfo && alarmInfo.state === "running") {
+              if (alarmInfo.alarmTimer) {
+                clearTimeout(alarmInfo.alarmTimer);
+                alarmInfo.alarmTimer = undefined;
+              }
+              if (m.seconds > 0) {
+                alarmInfo.alarmTimer = setTimeout(() => {
+                  alarmInfo.alarmTimer = undefined;
+                  try { this.deliverSignal(m.pid, 14); } catch { /* process may have exited */ }
+                }, m.seconds * 1000);
+              }
+            }
+            break;
+          }
+          case "fork_request": {
+            this.handleForkRequest(m.pid, (m as import("./worker-protocol").ForkRequestMessage).forkSab, (m as import("./worker-protocol").ForkRequestMessage).forkState);
+            break;
+          }
+          case "waitpid_request": {
+            const wm = m as import("./worker-protocol").WaitpidRequestMessage;
+            this.handleWaitpidRequest(wm.targetPid, wm.options, wm.waitpidSab);
+            break;
+          }
+        }
+      });
+
+      worker.on("error", (err: Error) => {
+        if (childInfo.state === "starting") {
+          clearTimeout(timeout);
+          this.processes.delete(childPid);
+          this.sharedLockTable.removeLocksByPid(childPid);
+          worker.terminate().catch(() => {});
+          reject(err);
+        }
+      });
+
+      worker.on("exit", (code: number) => {
+        if (childInfo.state === "starting") {
+          clearTimeout(timeout);
+          this.processes.delete(childPid);
+          this.sharedLockTable.removeLocksByPid(childPid);
+          reject(new Error(`Forked worker exited with code ${code}`));
+        }
+      });
+    });
+  }
+
+  /**
+   * Handle a guest-initiated waitpid request. Waits for the target child
+   * to exit and signals the result back via the caller's waitpidSab.
+   * waitpidSab layout: Int32Array(3) [flag, resultPid, status]
+   */
+  private handleWaitpidRequest(targetPid: number, options: number, waitpidSab: SharedArrayBuffer): void {
+    const view = new Int32Array(waitpidSab);
+    const WNOHANG = 1;
+
+    const signal = (pid: number, status: number) => {
+      Atomics.store(view, 1, pid);
+      Atomics.store(view, 2, status);
+      Atomics.store(view, 0, 1);
+      Atomics.notify(view, 0);
+    };
+
+    const info = this.processes.get(targetPid);
+    if (!info) {
+      signal(-10, 0); // -ECHILD
+      return;
+    }
+
+    if (info.state === "zombie") {
+      const status = info.exitStatus ?? 0;
+      // Encode as wait status: (exitCode << 8) for normal exit
+      signal(targetPid, (status & 0xff) << 8);
+      this.processes.delete(targetPid);
+      return;
+    }
+
+    if (options & WNOHANG) {
+      signal(0, 0);
+      return;
+    }
+
+    // Wait for child exit
+    info.worker.on("message", (msg: unknown) => {
+      const m = msg as WorkerToHostMessage;
+      if (m.type === "exit") {
+        const status = m.status;
+        signal(targetPid, (status & 0xff) << 8);
+        this.processes.delete(targetPid);
+      }
+    });
+
+    info.worker.on("exit", () => {
+      if (this.processes.has(targetPid)) {
+        signal(targetPid, 0);
+        this.processes.delete(targetPid);
+      }
     });
   }
 

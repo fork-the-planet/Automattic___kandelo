@@ -9,6 +9,7 @@ import type {
   ConvertPipeMessage,
   ExecReplyMessage,
 } from "./worker-protocol";
+import { instantiateAndRunProgram } from "./program-runner";
 
 export interface MessagePort {
   postMessage(msg: unknown, transferList?: unknown[]): void;
@@ -49,12 +50,37 @@ export async function workerMain(
         } satisfies WorkerToHostMessage);
         return 0;
       },
+      onWaitpid: (targetPid: number, options: number): void => {
+        port.postMessage({
+          type: "waitpid_request",
+          pid: initData.pid,
+          targetPid,
+          options,
+          waitpidSab: initData.waitpidSab!,
+        } satisfies WorkerToHostMessage);
+      },
       onFork: (forkSab: SharedArrayBuffer): void => {
+        // Serialize fork state NOW, before Atomics.wait blocks the thread.
+        // The host can't request fork state from a blocked worker.
+        const mem = kernel.getMemory()!;
+        const inst = kernel.getInstance()!;
+        const FORK_BUF_PAGES = 16;
+        const sp = mem.grow(FORK_BUF_PAGES);
+        const bp = sp * 65536;
+        const bs = FORK_BUF_PAGES * 65536;
+        const getForkState = inst.exports.kernel_get_fork_state as
+          (ptr: number, len: number) => number;
+        const written = getForkState(bp, bs);
+        const forkState = written > 0
+          ? new Uint8Array(mem.buffer, bp, written).slice().buffer
+          : new ArrayBuffer(0);
         port.postMessage({
           type: "fork_request",
           pid: initData.pid,
           forkSab,
-        } satisfies WorkerToHostMessage);
+          forkState,
+        } satisfies WorkerToHostMessage,
+        [forkState]);
       },
     };
 
@@ -73,6 +99,10 @@ export async function workerMain(
 
     if (initData.forkSab) {
       kernel.registerForkSab(initData.forkSab);
+    }
+
+    if (initData.waitpidSab) {
+      kernel.registerWaitpidSab(initData.waitpidSab);
     }
 
     if (initData.forkState) {
@@ -140,6 +170,29 @@ export async function workerMain(
       type: "ready",
       pid: initData.pid,
     } satisfies WorkerToHostMessage);
+
+    // If programBytes provided, run the user program after signaling ready.
+    // This runs asynchronously so the message listener below can handle
+    // incoming messages (fork_request responses, signals, etc.) while
+    // the program executes.
+    if (initData.programBytes) {
+      (async () => {
+        try {
+          const exitCode = await instantiateAndRunProgram(kernel, initData.programBytes!);
+          port.postMessage({
+            type: "exit",
+            pid: initData.pid,
+            status: exitCode,
+          } satisfies WorkerToHostMessage);
+        } catch (err) {
+          port.postMessage({
+            type: "error",
+            pid: initData.pid,
+            message: `Program failed: ${err instanceof Error ? err.message : String(err)}`,
+          } satisfies WorkerToHostMessage);
+        }
+      })();
+    }
 
     // Listen for messages from host
     port.on("message", (msg: unknown) => {
@@ -266,6 +319,16 @@ export async function workerMain(
                 newKernel.registerSharedLockTable(initData.lockTableSab);
               }
 
+              // Transfer fork SAB to new kernel
+              if (initData.forkSab) {
+                newKernel.registerForkSab(initData.forkSab);
+              }
+
+              // Transfer waitpid SAB to new kernel
+              if (initData.waitpidSab) {
+                newKernel.registerWaitpidSab(initData.waitpidSab);
+              }
+
               // 5. Replace references
               kernel = newKernel;
               instance = newInstance;
@@ -275,6 +338,16 @@ export async function workerMain(
                 type: "exec_complete",
                 pid: initData.pid,
               } satisfies WorkerToHostMessage);
+
+              // 7. If exec_reply includes programBytes, run the new program
+              if (msg.programBytes) {
+                const exitCode = await instantiateAndRunProgram(kernel, msg.programBytes);
+                port.postMessage({
+                  type: "exit",
+                  pid: initData.pid,
+                  status: exitCode,
+                } satisfies WorkerToHostMessage);
+              }
             } catch (err) {
               port.postMessage({
                 type: "error",
