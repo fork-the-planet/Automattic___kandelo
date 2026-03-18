@@ -3355,6 +3355,15 @@ pub extern "C" fn kernel_clear_fork_exec() -> i32 {
     0
 }
 
+/// Set PID/PPID on an existing process (used by asyncify fork to update
+/// identity after full memory snapshot restoration without full re-init).
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_set_child_pid(new_pid: u32) {
+    let proc = unsafe { get_process() };
+    proc.ppid = proc.pid;
+    proc.pid = new_pid;
+}
+
 // ---------------------------------------------------------------------------
 // alarm
 // ---------------------------------------------------------------------------

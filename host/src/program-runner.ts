@@ -14,6 +14,12 @@
  *   2. WebAssembly.instantiate(program) — runs __wasm_call_ctors via start section
  *   3. Call program's _start export
  *   4. Catch unreachable trap from kernel_exit as clean exit
+ *
+ * Asyncify support (optional):
+ *   If the user program was built with `wasm-opt --asyncify`, fork() can
+ *   save/restore the call stack so the child resumes from the fork return
+ *   point instead of restarting at _start. This is the initial mechanism;
+ *   it can be replaced by Wasm Stack Switching or JSPI in the future.
  */
 
 import { WasmPosixKernel } from "./kernel";
@@ -29,6 +35,35 @@ if (typeof process !== "undefined" && process.versions?.node) {
   } catch {
     // Ignore — browser or unsupported Node version
   }
+}
+
+/** Size of the asyncify data buffer (1 page). */
+export const ASYNCIFY_DATA_SIZE = 65536;
+
+/**
+ * Callback interface for handling fork() when Asyncify is available.
+ * The program runner calls this after capturing the asyncify stack data.
+ * The handler is responsible for taking a memory snapshot, serializing
+ * kernel state, sending fork_request, and blocking until the child is created.
+ */
+export interface AsyncifyForkHandler {
+  handleFork(
+    asyncifyData: ArrayBuffer,
+    asyncifyDataAddr: number,
+    memory: WebAssembly.Memory,
+  ): number; // Returns child PID (>0) or negative errno
+}
+
+/**
+ * Data needed to resume a fork child from the parent's fork point.
+ * The child restores memory, writes asyncify data, and rewinds to the
+ * fork() call site where it returns 0.
+ */
+export interface AsyncifyResumeData {
+  memorySnapshot: ArrayBuffer;
+  asyncifyData: ArrayBuffer;
+  asyncifyDataAddr: number;
+  childPid: number;
 }
 
 /** Read an unsigned LEB128 integer from a byte array. */
@@ -100,16 +135,36 @@ function getMemoryImportMinPages(bytes: Uint8Array): number | null {
     return null;
 }
 
+/** Extract exit code from a _start() trap. Returns the code or rethrows. */
+function handleExitTrap(
+    e: unknown,
+    getExitStatus: Function | undefined,
+): number {
+    if (e instanceof WebAssembly.RuntimeError) {
+        const msg = e.message || "";
+        if (msg.includes("unreachable")) {
+            return getExitStatus ? getExitStatus() : 0;
+        }
+    }
+    throw e;
+}
+
 /**
  * Instantiate and run a user program on an already-initialized kernel.
  * The kernel must have been init'd (kernel_init or kernel_init_from_fork/exec)
  * and env/argv must already be set.
  *
+ * @param options.forkHandler  - Asyncify fork callback (parent side)
+ * @param options.resumeFromFork - Asyncify resume data (child side)
  * @returns The exit code (0 for normal exit via kernel_exit trap)
  */
 export async function instantiateAndRunProgram(
     kernel: WasmPosixKernel,
     programBytes: BufferSource,
+    options?: {
+      forkHandler?: AsyncifyForkHandler;
+      resumeFromFork?: AsyncifyResumeData;
+    },
 ): Promise<number> {
     const memory = kernel.getMemory();
     if (!memory) throw new Error("Kernel not initialized");
@@ -154,6 +209,39 @@ export async function instantiateAndRunProgram(
         }
     }
 
+    // Detect asyncify support in the compiled module.
+    const moduleExportList = WebAssembly.Module.exports(module);
+    const hasAsyncify = moduleExportList.some(e => e.name === "asyncify_start_unwind");
+    const useAsyncifyFork = hasAsyncify && !!(options?.forkHandler || options?.resumeFromFork);
+
+    // Asyncify state: mutable ref so the kernel_fork wrapper (defined before
+    // the instance exists) can call asyncify_start_unwind on it.
+    let programInst: WebAssembly.Instance | null = null;
+    let forkResult = 0;
+    let asyncifyDataAddr = 0;
+
+    if (useAsyncifyFork) {
+        // Replace kernel_fork import with asyncify-aware wrapper.
+        // Normal (non-rewind) calls trigger asyncify unwind to capture the stack.
+        // During rewind, return the fork result (child PID or 0).
+        kernelImports["kernel_fork"] = () => {
+            if (!programInst) return -38; // -ENOSYS
+
+            // Check asyncify state: 2 = rewinding → return fork result
+            const state = (programInst.exports.asyncify_get_state as Function)();
+            if (state === 2) {
+                return forkResult;
+            }
+
+            // Normal call: set up data buffer and start unwind
+            const view = new DataView(memory.buffer);
+            view.setUint32(asyncifyDataAddr, asyncifyDataAddr + 8, true);     // data start
+            view.setUint32(asyncifyDataAddr + 4, asyncifyDataAddr + ASYNCIFY_DATA_SIZE, true); // data end
+            (programInst.exports.asyncify_start_unwind as Function)(asyncifyDataAddr);
+            return 0; // discarded during unwind
+        };
+    }
+
     // Build env imports: memory + stub any unresolved function imports.
     const envImports: Record<string, WebAssembly.ExportValue> = { memory };
     for (const imp of WebAssembly.Module.imports(module)) {
@@ -170,6 +258,7 @@ export async function instantiateAndRunProgram(
     };
 
     const instance = await WebAssembly.instantiate(module, importObject);
+    programInst = instance;
 
     // Give the kernel access to the program's function table so signal
     // handlers (registered via sigaction in user code) can be dispatched.
@@ -178,27 +267,118 @@ export async function instantiateAndRunProgram(
         kernel.setProgramFuncTable(progTable);
     }
 
-    // Set the kernel's program break to the program's __heap_base.
-    const heapBase = instance.exports.__heap_base;
-    if (heapBase instanceof WebAssembly.Global) {
-        const kernelBrk = kernelExports.kernel_brk as Function;
-        kernelBrk(heapBase.value);
+    // ── Child resume path (asyncify rewind) ──────────────────────────
+    if (options?.resumeFromFork && hasAsyncify) {
+        const resume = options.resumeFromFork;
+        // Grow memory to match snapshot size, then overwrite with parent's state.
+        const snapshotSize = resume.memorySnapshot.byteLength;
+        const currentSize = memory.buffer.byteLength;
+        if (snapshotSize > currentSize) {
+            memory.grow(Math.ceil((snapshotSize - currentSize) / 65536));
+        }
+        new Uint8Array(memory.buffer, 0, snapshotSize).set(
+            new Uint8Array(resume.memorySnapshot),
+        );
+
+        // Kernel state in memory is now the parent's. Fix PID.
+        (kernelExports.kernel_set_child_pid as Function)(resume.childPid);
+
+        // Restore asyncify data from parent's snapshot.
+        // Important: do NOT reset the position pointer [addr+0]. Asyncify
+        // reads BACKWARD during rewind, so the position must remain at
+        // the end of the written data (where unwind finished writing).
+        asyncifyDataAddr = resume.asyncifyDataAddr;
+        new Uint8Array(memory.buffer, asyncifyDataAddr, resume.asyncifyData.byteLength)
+            .set(new Uint8Array(resume.asyncifyData));
+
+        // Rewind to fork point; kernel_fork wrapper will return 0.
+        forkResult = 0;
+        (instance.exports.asyncify_start_rewind as Function)(asyncifyDataAddr);
+
+        // Fall through to the asyncify execution loop below.
     }
 
-    // Call the program's _start entry point.
+    // ── Normal parent setup ──────────────────────────────────────────
+    if (!options?.resumeFromFork) {
+        // Set the kernel's program break to the program's __heap_base.
+        const heapBase = instance.exports.__heap_base;
+        if (heapBase instanceof WebAssembly.Global) {
+            (kernelExports.kernel_brk as Function)(heapBase.value);
+        }
+
+        // Allocate asyncify data buffer (1 page) right after program heap.
+        if (useAsyncifyFork) {
+            const allocPage = memory.grow(1);
+            asyncifyDataAddr = allocPage * 65536;
+        }
+    }
+
+    // ── Simple execution (no asyncify) ───────────────────────────────
     const startFn = instance.exports._start as Function;
     const getExitStatus = kernelExports.kernel_get_exit_status as Function | undefined;
-    try {
-        startFn();
-        return 0;
-    } catch (e: unknown) {
-        if (e instanceof WebAssembly.RuntimeError) {
-            const msg = e.message || "";
-            if (msg.includes("unreachable")) {
-                return getExitStatus ? getExitStatus() : 0;
-            }
+
+    if (!useAsyncifyFork) {
+        try {
+            startFn();
+            return 0;
+        } catch (e: unknown) {
+            return handleExitTrap(e, getExitStatus);
         }
-        throw e;
+    }
+
+    // ── Asyncify execution loop ──────────────────────────────────────
+    // Handles: normal run, fork-triggered unwind, parent rewind, child
+    // rewind, and nested forks. Uses asyncify_get_state to determine
+    // what happened after _start() returns.
+    const getAsyncifyState = instance.exports.asyncify_get_state as Function;
+
+    while (true) {
+        let exitCode: number;
+        try {
+            startFn();
+            exitCode = 0;
+        } catch (e: unknown) {
+            exitCode = handleExitTrap(e, getExitStatus);
+        }
+
+        const state = getAsyncifyState() as number;
+
+        if (state === 1) {
+            // Unwinding: fork() was called and stack has been saved.
+            (instance.exports.asyncify_stop_unwind as Function)();
+
+            // Capture asyncify data before the fork handler modifies memory.
+            const savedAsyncData = new Uint8Array(
+                memory.buffer, asyncifyDataAddr, ASYNCIFY_DATA_SIZE,
+            ).slice().buffer;
+
+            // Delegate fork to the handler (pipe conversion, memory snapshot,
+            // fork_request, Atomics.wait, etc.)
+            const childPid = options!.forkHandler!.handleFork(
+                savedAsyncData, asyncifyDataAddr, memory,
+            );
+            forkResult = childPid;
+
+            // Restore asyncify data (handler may have modified memory).
+            // Important: do NOT reset the position pointer [addr+0]. Asyncify
+            // reads BACKWARD during rewind, so the position must remain at
+            // the end of the written data (where unwind finished writing).
+            new Uint8Array(memory.buffer, asyncifyDataAddr, ASYNCIFY_DATA_SIZE)
+                .set(new Uint8Array(savedAsyncData));
+
+            // Rewind parent: re-call _start, which rewinds to the fork point
+            // and kernel_fork wrapper returns childPid.
+            (instance.exports.asyncify_start_rewind as Function)(asyncifyDataAddr);
+            continue;
+        }
+
+        if (state === 2) {
+            // Rewind completed: _start ran forward from fork point to exit.
+            (instance.exports.asyncify_stop_rewind as Function)();
+        }
+
+        // state === 0: normal exit (no asyncify activity).
+        return exitCode;
     }
 }
 

@@ -79,6 +79,19 @@ LINK_FLAGS=(
     -Wl,--export-table
 )
 
+# Asyncify support: instrument wasm so fork() can save/restore call stack
+WASM_OPT="$(command -v wasm-opt 2>/dev/null || true)"
+ASYNCIFY_IMPORTS="kernel.kernel_fork"
+
+asyncify_wasm() {
+    local wasm="$1"
+    if [ -n "$WASM_OPT" ]; then
+        "$WASM_OPT" --asyncify \
+            --pass-arg="asyncify-imports@${ASYNCIFY_IMPORTS}" \
+            "$wasm" -o "$wasm" 2>/dev/null || true
+    fi
+}
+
 # Timeout per test (seconds)
 TEST_TIMEOUT=30
 
@@ -123,6 +136,7 @@ build_functional() {
     "$CC" "${CFLAGS[@]}" \
         "$src" "${COMMON_SRCS[@]}" "${LINK_FLAGS[@]}" \
         -o "$wasm" 2>/tmp/libc-test-build-err.txt
+    asyncify_wasm "$wasm"
 }
 
 build_regression() {
@@ -134,6 +148,7 @@ build_regression() {
     "$CC" "${CFLAGS[@]}" \
         "$src" "${COMMON_SRCS[@]}" "${LINK_FLAGS[@]}" \
         -o "$wasm" 2>/tmp/libc-test-build-err.txt
+    asyncify_wasm "$wasm"
 }
 
 build_math() {
@@ -148,6 +163,7 @@ build_math() {
         "$LIBC_TEST/src/common/mtest.c" \
         "${COMMON_SRCS[@]}" "${LINK_FLAGS[@]}" \
         -o "$wasm" 2>/tmp/libc-test-build-err.txt
+    asyncify_wasm "$wasm"
 }
 
 # ── Run a single test ───────────────────────────────────────

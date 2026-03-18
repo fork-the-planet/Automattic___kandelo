@@ -187,7 +187,7 @@ export class ProcessManager {
             break;
           }
           case "fork_request": {
-            { const fm = m as import("./worker-protocol").ForkRequestMessage; this.handleForkRequest(fm.pid, fm.forkSab, fm.forkState, fm.pipeSabs); }
+            { const fm = m as import("./worker-protocol").ForkRequestMessage; this.handleForkRequest(fm.pid, fm.forkSab, fm.forkState, fm.pipeSabs, fm.asyncifyData); }
             break;
           }
           case "waitpid_request": {
@@ -400,7 +400,7 @@ export class ProcessManager {
             break;
           }
           case "fork_request": {
-            { const fm = m as import("./worker-protocol").ForkRequestMessage; this.handleForkRequest(fm.pid, fm.forkSab, fm.forkState, fm.pipeSabs); }
+            { const fm = m as import("./worker-protocol").ForkRequestMessage; this.handleForkRequest(fm.pid, fm.forkSab, fm.forkState, fm.pipeSabs, fm.asyncifyData); }
             break;
           }
           case "waitpid_request": {
@@ -603,9 +603,10 @@ export class ProcessManager {
     forkSab: SharedArrayBuffer,
     forkState: ArrayBuffer,
     pipeSabs?: { handle: number; sab: SharedArrayBuffer; end: "read" | "write" }[],
+    asyncifyData?: { memorySnapshot: ArrayBuffer; asyncifyData: ArrayBuffer; asyncifyDataAddr: number },
   ): void {
     const view = new Int32Array(forkSab);
-    this.forkWithState(parentPid, forkState, pipeSabs).then((childPid) => {
+    this.forkWithState(parentPid, forkState, pipeSabs, asyncifyData).then((childPid) => {
       Atomics.store(view, 1, childPid);
       Atomics.store(view, 0, 1);
       Atomics.notify(view, 0);
@@ -624,6 +625,7 @@ export class ProcessManager {
     parentPid: number,
     forkState: ArrayBuffer,
     pipeSabs?: { handle: number; sab: SharedArrayBuffer; end: "read" | "write" }[],
+    asyncifyData?: { memorySnapshot: ArrayBuffer; asyncifyData: ArrayBuffer; asyncifyDataAddr: number },
   ): Promise<number> {
     const parentInfo = this.processes.get(parentPid);
     if (!parentInfo) {
@@ -641,12 +643,17 @@ export class ProcessManager {
       ppid: parentPid,
       wasmBytes: this.config.wasmBytes,
       kernelConfig: this.config.kernelConfig,
-      forkState,
+      forkState: asyncifyData ? undefined : forkState,
       signalWakeSab,
       lockTableSab: this.sharedLockTable.getBuffer(),
       forkSab: childForkSab,
       waitpidSab: childWaitpidSab,
       programBytes: parentInfo.programBytes,
+      asyncifyResume: asyncifyData ? {
+        memorySnapshot: asyncifyData.memorySnapshot,
+        asyncifyData: asyncifyData.asyncifyData,
+        asyncifyDataAddr: asyncifyData.asyncifyDataAddr,
+      } : undefined,
     };
 
     const worker = this.config.workerAdapter.createWorker(initData);
@@ -756,7 +763,7 @@ export class ProcessManager {
             break;
           }
           case "fork_request": {
-            { const fm = m as import("./worker-protocol").ForkRequestMessage; this.handleForkRequest(fm.pid, fm.forkSab, fm.forkState, fm.pipeSabs); }
+            { const fm = m as import("./worker-protocol").ForkRequestMessage; this.handleForkRequest(fm.pid, fm.forkSab, fm.forkState, fm.pipeSabs, fm.asyncifyData); }
             break;
           }
           case "waitpid_request": {

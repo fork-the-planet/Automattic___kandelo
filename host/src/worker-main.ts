@@ -9,7 +9,8 @@ import type {
   ConvertPipeMessage,
   ExecReplyMessage,
 } from "./worker-protocol";
-import { instantiateAndRunProgram } from "./program-runner";
+import { instantiateAndRunProgram, ASYNCIFY_DATA_SIZE } from "./program-runner";
+import type { AsyncifyForkHandler } from "./program-runner";
 import { SharedPipeBuffer } from "./shared-pipe-buffer";
 
 export interface MessagePort {
@@ -18,6 +19,84 @@ export interface MessagePort {
 }
 
 export type CreateIOFn = (initData: WorkerInitMessage) => PlatformIO;
+
+/**
+ * Convert kernel-internal pipes to SharedPipeBuffers and return the SABs.
+ * Must be called while the worker is NOT blocked (before Atomics.wait).
+ */
+function convertPipesToShared(
+  kernel: WasmPosixKernel,
+): { handle: number; sab: SharedArrayBuffer; end: "read" | "write" }[] {
+  const inst = kernel.getInstance()!;
+  const mem = kernel.getMemory()!;
+  const pipeSabs: { handle: number; sab: SharedArrayBuffer; end: "read" | "write" }[] = [];
+
+  try {
+    const getPipeOfds = inst.exports.kernel_get_pipe_ofds as
+      (ptr: number, len: number) => number;
+    const PIPE_BUF_PAGES = 1;
+    const pipeBufPage = mem.grow(PIPE_BUF_PAGES);
+    const pipeBufPtr = pipeBufPage * 65536;
+    const pipeBufSize = PIPE_BUF_PAGES * 65536;
+    const pipeCount = getPipeOfds(pipeBufPtr, pipeBufSize);
+
+    if (pipeCount > 0) {
+      const convertFn = inst.exports.kernel_convert_pipe_to_host as
+        (ofdIdx: number, newHandle: bigint) => number;
+      const pipeView = new DataView(mem.buffer, pipeBufPtr, pipeCount * 16);
+
+      // Group pipe OFDs by host_handle (same pipe has same |host_handle|)
+      const groups = new Map<bigint, { ofdIndex: number; isRead: boolean }[]>();
+      for (let i = 0; i < pipeCount; i++) {
+        const ofdIndex = pipeView.getUint32(i * 16, true);
+        const hostHandle = pipeView.getBigInt64(i * 16 + 4, true);
+        const isRead = pipeView.getUint32(i * 16 + 12, true) === 1;
+        // Already converted pipes have positive host_handle; skip them
+        if (hostHandle >= 0) continue;
+        const key = hostHandle < 0n ? -hostHandle : hostHandle;
+        const existing = groups.get(key);
+        if (existing) existing.push({ ofdIndex, isRead });
+        else groups.set(key, [{ ofdIndex, isRead }]);
+      }
+
+      // Create SharedPipeBuffer per pipe group, convert OFDs
+      let nextHandle = 1000; // Start pipe handles high to avoid conflicts
+      for (const ofds of groups.values()) {
+        const sharedPipe = SharedPipeBuffer.create();
+        const sab = sharedPipe.getBuffer();
+        for (const ofd of ofds) {
+          const handle = nextHandle++;
+          const end = ofd.isRead ? "read" as const : "write" as const;
+          kernel.registerSharedPipe(handle, sab, end);
+          convertFn(ofd.ofdIndex, BigInt(handle));
+          pipeSabs.push({ handle, sab, end });
+        }
+      }
+    }
+  } catch {
+    // If pipe enumeration fails, proceed without pipe conversion
+  }
+
+  return pipeSabs;
+}
+
+/**
+ * Serialize kernel fork state into a transferable ArrayBuffer.
+ */
+function serializeForkState(kernel: WasmPosixKernel): ArrayBuffer {
+  const inst = kernel.getInstance()!;
+  const mem = kernel.getMemory()!;
+  const FORK_BUF_PAGES = 16;
+  const sp = mem.grow(FORK_BUF_PAGES);
+  const bp = sp * 65536;
+  const bs = FORK_BUF_PAGES * 65536;
+  const getForkState = inst.exports.kernel_get_fork_state as
+    (ptr: number, len: number) => number;
+  const written = getForkState(bp, bs);
+  return written > 0
+    ? new Uint8Array(mem.buffer, bp, written).slice().buffer
+    : new ArrayBuffer(0);
+}
 
 export async function workerMain(
   port: MessagePort,
@@ -61,70 +140,10 @@ export async function workerMain(
         } satisfies WorkerToHostMessage);
       },
       onFork: (forkSab: SharedArrayBuffer): void => {
-        // Convert kernel-internal pipes to SharedPipeBuffers BEFORE serializing
-        // fork state. This ensures both parent and child share the same pipe
-        // buffers. We must do this before Atomics.wait because the parent can't
-        // process messages while blocked.
-        const inst = kernel.getInstance()!;
-        const mem = kernel.getMemory()!;
-        const pipeSabs: { handle: number; sab: SharedArrayBuffer; end: "read" | "write" }[] = [];
-        try {
-          const getPipeOfds = inst.exports.kernel_get_pipe_ofds as
-            (ptr: number, len: number) => number;
-          const PIPE_BUF_PAGES = 1;
-          const pipeBufPage = mem.grow(PIPE_BUF_PAGES);
-          const pipeBufPtr = pipeBufPage * 65536;
-          const pipeBufSize = PIPE_BUF_PAGES * 65536;
-          const pipeCount = getPipeOfds(pipeBufPtr, pipeBufSize);
-
-          if (pipeCount > 0) {
-            const convertFn = inst.exports.kernel_convert_pipe_to_host as
-              (ofdIdx: number, newHandle: bigint) => number;
-            const pipeView = new DataView(mem.buffer, pipeBufPtr, pipeCount * 16);
-
-            // Group pipe OFDs by host_handle (same pipe has same |host_handle|)
-            const groups = new Map<bigint, { ofdIndex: number; isRead: boolean }[]>();
-            for (let i = 0; i < pipeCount; i++) {
-              const ofdIndex = pipeView.getUint32(i * 16, true);
-              const hostHandle = pipeView.getBigInt64(i * 16 + 4, true);
-              const isRead = pipeView.getUint32(i * 16 + 12, true) === 1;
-              // Already converted pipes have positive host_handle; skip them
-              if (hostHandle >= 0) continue;
-              const key = hostHandle < 0n ? -hostHandle : hostHandle;
-              const existing = groups.get(key);
-              if (existing) existing.push({ ofdIndex, isRead });
-              else groups.set(key, [{ ofdIndex, isRead }]);
-            }
-
-            // Create SharedPipeBuffer per pipe group, convert OFDs
-            let nextHandle = 1000; // Start pipe handles high to avoid conflicts
-            for (const ofds of groups.values()) {
-              const sharedPipe = SharedPipeBuffer.create();
-              const sab = sharedPipe.getBuffer();
-              for (const ofd of ofds) {
-                const handle = nextHandle++;
-                const end = ofd.isRead ? "read" as const : "write" as const;
-                kernel.registerSharedPipe(handle, sab, end);
-                convertFn(ofd.ofdIndex, BigInt(handle));
-                pipeSabs.push({ handle, sab, end });
-              }
-            }
-          }
-        } catch {
-          // If pipe enumeration fails, proceed without pipe conversion
-        }
-
-        // Serialize fork state NOW (after pipe conversion), before Atomics.wait.
-        const FORK_BUF_PAGES = 16;
-        const sp = mem.grow(FORK_BUF_PAGES);
-        const bp = sp * 65536;
-        const bs = FORK_BUF_PAGES * 65536;
-        const getForkState = inst.exports.kernel_get_fork_state as
-          (ptr: number, len: number) => number;
-        const written = getForkState(bp, bs);
-        const forkState = written > 0
-          ? new Uint8Array(mem.buffer, bp, written).slice().buffer
-          : new ArrayBuffer(0);
+        // Non-asyncify fork path: kernel called host_fork directly.
+        // Convert pipes, serialize state, and send fork_request.
+        const pipeSabs = convertPipesToShared(kernel);
+        const forkState = serializeForkState(kernel);
         port.postMessage({
           type: "fork_request",
           pid: initData.pid,
@@ -157,6 +176,58 @@ export async function workerMain(
       kernel.registerWaitpidSab(initData.waitpidSab);
     }
 
+    // ── Fork child with asyncify resume ────────────────────────────
+    // If asyncifyResume is present, the child resumes from the parent's
+    // fork point via asyncify rewind. We skip kernel_init_from_fork
+    // because the memory snapshot already contains the parent's kernel state;
+    // kernel_set_child_pid fixes the PID afterward.
+    if (initData.asyncifyResume) {
+      // Kernel was freshly init'd by WasmPosixKernel constructor.
+      // We don't call kernel_init or kernel_init_from_fork — the memory
+      // snapshot restore in instantiateAndRunProgram handles everything.
+
+      port.postMessage({
+        type: "ready",
+        pid: initData.pid,
+      } satisfies WorkerToHostMessage);
+
+      if (initData.programBytes) {
+        (async () => {
+          try {
+            const exitCode = await instantiateAndRunProgram(
+              kernel,
+              initData.programBytes!,
+              {
+                forkHandler: createAsyncifyForkHandler(kernel, port, initData),
+                resumeFromFork: {
+                  memorySnapshot: initData.asyncifyResume!.memorySnapshot,
+                  asyncifyData: initData.asyncifyResume!.asyncifyData,
+                  asyncifyDataAddr: initData.asyncifyResume!.asyncifyDataAddr,
+                  childPid: initData.pid,
+                },
+              },
+            );
+            port.postMessage({
+              type: "exit",
+              pid: initData.pid,
+              status: exitCode,
+            } satisfies WorkerToHostMessage);
+          } catch (err) {
+            port.postMessage({
+              type: "error",
+              pid: initData.pid,
+              message: `Program failed: ${err instanceof Error ? err.message : String(err)}`,
+            } satisfies WorkerToHostMessage);
+          }
+        })();
+      }
+
+      // Set up message listener and return
+      setupMessageListener(port, kernel, instance, initData, createIO, callbacks);
+      return;
+    }
+
+    // ── Standard fork/init path ────────────────────────────────────
     if (initData.forkState) {
       // Fork init: write fork state to Wasm memory and call kernel_init_from_fork
       const memory = kernel.getMemory()!;
@@ -277,13 +348,16 @@ export async function workerMain(
 
     // If programBytes provided and not already handling fork+exec,
     // run the user program after signaling ready.
-    // This runs asynchronously so the message listener below can handle
-    // incoming messages (fork_request responses, signals, etc.) while
-    // the program executes.
     if (initData.programBytes && !forkChildHandledExec) {
       (async () => {
         try {
-          const exitCode = await instantiateAndRunProgram(kernel, initData.programBytes!);
+          const exitCode = await instantiateAndRunProgram(
+            kernel,
+            initData.programBytes!,
+            {
+              forkHandler: createAsyncifyForkHandler(kernel, port, initData),
+            },
+          );
           port.postMessage({
             type: "exit",
             pid: initData.pid,
@@ -300,171 +374,7 @@ export async function workerMain(
     }
 
     // Listen for messages from host
-    port.on("message", (msg: unknown) => {
-      const m = msg as HostToWorkerMessage;
-      switch (m.type) {
-        case "terminate":
-          port.postMessage({
-            type: "exit",
-            pid: initData.pid,
-            status: 0,
-          } satisfies WorkerToHostMessage);
-          break;
-        case "get_fork_state": {
-          const memory = kernel.getMemory()!;
-          const FORK_BUF_PAGES = 16; // 1MB buffer
-          const startPage = memory.grow(FORK_BUF_PAGES);
-          const bufPtr = startPage * 65536;
-          const bufSize = FORK_BUF_PAGES * 65536;
-
-          const kernelGetForkState = instance.exports.kernel_get_fork_state as
-            (ptr: number, len: number) => number;
-          const written = kernelGetForkState(bufPtr, bufSize);
-          if (written < 0) {
-            port.postMessage({
-              type: "error",
-              pid: initData.pid,
-              message: `kernel_get_fork_state failed: ${written}`,
-            } satisfies WorkerToHostMessage);
-            break;
-          }
-
-          const forkData = new Uint8Array(memory.buffer, bufPtr, written).slice();
-          port.postMessage(
-            { type: "fork_state", pid: initData.pid, data: forkData.buffer } satisfies WorkerToHostMessage,
-            [forkData.buffer],
-          );
-          break;
-        }
-        case "register_pipe": {
-          const msg = m as RegisterPipeMessage;
-          kernel.registerSharedPipe(msg.handle, msg.buffer, msg.end);
-          break;
-        }
-        case "convert_pipe": {
-          const msg = m as ConvertPipeMessage;
-          const convertFn = instance.exports.kernel_convert_pipe_to_host as
-            (ofdIdx: number, newHandle: bigint) => number;
-          const result = convertFn(msg.ofdIndex, BigInt(msg.newHandle));
-          if (result < 0) {
-            port.postMessage({
-              type: "error",
-              pid: initData.pid,
-              message: `kernel_convert_pipe_to_host failed: ${result}`,
-            } satisfies WorkerToHostMessage);
-          }
-          break;
-        }
-        case "deliver_signal": {
-          const deliverFn = instance.exports.kernel_deliver_signal as
-            (sig: number) => number;
-          deliverFn(m.signal);
-          break;
-        }
-        case "exec_reply": {
-          (async () => {
-            try {
-              const msg = m as ExecReplyMessage;
-              // 1. Get exec state from current kernel
-              const memory = kernel.getMemory()!;
-              const EXEC_BUF_PAGES = 16; // 1MB buffer
-              const startPage = memory.grow(EXEC_BUF_PAGES);
-              const bufPtr = startPage * 65536;
-              const bufSize = EXEC_BUF_PAGES * 65536;
-
-              const getExecState = instance.exports.kernel_get_exec_state as
-                (ptr: number, len: number) => number;
-              const written = getExecState(bufPtr, bufSize);
-              if (written < 0) {
-                port.postMessage({
-                  type: "error",
-                  pid: initData.pid,
-                  message: `kernel_get_exec_state failed: ${written}`,
-                } satisfies WorkerToHostMessage);
-                return;
-              }
-              const execState = new Uint8Array(memory.buffer, bufPtr, written).slice();
-
-              // 2. Create new kernel with new binary
-              const newKernel = new WasmPosixKernel(initData.kernelConfig, createIO(initData), callbacks);
-              await newKernel.init(msg.wasmBytes);
-              const newInstance = newKernel.getInstance()!;
-              const newMemory = newKernel.getMemory()!;
-
-              // 3. Write exec state to new kernel memory and init
-              const pages = Math.ceil(execState.byteLength / 65536) + 1;
-              const sp = newMemory.grow(pages);
-              const bp = sp * 65536;
-              new Uint8Array(newMemory.buffer, bp, execState.byteLength).set(execState);
-
-              const initFromExec = newInstance.exports.kernel_init_from_exec as
-                (ptr: number, len: number, pid: number) => number;
-              const result = initFromExec(bp, execState.byteLength, initData.pid);
-              if (result < 0) {
-                port.postMessage({
-                  type: "error",
-                  pid: initData.pid,
-                  message: `kernel_init_from_exec failed: ${result}`,
-                } satisfies WorkerToHostMessage);
-                return;
-              }
-
-              // 4. Transfer shared pipe registrations from old kernel
-              for (const [handle, entry] of kernel.getSharedPipes()) {
-                newKernel.registerSharedPipe(handle, entry.pipe.getBuffer(), entry.end);
-              }
-
-              // Transfer signal wake SAB to new kernel
-              if (initData.signalWakeSab) {
-                newKernel.registerSignalWakeSab(initData.signalWakeSab);
-              }
-
-              // Transfer lock table SAB to new kernel
-              if (initData.lockTableSab) {
-                newKernel.registerSharedLockTable(initData.lockTableSab);
-              }
-
-              // Transfer fork SAB to new kernel
-              if (initData.forkSab) {
-                newKernel.registerForkSab(initData.forkSab);
-              }
-
-              // Transfer waitpid SAB to new kernel
-              if (initData.waitpidSab) {
-                newKernel.registerWaitpidSab(initData.waitpidSab);
-              }
-
-              // 5. Replace references
-              kernel = newKernel;
-              instance = newInstance;
-
-              // 6. Notify host
-              port.postMessage({
-                type: "exec_complete",
-                pid: initData.pid,
-              } satisfies WorkerToHostMessage);
-
-              // 7. If exec_reply includes programBytes, run the new program
-              if (msg.programBytes) {
-                const exitCode = await instantiateAndRunProgram(kernel, msg.programBytes);
-                port.postMessage({
-                  type: "exit",
-                  pid: initData.pid,
-                  status: exitCode,
-                } satisfies WorkerToHostMessage);
-              }
-            } catch (err) {
-              port.postMessage({
-                type: "error",
-                pid: initData.pid,
-                message: `exec failed: ${err instanceof Error ? err.message : String(err)}`,
-              } satisfies WorkerToHostMessage);
-            }
-          })();
-          break;
-        }
-      }
-    });
+    setupMessageListener(port, kernel, instance, initData, createIO, callbacks);
   } catch (err) {
     port.postMessage({
       type: "error",
@@ -472,4 +382,243 @@ export async function workerMain(
       message: err instanceof Error ? err.message : String(err),
     } satisfies WorkerToHostMessage);
   }
+}
+
+/**
+ * Create an AsyncifyForkHandler that does pipe conversion, takes a memory
+ * snapshot, serializes fork state, sends fork_request, and blocks on
+ * Atomics.wait until the host signals back with the child PID.
+ */
+function createAsyncifyForkHandler(
+  kernel: WasmPosixKernel,
+  port: MessagePort,
+  initData: WorkerInitMessage,
+): AsyncifyForkHandler {
+  return {
+    handleFork(
+      asyncifyData: ArrayBuffer,
+      asyncifyDataAddr: number,
+      memory: WebAssembly.Memory,
+    ): number {
+      // 1. Convert pipes to SharedPipeBuffers (modifies kernel state in memory)
+      const pipeSabs = convertPipesToShared(kernel);
+
+      // 2. Take memory snapshot AFTER pipe conversion
+      const memorySnapshot = new Uint8Array(memory.buffer).slice().buffer;
+
+      // 3. Serialize kernel fork state (for non-asyncify metadata)
+      const forkState = serializeForkState(kernel);
+
+      // 4. Use the worker's forkSab to synchronize with host
+      const forkSab = initData.forkSab!;
+      const view = new Int32Array(forkSab);
+      Atomics.store(view, 0, 0); // flag = waiting
+      Atomics.store(view, 1, 0); // result = 0
+
+      // 5. Send fork_request with all data
+      port.postMessage({
+        type: "fork_request",
+        pid: initData.pid,
+        forkSab,
+        forkState,
+        pipeSabs: pipeSabs.map(p => ({ handle: p.handle, sab: p.sab, end: p.end })),
+        asyncifyData: {
+          memorySnapshot,
+          asyncifyData: asyncifyData.slice(0),
+          asyncifyDataAddr,
+        },
+      } satisfies WorkerToHostMessage,
+      [forkState, memorySnapshot]);
+
+      // 6. Block until host creates the child and signals back
+      Atomics.wait(view, 0, 0);
+      const result = Atomics.load(view, 1);
+
+      // 7. Return child PID (or negative errno)
+      return result;
+    },
+  };
+}
+
+/**
+ * Set up the message listener for host→worker messages.
+ * Extracted as a function so both the asyncify and standard paths can use it.
+ */
+function setupMessageListener(
+  port: MessagePort,
+  kernel: WasmPosixKernel,
+  instance: WebAssembly.Instance,
+  initData: WorkerInitMessage,
+  createIO: CreateIOFn,
+  callbacks: KernelCallbacks,
+): void {
+  port.on("message", (msg: unknown) => {
+    const m = msg as HostToWorkerMessage;
+    switch (m.type) {
+      case "terminate":
+        port.postMessage({
+          type: "exit",
+          pid: initData.pid,
+          status: 0,
+        } satisfies WorkerToHostMessage);
+        break;
+      case "get_fork_state": {
+        const memory = kernel.getMemory()!;
+        const FORK_BUF_PAGES = 16; // 1MB buffer
+        const startPage = memory.grow(FORK_BUF_PAGES);
+        const bufPtr = startPage * 65536;
+        const bufSize = FORK_BUF_PAGES * 65536;
+
+        const kernelGetForkState = instance.exports.kernel_get_fork_state as
+          (ptr: number, len: number) => number;
+        const written = kernelGetForkState(bufPtr, bufSize);
+        if (written < 0) {
+          port.postMessage({
+            type: "error",
+            pid: initData.pid,
+            message: `kernel_get_fork_state failed: ${written}`,
+          } satisfies WorkerToHostMessage);
+          break;
+        }
+
+        const forkData = new Uint8Array(memory.buffer, bufPtr, written).slice();
+        port.postMessage(
+          { type: "fork_state", pid: initData.pid, data: forkData.buffer } satisfies WorkerToHostMessage,
+          [forkData.buffer],
+        );
+        break;
+      }
+      case "register_pipe": {
+        const msg = m as RegisterPipeMessage;
+        kernel.registerSharedPipe(msg.handle, msg.buffer, msg.end);
+        break;
+      }
+      case "convert_pipe": {
+        const msg = m as ConvertPipeMessage;
+        const convertFn = instance.exports.kernel_convert_pipe_to_host as
+          (ofdIdx: number, newHandle: bigint) => number;
+        const result = convertFn(msg.ofdIndex, BigInt(msg.newHandle));
+        if (result < 0) {
+          port.postMessage({
+            type: "error",
+            pid: initData.pid,
+            message: `kernel_convert_pipe_to_host failed: ${result}`,
+          } satisfies WorkerToHostMessage);
+        }
+        break;
+      }
+      case "deliver_signal": {
+        const deliverFn = instance.exports.kernel_deliver_signal as
+          (sig: number) => number;
+        deliverFn(m.signal);
+        break;
+      }
+      case "exec_reply": {
+        (async () => {
+          try {
+            const msg = m as ExecReplyMessage;
+            // 1. Get exec state from current kernel
+            const memory = kernel.getMemory()!;
+            const EXEC_BUF_PAGES = 16; // 1MB buffer
+            const startPage = memory.grow(EXEC_BUF_PAGES);
+            const bufPtr = startPage * 65536;
+            const bufSize = EXEC_BUF_PAGES * 65536;
+
+            const getExecState = instance.exports.kernel_get_exec_state as
+              (ptr: number, len: number) => number;
+            const written = getExecState(bufPtr, bufSize);
+            if (written < 0) {
+              port.postMessage({
+                type: "error",
+                pid: initData.pid,
+                message: `kernel_get_exec_state failed: ${written}`,
+              } satisfies WorkerToHostMessage);
+              return;
+            }
+            const execState = new Uint8Array(memory.buffer, bufPtr, written).slice();
+
+            // 2. Create new kernel with new binary
+            const newKernel = new WasmPosixKernel(initData.kernelConfig, createIO(initData), callbacks);
+            await newKernel.init(msg.wasmBytes);
+            const newInstance = newKernel.getInstance()!;
+            const newMemory = newKernel.getMemory()!;
+
+            // 3. Write exec state to new kernel memory and init
+            const pages = Math.ceil(execState.byteLength / 65536) + 1;
+            const sp = newMemory.grow(pages);
+            const bp = sp * 65536;
+            new Uint8Array(newMemory.buffer, bp, execState.byteLength).set(execState);
+
+            const initFromExec = newInstance.exports.kernel_init_from_exec as
+              (ptr: number, len: number, pid: number) => number;
+            const result = initFromExec(bp, execState.byteLength, initData.pid);
+            if (result < 0) {
+              port.postMessage({
+                type: "error",
+                pid: initData.pid,
+                message: `kernel_init_from_exec failed: ${result}`,
+              } satisfies WorkerToHostMessage);
+              return;
+            }
+
+            // 4. Transfer shared pipe registrations from old kernel
+            for (const [handle, entry] of kernel.getSharedPipes()) {
+              newKernel.registerSharedPipe(handle, entry.pipe.getBuffer(), entry.end);
+            }
+
+            // Transfer signal wake SAB to new kernel
+            if (initData.signalWakeSab) {
+              newKernel.registerSignalWakeSab(initData.signalWakeSab);
+            }
+
+            // Transfer lock table SAB to new kernel
+            if (initData.lockTableSab) {
+              newKernel.registerSharedLockTable(initData.lockTableSab);
+            }
+
+            // Transfer fork SAB to new kernel
+            if (initData.forkSab) {
+              newKernel.registerForkSab(initData.forkSab);
+            }
+
+            // Transfer waitpid SAB to new kernel
+            if (initData.waitpidSab) {
+              newKernel.registerWaitpidSab(initData.waitpidSab);
+            }
+
+            // 5. Replace references
+            kernel = newKernel;
+            instance = newInstance;
+
+            // 6. Notify host
+            port.postMessage({
+              type: "exec_complete",
+              pid: initData.pid,
+            } satisfies WorkerToHostMessage);
+
+            // 7. If exec_reply includes programBytes, run the new program
+            if (msg.programBytes) {
+              const exitCode = await instantiateAndRunProgram(
+                kernel,
+                msg.programBytes,
+                { forkHandler: createAsyncifyForkHandler(kernel, port, initData) },
+              );
+              port.postMessage({
+                type: "exit",
+                pid: initData.pid,
+                status: exitCode,
+              } satisfies WorkerToHostMessage);
+            }
+          } catch (err) {
+            port.postMessage({
+              type: "error",
+              pid: initData.pid,
+              message: `exec failed: ${err instanceof Error ? err.message : String(err)}`,
+            } satisfies WorkerToHostMessage);
+          }
+        })();
+        break;
+      }
+    }
+  });
 }

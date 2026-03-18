@@ -49,6 +49,12 @@ export interface WorkerInitMessage {
   waitpidSab?: SharedArrayBuffer;
   programBytes?: ArrayBuffer;
   mounts?: SerializedMountConfig[];
+  /** Asyncify fork resume data — if present, child resumes from fork point. */
+  asyncifyResume?: {
+    memorySnapshot: ArrayBuffer;
+    asyncifyData: ArrayBuffer;
+    asyncifyDataAddr: number;
+  };
 }
 
 export interface WorkerTerminateMessage {
@@ -122,6 +128,12 @@ export interface ForkRequestMessage {
   forkSab: SharedArrayBuffer;
   forkState: ArrayBuffer;
   pipeSabs?: { handle: number; sab: SharedArrayBuffer; end: "read" | "write" }[];
+  /** Asyncify fork data — enables child to resume from fork point. */
+  asyncifyData?: {
+    memorySnapshot: ArrayBuffer;
+    asyncifyData: ArrayBuffer;
+    asyncifyDataAddr: number;
+  };
 }
 
 export interface WaitpidRequestMessage {
