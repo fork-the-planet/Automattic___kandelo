@@ -17,6 +17,7 @@ export interface ProcessInfo {
   exitStatus?: number;
   alarmTimer?: ReturnType<typeof setTimeout>;
   signalWakeSab?: SharedArrayBuffer;
+  forkSab?: SharedArrayBuffer;
 }
 
 export interface ProcessManagerConfig {
@@ -54,6 +55,7 @@ export class ProcessManager {
     const ppid = options?.ppid ?? 0;
 
     const signalWakeSab = new SharedArrayBuffer(8);
+    const forkSab = new SharedArrayBuffer(8);
 
     const initData: WorkerInitMessage = {
       type: "init",
@@ -65,6 +67,7 @@ export class ProcessManager {
       cwd: options?.cwd,
       signalWakeSab,
       lockTableSab: this.sharedLockTable.getBuffer(),
+      forkSab,
     };
 
     const worker = this.config.workerAdapter.createWorker(initData);
@@ -77,6 +80,7 @@ export class ProcessManager {
       worker,
       state: "starting",
       signalWakeSab,
+      forkSab,
     };
 
     this.processes.set(pid, info);
@@ -167,6 +171,10 @@ export class ProcessManager {
             }
             break;
           }
+          case "fork_request": {
+            this.handleForkRequest(m.pid, (m as import("./worker-protocol").ForkRequestMessage).forkSab);
+            break;
+          }
         }
       });
 
@@ -209,6 +217,7 @@ export class ProcessManager {
     const childPid = this.nextPid++;
 
     const signalWakeSab = new SharedArrayBuffer(8);
+    const childForkSab = new SharedArrayBuffer(8);
 
     // Create child worker with fork state
     const initData: WorkerInitMessage = {
@@ -220,6 +229,7 @@ export class ProcessManager {
       forkState,
       signalWakeSab,
       lockTableSab: this.sharedLockTable.getBuffer(),
+      forkSab: childForkSab,
     };
 
     const worker = this.config.workerAdapter.createWorker(initData);
@@ -231,6 +241,7 @@ export class ProcessManager {
       worker,
       state: "starting",
       signalWakeSab,
+      forkSab: childForkSab,
     };
     this.processes.set(childPid, childInfo);
 
@@ -360,6 +371,10 @@ export class ProcessManager {
                 }, m.seconds * 1000);
               }
             }
+            break;
+          }
+          case "fork_request": {
+            this.handleForkRequest(m.pid, (m as import("./worker-protocol").ForkRequestMessage).forkSab);
             break;
           }
         }
@@ -545,6 +560,25 @@ export class ProcessManager {
       Atomics.store(view, 0, 1);
       Atomics.notify(view, 0);
     }
+  }
+
+  /**
+   * Handle a guest-initiated fork request. Forks the parent process
+   * and signals the result back via the parent's forkSab.
+   */
+  private handleForkRequest(parentPid: number, forkSab: SharedArrayBuffer): void {
+    const view = new Int32Array(forkSab);
+    this.fork(parentPid).then((childPid) => {
+      // Signal parent with child PID
+      Atomics.store(view, 1, childPid);
+      Atomics.store(view, 0, 1);
+      Atomics.notify(view, 0);
+    }).catch(() => {
+      // Signal parent with error
+      Atomics.store(view, 1, -12); // -ENOMEM
+      Atomics.store(view, 0, 1);
+      Atomics.notify(view, 0);
+    });
   }
 
   async terminate(pid: number): Promise<void> {

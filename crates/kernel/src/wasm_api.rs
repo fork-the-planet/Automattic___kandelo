@@ -69,6 +69,7 @@ unsafe extern "C" {
         len_lo: u32, len_hi: u32,
         result_ptr: *mut u8,
     ) -> i32;
+    fn host_fork() -> i32;
 }
 
 // ---------------------------------------------------------------------------
@@ -475,6 +476,10 @@ impl HostIO for WasmHostIO {
             )
         };
         i32_to_result(result)
+    }
+
+    fn host_fork(&self) -> i32 {
+        unsafe { host_fork() }
     }
 }
 
@@ -3161,6 +3166,159 @@ pub extern "C" fn kernel_execve(path_ptr: *const u8, path_len: u32) -> i32 {
     };
     deliver_pending_signals(proc, &mut host);
     result
+}
+
+// ---------------------------------------------------------------------------
+// fork (guest-initiated)
+// ---------------------------------------------------------------------------
+
+/// Fork the current process. Returns child PID in parent, 0 in child, negative errno on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_fork() -> i32 {
+    let proc = unsafe { get_process() };
+    let host = WasmHostIO;
+    match syscalls::sys_fork(proc, &host) {
+        Ok(pid) => pid as i32,
+        Err(e) => -(e as i32),
+    }
+}
+
+/// Returns 1 if this process is a fork child (should exec on startup), 0 otherwise.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_is_fork_child() -> i32 {
+    let proc = unsafe { get_process() };
+    if proc.fork_child { 1 } else { 0 }
+}
+
+/// Read the saved fork exec path into buf. Returns bytes written, or negative errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_get_fork_exec_path(buf_ptr: *mut u8, buf_len: u32) -> i32 {
+    let proc = unsafe { get_process() };
+    match &proc.fork_exec_path {
+        Some(path) => {
+            let len = path.len().min(buf_len as usize);
+            let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, len) };
+            buf.copy_from_slice(&path[..len]);
+            len as i32
+        }
+        None => 0,
+    }
+}
+
+/// Read fork exec argv[idx] into buf. Returns bytes written, 0 if index out of range.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_get_fork_exec_argv(idx: u32, buf_ptr: *mut u8, buf_len: u32) -> i32 {
+    let proc = unsafe { get_process() };
+    match &proc.fork_exec_argv {
+        Some(argv) => {
+            if (idx as usize) < argv.len() {
+                let arg = &argv[idx as usize];
+                let len = arg.len().min(buf_len as usize);
+                let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, len) };
+                buf.copy_from_slice(&arg[..len]);
+                len as i32
+            } else {
+                0
+            }
+        }
+        None => 0,
+    }
+}
+
+/// Return the number of fork exec argv entries, or 0 if none.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_get_fork_exec_argc() -> i32 {
+    let proc = unsafe { get_process() };
+    match &proc.fork_exec_argv {
+        Some(argv) => argv.len() as i32,
+        None => 0,
+    }
+}
+
+/// Save exec path and argv to be used after fork in the child.
+/// argv is passed as a pointer to an array of (ptr, len) pairs.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_set_fork_exec(
+    path_ptr: *const u8, path_len: u32,
+    argv_ptrs: *const u32, argc: u32,
+) -> i32 {
+    let proc = unsafe { get_process() };
+    let path = unsafe { slice::from_raw_parts(path_ptr, path_len as usize) };
+    proc.fork_exec_path = Some(path.to_vec());
+
+    let mut argv = alloc::vec::Vec::new();
+    for i in 0..argc {
+        let entry_ptr = unsafe { argv_ptrs.add((i * 2) as usize) };
+        let arg_ptr = unsafe { *entry_ptr } as *const u8;
+        let arg_len = unsafe { *entry_ptr.add(1) } as usize;
+        let arg = unsafe { slice::from_raw_parts(arg_ptr, arg_len) };
+        argv.push(arg.to_vec());
+    }
+    proc.fork_exec_argv = Some(argv);
+    0
+}
+
+/// Add an fd action to apply before exec in fork child.
+/// action_type: 0=DUP2(fd1→fd2), 1=CLOSE(fd1), 2=OPEN(fd1, path at fd2 interpreted as ptr+len)
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_set_fork_fd_action(action_type: u32, fd1: i32, fd2: i32) -> i32 {
+    let proc = unsafe { get_process() };
+    use crate::process::FdAction;
+    match action_type {
+        0 => proc.fork_fd_actions.push(FdAction::Dup2 { old_fd: fd1, new_fd: fd2 }),
+        1 => proc.fork_fd_actions.push(FdAction::Close { fd: fd1 }),
+        _ => return -(wasm_posix_shared::Errno::EINVAL as i32),
+    }
+    0
+}
+
+/// Apply saved fork fd actions (dup2, close). Returns 0 on success, negative errno on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_apply_fork_fd_actions() -> i32 {
+    let proc = unsafe { get_process() };
+    let mut host = WasmHostIO;
+    let actions: alloc::vec::Vec<_> = proc.fork_fd_actions.drain(..).collect();
+    for action in actions {
+        match action {
+            crate::process::FdAction::Dup2 { old_fd, new_fd } => {
+                if let Err(e) = syscalls::sys_dup2(proc, &mut host, old_fd, new_fd) {
+                    return -(e as i32);
+                }
+            }
+            crate::process::FdAction::Close { fd } => {
+                if let Err(e) = syscalls::sys_close(proc, &mut host, fd) {
+                    return -(e as i32);
+                }
+            }
+            crate::process::FdAction::Open { fd, ref path, flags, mode } => {
+                match syscalls::sys_open(proc, &mut host, &path, flags as u32, mode as u32) {
+                    Ok(opened_fd) => {
+                        if opened_fd != fd {
+                            if let Err(e) = syscalls::sys_dup2(proc, &mut host, opened_fd, fd) {
+                                return -(e as i32);
+                            }
+                            let _ = syscalls::sys_close(proc, &mut host, opened_fd);
+                        }
+                    }
+                    Err(e) => return -(e as i32),
+                }
+            }
+        }
+    }
+    // Clear fork_child flag after applying actions
+    proc.fork_child = false;
+    0
+}
+
+/// Clear saved fork exec state (path, argv, fd_actions).
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_clear_fork_exec() -> i32 {
+    let proc = unsafe { get_process() };
+    proc.fork_exec_path = None;
+    proc.fork_exec_argv = None;
+    proc.fork_fd_actions.clear();
+    proc.fork_child = false;
+    0
 }
 
 // ---------------------------------------------------------------------------

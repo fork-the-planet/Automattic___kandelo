@@ -1615,6 +1615,20 @@ pub fn sys_raise(proc: &mut Process, host: &mut dyn HostIO, sig: u32) -> Result<
     sys_kill(proc, host, proc.pid as i32, sig)
 }
 
+/// Fork the current process. Delegates to host for worker creation.
+/// Returns child PID in parent (> 0), 0 in child, or error.
+pub fn sys_fork(_proc: &mut Process, host: &dyn HostIO) -> Result<u32, Errno> {
+    let result = host.host_fork();
+    if result < 0 {
+        match Errno::from_u32((-result) as u32) {
+            Some(e) => Err(e),
+            None => Err(Errno::EIO),
+        }
+    } else {
+        Ok(result as u32)
+    }
+}
+
 /// Execute a new program. Delegates to host for binary loading.
 /// On success, the kernel process will be replaced (POSIX: exec doesn't return on success).
 /// On failure, returns the error.
@@ -4204,6 +4218,9 @@ mod tests {
                 result_buf[0..4].copy_from_slice(&2u32.to_le_bytes()); // F_UNLCK
             }
             Ok(())
+        }
+        fn host_fork(&self) -> i32 {
+            -(Errno::ENOSYS as i32)
         }
     }
 
@@ -7130,6 +7147,23 @@ mod tests {
     }
 
     #[test]
+    fn test_fork_returns_enosys_with_mock() {
+        let mut proc = Process::new(1);
+        let host = MockHostIO::new();
+        let result = sys_fork(&mut proc, &host);
+        assert_eq!(result, Err(Errno::ENOSYS));
+    }
+
+    #[test]
+    fn test_fork_child_fields_default_to_false() {
+        let proc = Process::new(1);
+        assert!(!proc.fork_child);
+        assert!(proc.fork_exec_path.is_none());
+        assert!(proc.fork_exec_argv.is_none());
+        assert!(proc.fork_fd_actions.is_empty());
+    }
+
+    #[test]
     fn test_execve_empty_path_returns_enoent() {
         let mut proc = Process::new(1);
         let mut host = MockHostIO::new();
@@ -7403,6 +7437,9 @@ mod tests {
         }
         fn host_fcntl_lock(&mut self, _path: &[u8], _pid: u32, _cmd: u32, _lock_type: u32, _start: i64, _len: i64, _result_buf: &mut [u8]) -> Result<(), Errno> {
             Ok(())
+        }
+        fn host_fork(&self) -> i32 {
+            -(Errno::ENOSYS as i32)
         }
     }
 
@@ -7681,6 +7718,7 @@ mod tests {
             fn host_net_close(&mut self, _h: i32) -> Result<(), Errno> { Ok(()) }
             fn host_getaddrinfo(&mut self, _n: &[u8], _r: &mut [u8]) -> Result<usize, Errno> { Err(Errno::ENOENT) }
             fn host_fcntl_lock(&mut self, _p: &[u8], _pid: u32, _cmd: u32, _lt: u32, _s: i64, _l: i64, _r: &mut [u8]) -> Result<(), Errno> { Ok(()) }
+            fn host_fork(&self) -> i32 { -(Errno::ENOSYS as i32) }
         }
 
         let mut proc = Process::new(1);

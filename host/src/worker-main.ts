@@ -49,6 +49,13 @@ export async function workerMain(
         } satisfies WorkerToHostMessage);
         return 0;
       },
+      onFork: (forkSab: SharedArrayBuffer): void => {
+        port.postMessage({
+          type: "fork_request",
+          pid: initData.pid,
+          forkSab,
+        } satisfies WorkerToHostMessage);
+      },
     };
 
     let kernel = new WasmPosixKernel(initData.kernelConfig, createIO(initData), callbacks);
@@ -62,6 +69,10 @@ export async function workerMain(
 
     if (initData.lockTableSab) {
       kernel.registerSharedLockTable(initData.lockTableSab);
+    }
+
+    if (initData.forkSab) {
+      kernel.registerForkSab(initData.forkSab);
     }
 
     if (initData.forkState) {

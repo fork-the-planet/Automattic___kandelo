@@ -1780,8 +1780,10 @@ static long __do_syscall(long n, long a1, long a2, long a3,
 
     case SYS_FORK:
     case SYS_VFORK:
+        return (long)kernel_fork();
+
     case SYS_CLONE:
-        return ENOSYS_NEG; /* host-initiated only */
+        return ENOSYS_NEG; /* not supported in Wasm */
 
     /* execve — delegate to kernel */
     case SYS_EXECVE: {

@@ -45,6 +45,7 @@ export interface WorkerInitMessage {
   forkState?: ArrayBuffer;
   signalWakeSab?: SharedArrayBuffer;
   lockTableSab?: SharedArrayBuffer;
+  forkSab?: SharedArrayBuffer;
   mounts?: SerializedMountConfig[];
 }
 
@@ -62,7 +63,8 @@ export type WorkerToHostMessage =
   | KillRequestMessage
   | ExecRequestMessage
   | ExecCompleteMessage
-  | AlarmSetMessage;
+  | AlarmSetMessage
+  | ForkRequestMessage;
 
 export interface WorkerReadyMessage {
   type: "ready";
@@ -109,6 +111,12 @@ export interface AlarmSetMessage {
   type: "alarm_set";
   pid: number;
   seconds: number;
+}
+
+export interface ForkRequestMessage {
+  type: "fork_request";
+  pid: number;
+  forkSab: SharedArrayBuffer;
 }
 
 export interface ExecReplyMessage {

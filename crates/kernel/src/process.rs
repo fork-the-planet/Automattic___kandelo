@@ -69,6 +69,9 @@ pub trait HostIO {
         &mut self, path: &[u8], pid: u32, cmd: u32, lock_type: u32,
         start: i64, len: i64, result_buf: &mut [u8],
     ) -> Result<(), Errno>;
+    /// Request the host to fork the current process.
+    /// Returns child PID (>= 0) on success, or negative errno on error.
+    fn host_fork(&self) -> i32;
 }
 
 /// Process lifecycle state.
@@ -76,6 +79,14 @@ pub trait HostIO {
 pub enum ProcessState {
     Running,
     Exited,
+}
+
+/// File descriptor action to apply in a fork child before exec.
+#[derive(Debug, Clone)]
+pub enum FdAction {
+    Dup2 { old_fd: i32, new_fd: i32 },
+    Close { fd: i32 },
+    Open { fd: i32, path: Vec<u8>, flags: i32, mode: i32 },
 }
 
 /// Per-process kernel state: file descriptor table, OFD table, pipes, cwd, and directory streams.
@@ -107,6 +118,14 @@ pub struct Process {
     pub alarm_deadline_ns: u64,
     pub alarm_interval_ns: u64,
     pub thread_name: [u8; 16],
+    /// True if this process is a fork child that should exec on startup.
+    pub fork_child: bool,
+    /// Path to exec after fork (set by posix_spawn before forking).
+    pub fork_exec_path: Option<Vec<u8>>,
+    /// Argv for exec after fork.
+    pub fork_exec_argv: Option<Vec<Vec<u8>>>,
+    /// FD actions to apply before exec in fork child.
+    pub fork_fd_actions: Vec<FdAction>,
 }
 
 impl Process {
@@ -159,6 +178,10 @@ impl Process {
             alarm_deadline_ns: 0,
             alarm_interval_ns: 0,
             thread_name: [0u8; 16],
+            fork_child: false,
+            fork_exec_path: None,
+            fork_exec_argv: None,
+            fork_fd_actions: Vec::new(),
         }
     }
 }

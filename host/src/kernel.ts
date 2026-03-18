@@ -27,6 +27,7 @@ export interface KernelCallbacks {
   onKill?: (pid: number, signal: number) => number;
   onExec?: (path: string) => number;
   onAlarm?: (seconds: number) => number;
+  onFork?: (forkSab: SharedArrayBuffer) => void;
   onStdout?: (data: Uint8Array) => void;
   onStderr?: (data: Uint8Array) => void;
   /** Read up to maxLen bytes from stdin. Return a Uint8Array with available data, or empty/null for EOF. */
@@ -43,6 +44,7 @@ export class WasmPosixKernel {
   private signalWakeSab: SharedArrayBuffer | null = null;
   private sharedLockTable: SharedLockTable | null = null;
   private programFuncTable: WebAssembly.Table | null = null;
+  private forkSab: SharedArrayBuffer | null = null;
 
   /**
    * Set the user program's indirect function table so signal handlers
@@ -77,6 +79,10 @@ export class WasmPosixKernel {
 
   registerSharedLockTable(sab: SharedArrayBuffer): void {
     this.sharedLockTable = SharedLockTable.fromBuffer(sab);
+  }
+
+  registerForkSab(sab: SharedArrayBuffer): void {
+    this.forkSab = sab;
   }
 
   /**
@@ -337,6 +343,9 @@ export class WasmPosixKernel {
           resultPtr: number,
         ): number => {
           return this.hostFcntlLock(pathPtr, pathLen, pid, cmd, lockType, startLo, startHi, lenLo, lenHi, resultPtr);
+        },
+        host_fork: (): number => {
+          return this.hostFork();
         },
       },
     };
@@ -1709,5 +1718,39 @@ export class WasmPosixKernel {
     } catch {
       return -5; // -EIO
     }
+  }
+
+  /**
+   * host_fork() -> i32
+   * Guest-initiated fork. Posts fork_request to host, blocks on Atomics.wait
+   * until host signals back with child PID via forkSab.
+   *
+   * forkSab layout: Int32Array(2) on SharedArrayBuffer(8)
+   *   [0] = flag (0 = waiting, 1 = done)
+   *   [1] = result (child PID or negative errno)
+   */
+  private hostFork(): number {
+    if (!this.forkSab) {
+      return -38; // -ENOSYS
+    }
+
+    const view = new Int32Array(this.forkSab);
+
+    // Reset flag
+    Atomics.store(view, 0, 0);
+    Atomics.store(view, 1, 0);
+
+    // Notify host via callback
+    if (this.callbacks.onFork) {
+      this.callbacks.onFork(this.forkSab);
+    } else {
+      return -38; // -ENOSYS — no fork handler registered
+    }
+
+    // Block until host signals completion
+    Atomics.wait(view, 0, 0);
+
+    // Read result (child PID or negative errno)
+    return Atomics.load(view, 1);
   }
 }

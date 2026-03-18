@@ -504,6 +504,10 @@ pub fn deserialize_fork_state(buf: &[u8], child_pid: u32) -> Result<Process, Err
         alarm_deadline_ns: 0,
         alarm_interval_ns: 0,
         thread_name: [0u8; 16],
+        fork_child: true,
+        fork_exec_path: None,
+        fork_exec_argv: None,
+        fork_fd_actions: Vec::new(),
     })
 }
 
@@ -820,6 +824,10 @@ pub fn deserialize_exec_state(buf: &[u8], pid: u32) -> Result<Process, Errno> {
         alarm_deadline_ns: 0,
         alarm_interval_ns: 0,
         thread_name: [0u8; 16],
+        fork_child: false,
+        fork_exec_path: None,
+        fork_exec_argv: None,
+        fork_fd_actions: Vec::new(),
     })
 }
 

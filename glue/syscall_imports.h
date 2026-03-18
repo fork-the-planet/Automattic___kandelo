@@ -423,6 +423,34 @@ _Noreturn void kernel_exit(int32_t status);
 KERNEL_IMPORT(kernel_execve)
 int32_t kernel_execve(const uint8_t *path_ptr, uint32_t path_len);
 
+KERNEL_IMPORT(kernel_fork)
+int32_t kernel_fork(void);
+
+KERNEL_IMPORT(kernel_is_fork_child)
+int32_t kernel_is_fork_child(void);
+
+KERNEL_IMPORT(kernel_get_fork_exec_path)
+int32_t kernel_get_fork_exec_path(uint8_t *buf_ptr, uint32_t buf_len);
+
+KERNEL_IMPORT(kernel_get_fork_exec_argv)
+int32_t kernel_get_fork_exec_argv(uint32_t idx, uint8_t *buf_ptr, uint32_t buf_len);
+
+KERNEL_IMPORT(kernel_get_fork_exec_argc)
+int32_t kernel_get_fork_exec_argc(void);
+
+KERNEL_IMPORT(kernel_set_fork_exec)
+int32_t kernel_set_fork_exec(const uint8_t *path_ptr, uint32_t path_len,
+                              const uint32_t *argv_ptrs, uint32_t argc);
+
+KERNEL_IMPORT(kernel_set_fork_fd_action)
+int32_t kernel_set_fork_fd_action(uint32_t action_type, int32_t fd1, int32_t fd2);
+
+KERNEL_IMPORT(kernel_apply_fork_fd_actions)
+int32_t kernel_apply_fork_fd_actions(void);
+
+KERNEL_IMPORT(kernel_clear_fork_exec)
+int32_t kernel_clear_fork_exec(void);
+
 /* ------------------------------------------------------------------ */
 /* Resource limits                                                     */
 /* ------------------------------------------------------------------ */
