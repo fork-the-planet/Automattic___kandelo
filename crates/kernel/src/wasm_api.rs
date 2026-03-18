@@ -641,6 +641,33 @@ pub extern "C" fn kernel_convert_pipe_to_host(ofd_idx: u32, new_host_handle: i64
     0
 }
 
+/// Enumerate pipe OFDs. Writes (ofd_index: u32, host_handle: i64, is_read: u32) tuples to buf.
+/// Returns number of pipe OFDs found.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_get_pipe_ofds(buf_ptr: *mut u8, buf_len: u32) -> i32 {
+    let proc = unsafe { get_process() };
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, buf_len as usize) };
+    let entry_size = 4 + 8 + 4; // ofd_index(u32) + host_handle(i64) + is_read(u32)
+    let max_entries = buf.len() / entry_size;
+    let mut count = 0usize;
+
+    for (idx, ofd) in proc.ofd_table.iter() {
+        if ofd.file_type == FileType::Pipe && count < max_entries {
+            let off = count * entry_size;
+            buf[off..off + 4].copy_from_slice(&(idx as u32).to_le_bytes());
+            buf[off + 4..off + 12].copy_from_slice(&ofd.host_handle.to_le_bytes());
+            // Pipes with offset 0 (or flag-based) are write ends; kernel uses
+            // positive host_handle index parity to distinguish read/write.
+            // Since pipe pairs share the same |host_handle|, we check status_flags
+            // for O_WRONLY (bit 0) to determine end.
+            let is_read = if ofd.status_flags & 1 == 0 { 1u32 } else { 0u32 };
+            buf[off + 12..off + 16].copy_from_slice(&is_read.to_le_bytes());
+            count += 1;
+        }
+    }
+    count as i32
+}
+
 /// Open a file. Returns fd (>= 0) on success, or negative errno on error.
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_open(
@@ -1919,6 +1946,13 @@ pub extern "C" fn kernel_environ_get(index: u32, buf_ptr: *mut u8, buf_len: u32)
 // ---------------------------------------------------------------------------
 // Argv support — host pushes args, program reads them at startup
 // ---------------------------------------------------------------------------
+
+/// Clear all argv entries.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_clear_argv() {
+    let proc = unsafe { get_process() };
+    proc.argv.clear();
+}
 
 /// Push an argument string. Called by host before _start.
 #[unsafe(no_mangle)]

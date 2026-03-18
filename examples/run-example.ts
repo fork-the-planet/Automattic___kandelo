@@ -11,10 +11,41 @@
  *   npx tsx examples/run-example.ts /path/to/test.wasm
  */
 
-import { readFileSync } from "fs";
-import { resolve } from "path";
+import { readFileSync, existsSync } from "fs";
+import { resolve, dirname } from "path";
 import { ProcessManager } from "../host/src/process-manager";
 import { NodeWorkerAdapter } from "../host/src/worker-adapter";
+
+// Built-in program resolution: resolve exec paths to .wasm binaries.
+// Searches: examples/<name>.wasm, then absolute path.
+const repoRoot = resolve(dirname(new URL(import.meta.url).pathname), "..");
+const builtinPrograms: Record<string, string> = {
+    "echo": resolve(repoRoot, "examples/echo.wasm"),
+    "/bin/echo": resolve(repoRoot, "examples/echo.wasm"),
+    "/usr/bin/echo": resolve(repoRoot, "examples/echo.wasm"),
+};
+
+function resolveProgram(path: string): Promise<ArrayBuffer | null> {
+    // Check built-in mappings first
+    const mapped = builtinPrograms[path];
+    if (mapped && existsSync(mapped)) {
+        const bytes = readFileSync(mapped);
+        return Promise.resolve(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+    }
+    // Try as a file path
+    const candidates = [
+        path,
+        path.endsWith(".wasm") ? path : `${path}.wasm`,
+        resolve(repoRoot, `examples/${path}.wasm`),
+    ];
+    for (const c of candidates) {
+        if (existsSync(c)) {
+            const bytes = readFileSync(c);
+            return Promise.resolve(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+        }
+    }
+    return Promise.resolve(null);
+}
 
 async function main() {
     const name = process.argv[2];
@@ -39,6 +70,7 @@ async function main() {
         ),
         kernelConfig: { maxWorkers: 4, dataBufferSize: 65536, useSharedMemory: true },
         workerAdapter: new NodeWorkerAdapter(),
+        resolveProgram,
     });
 
     const pid = await pm.spawn({

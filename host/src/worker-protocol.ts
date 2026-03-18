@@ -121,6 +121,7 @@ export interface ForkRequestMessage {
   pid: number;
   forkSab: SharedArrayBuffer;
   forkState: ArrayBuffer;
+  pipeSabs?: { handle: number; sab: SharedArrayBuffer; end: "read" | "write" }[];
 }
 
 export interface WaitpidRequestMessage {

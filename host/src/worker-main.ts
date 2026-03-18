@@ -10,6 +10,7 @@ import type {
   ExecReplyMessage,
 } from "./worker-protocol";
 import { instantiateAndRunProgram } from "./program-runner";
+import { SharedPipeBuffer } from "./shared-pipe-buffer";
 
 export interface MessagePort {
   postMessage(msg: unknown, transferList?: unknown[]): void;
@@ -60,10 +61,60 @@ export async function workerMain(
         } satisfies WorkerToHostMessage);
       },
       onFork: (forkSab: SharedArrayBuffer): void => {
-        // Serialize fork state NOW, before Atomics.wait blocks the thread.
-        // The host can't request fork state from a blocked worker.
-        const mem = kernel.getMemory()!;
+        // Convert kernel-internal pipes to SharedPipeBuffers BEFORE serializing
+        // fork state. This ensures both parent and child share the same pipe
+        // buffers. We must do this before Atomics.wait because the parent can't
+        // process messages while blocked.
         const inst = kernel.getInstance()!;
+        const mem = kernel.getMemory()!;
+        const pipeSabs: { handle: number; sab: SharedArrayBuffer; end: "read" | "write" }[] = [];
+        try {
+          const getPipeOfds = inst.exports.kernel_get_pipe_ofds as
+            (ptr: number, len: number) => number;
+          const PIPE_BUF_PAGES = 1;
+          const pipeBufPage = mem.grow(PIPE_BUF_PAGES);
+          const pipeBufPtr = pipeBufPage * 65536;
+          const pipeBufSize = PIPE_BUF_PAGES * 65536;
+          const pipeCount = getPipeOfds(pipeBufPtr, pipeBufSize);
+
+          if (pipeCount > 0) {
+            const convertFn = inst.exports.kernel_convert_pipe_to_host as
+              (ofdIdx: number, newHandle: bigint) => number;
+            const pipeView = new DataView(mem.buffer, pipeBufPtr, pipeCount * 16);
+
+            // Group pipe OFDs by host_handle (same pipe has same |host_handle|)
+            const groups = new Map<bigint, { ofdIndex: number; isRead: boolean }[]>();
+            for (let i = 0; i < pipeCount; i++) {
+              const ofdIndex = pipeView.getUint32(i * 16, true);
+              const hostHandle = pipeView.getBigInt64(i * 16 + 4, true);
+              const isRead = pipeView.getUint32(i * 16 + 12, true) === 1;
+              // Already converted pipes have positive host_handle; skip them
+              if (hostHandle >= 0) continue;
+              const key = hostHandle < 0n ? -hostHandle : hostHandle;
+              const existing = groups.get(key);
+              if (existing) existing.push({ ofdIndex, isRead });
+              else groups.set(key, [{ ofdIndex, isRead }]);
+            }
+
+            // Create SharedPipeBuffer per pipe group, convert OFDs
+            let nextHandle = 1000; // Start pipe handles high to avoid conflicts
+            for (const ofds of groups.values()) {
+              const sharedPipe = SharedPipeBuffer.create();
+              const sab = sharedPipe.getBuffer();
+              for (const ofd of ofds) {
+                const handle = nextHandle++;
+                const end = ofd.isRead ? "read" as const : "write" as const;
+                kernel.registerSharedPipe(handle, sab, end);
+                convertFn(ofd.ofdIndex, BigInt(handle));
+                pipeSabs.push({ handle, sab, end });
+              }
+            }
+          }
+        } catch {
+          // If pipe enumeration fails, proceed without pipe conversion
+        }
+
+        // Serialize fork state NOW (after pipe conversion), before Atomics.wait.
         const FORK_BUF_PAGES = 16;
         const sp = mem.grow(FORK_BUF_PAGES);
         const bp = sp * 65536;
@@ -79,6 +130,7 @@ export async function workerMain(
           pid: initData.pid,
           forkSab,
           forkState,
+          pipeSabs: pipeSabs.map(p => ({ handle: p.handle, sab: p.sab, end: p.end })),
         } satisfies WorkerToHostMessage,
         [forkState]);
       },
@@ -171,11 +223,64 @@ export async function workerMain(
       pid: initData.pid,
     } satisfies WorkerToHostMessage);
 
-    // If programBytes provided, run the user program after signaling ready.
+    // Check if this is a fork child with pending exec (posix_spawn pattern).
+    // If so, apply fd_actions and send exec_request instead of running programBytes.
+    let forkChildHandledExec = false;
+    if (initData.forkState) {
+      const isForkChild = instance.exports.kernel_is_fork_child as () => number;
+      if (isForkChild() === 1) {
+        const getExecPath = instance.exports.kernel_get_fork_exec_path as
+          (ptr: number, len: number) => number;
+        const memory = kernel.getMemory()!;
+        const pathBufPage = memory.grow(1);
+        const pathBufPtr = pathBufPage * 65536;
+        const pathLen = getExecPath(pathBufPtr, 65536);
+        if (pathLen > 0) {
+          // Apply fd actions (dup2, close) before exec
+          const applyFdActions = instance.exports.kernel_apply_fork_fd_actions as () => number;
+          applyFdActions();
+
+          // Set argv from fork_exec_argv so exec state captures the right argv
+          const getArgc = instance.exports.kernel_get_fork_exec_argc as () => number;
+          const getArgv = instance.exports.kernel_get_fork_exec_argv as
+            (idx: number, ptr: number, len: number) => number;
+          const clearArgv = instance.exports.kernel_clear_argv as () => void;
+          const pushArgv = instance.exports.kernel_push_argv as
+            (ptr: number, len: number) => void;
+          const argc = getArgc();
+          if (argc > 0) {
+            clearArgv();
+            for (let i = 0; i < argc; i++) {
+              const argLen = getArgv(i, pathBufPtr, 65536);
+              if (argLen > 0) {
+                pushArgv(pathBufPtr, argLen);
+              }
+            }
+          }
+
+          // Read exec path
+          // Re-read since getArgv may have overwritten pathBufPtr
+          const pathLen2 = getExecPath(pathBufPtr, 65536);
+          const pathBytes = new Uint8Array(memory.buffer, pathBufPtr, pathLen2);
+          const execPath = new TextDecoder().decode(pathBytes);
+
+          // Send exec_request to host — exec_reply handler will start the new program
+          port.postMessage({
+            type: "exec_request",
+            pid: initData.pid,
+            path: execPath,
+          } satisfies WorkerToHostMessage);
+          forkChildHandledExec = true;
+        }
+      }
+    }
+
+    // If programBytes provided and not already handling fork+exec,
+    // run the user program after signaling ready.
     // This runs asynchronously so the message listener below can handle
     // incoming messages (fork_request responses, signals, etc.) while
     // the program executes.
-    if (initData.programBytes) {
+    if (initData.programBytes && !forkChildHandledExec) {
       (async () => {
         try {
           const exitCode = await instantiateAndRunProgram(kernel, initData.programBytes!);

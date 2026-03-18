@@ -187,7 +187,7 @@ export class ProcessManager {
             break;
           }
           case "fork_request": {
-            this.handleForkRequest(m.pid, (m as import("./worker-protocol").ForkRequestMessage).forkSab, (m as import("./worker-protocol").ForkRequestMessage).forkState);
+            { const fm = m as import("./worker-protocol").ForkRequestMessage; this.handleForkRequest(fm.pid, fm.forkSab, fm.forkState, fm.pipeSabs); }
             break;
           }
           case "waitpid_request": {
@@ -400,7 +400,7 @@ export class ProcessManager {
             break;
           }
           case "fork_request": {
-            this.handleForkRequest(m.pid, (m as import("./worker-protocol").ForkRequestMessage).forkSab, (m as import("./worker-protocol").ForkRequestMessage).forkState);
+            { const fm = m as import("./worker-protocol").ForkRequestMessage; this.handleForkRequest(fm.pid, fm.forkSab, fm.forkState, fm.pipeSabs); }
             break;
           }
           case "waitpid_request": {
@@ -598,9 +598,14 @@ export class ProcessManager {
    * pre-serialized fork state (parent worker is blocked on Atomics.wait
    * so we can't request state from it). Signals result via forkSab.
    */
-  private handleForkRequest(parentPid: number, forkSab: SharedArrayBuffer, forkState: ArrayBuffer): void {
+  private handleForkRequest(
+    parentPid: number,
+    forkSab: SharedArrayBuffer,
+    forkState: ArrayBuffer,
+    pipeSabs?: { handle: number; sab: SharedArrayBuffer; end: "read" | "write" }[],
+  ): void {
     const view = new Int32Array(forkSab);
-    this.forkWithState(parentPid, forkState).then((childPid) => {
+    this.forkWithState(parentPid, forkState, pipeSabs).then((childPid) => {
       Atomics.store(view, 1, childPid);
       Atomics.store(view, 0, 1);
       Atomics.notify(view, 0);
@@ -615,7 +620,11 @@ export class ProcessManager {
    * Fork using pre-serialized state (for guest-initiated fork where
    * the parent worker is blocked and can't respond to get_fork_state).
    */
-  private async forkWithState(parentPid: number, forkState: ArrayBuffer): Promise<number> {
+  private async forkWithState(
+    parentPid: number,
+    forkState: ArrayBuffer,
+    pipeSabs?: { handle: number; sab: SharedArrayBuffer; end: "read" | "write" }[],
+  ): Promise<number> {
     const parentInfo = this.processes.get(parentPid);
     if (!parentInfo) {
       throw new Error(`Cannot fork process ${parentPid}: not found`);
@@ -670,6 +679,15 @@ export class ProcessManager {
             if (childInfo.state === "starting") {
               clearTimeout(timeout);
               childInfo.state = "running";
+
+              // Register parent's shared pipes with child worker so cross-process
+              // pipe I/O works. The parent already converted its pipes before fork.
+              if (pipeSabs && pipeSabs.length > 0) {
+                for (const p of pipeSabs) {
+                  worker.postMessage({ type: "register_pipe", handle: p.handle, buffer: p.sab, end: p.end });
+                }
+              }
+
               resolve(childPid);
             }
             break;
@@ -738,7 +756,7 @@ export class ProcessManager {
             break;
           }
           case "fork_request": {
-            this.handleForkRequest(m.pid, (m as import("./worker-protocol").ForkRequestMessage).forkSab, (m as import("./worker-protocol").ForkRequestMessage).forkState);
+            { const fm = m as import("./worker-protocol").ForkRequestMessage; this.handleForkRequest(fm.pid, fm.forkSab, fm.forkState, fm.pipeSabs); }
             break;
           }
           case "waitpid_request": {

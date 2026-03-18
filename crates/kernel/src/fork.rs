@@ -30,7 +30,7 @@ use crate::terminal::{TerminalState, WinSize, NCCS};
 
 const FORK_MAGIC: u32 = 0x464F524B; // "FORK"
 const EXEC_MAGIC: u32 = 0x45584543; // "EXEC"
-const FORK_VERSION: u32 = 2;
+const FORK_VERSION: u32 = 3;
 
 // ── Writer helper ───────────────────────────────────────────────────────────
 
@@ -314,6 +314,49 @@ pub fn serialize_fork_state(proc: &Process, buf: &mut [u8]) -> Result<usize, Err
     // ── Program break ──
     w.write_u32(proc.memory.get_brk())?;
 
+    // ── Fork exec state (v3) ──
+    // exec_path: u32 len then bytes (0 = none)
+    match &proc.fork_exec_path {
+        Some(path) => {
+            w.write_u32(path.len() as u32)?;
+            w.write_bytes(path)?;
+        }
+        None => w.write_u32(0)?,
+    }
+    // exec_argv: u32 count then each (u32 len, bytes)
+    match &proc.fork_exec_argv {
+        Some(argv) => {
+            w.write_u32(argv.len() as u32)?;
+            for arg in argv {
+                w.write_u32(arg.len() as u32)?;
+                w.write_bytes(arg)?;
+            }
+        }
+        None => w.write_u32(0)?,
+    }
+    // fd_actions: u32 count then each (u32 type, u32 fd1, u32 fd2)
+    w.write_u32(proc.fork_fd_actions.len() as u32)?;
+    for action in &proc.fork_fd_actions {
+        use crate::process::FdAction;
+        match action {
+            FdAction::Dup2 { old_fd, new_fd } => {
+                w.write_u32(0)?;
+                w.write_u32(*old_fd as u32)?;
+                w.write_u32(*new_fd as u32)?;
+            }
+            FdAction::Close { fd } => {
+                w.write_u32(1)?;
+                w.write_u32(*fd as u32)?;
+                w.write_u32(0)?;
+            }
+            FdAction::Open { fd, .. } => {
+                w.write_u32(2)?;
+                w.write_u32(*fd as u32)?;
+                w.write_u32(0)?;
+            }
+        }
+    }
+
     // ── Patch total_size ──
     let total = w.pos as u32;
     w.patch_u32(total_size_offset, total);
@@ -476,6 +519,48 @@ pub fn deserialize_fork_state(buf: &[u8], child_pid: u32) -> Result<Process, Err
     let mut memory = MemoryManager::new();
     memory.set_brk(program_break);
 
+    // ── Fork exec state (v3) ──
+    let fork_exec_path = if r.remaining() >= 4 {
+        let path_len = r.read_u32()? as usize;
+        if path_len > 0 {
+            Some(r.read_bytes(path_len)?.to_vec())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let fork_exec_argv = if r.remaining() >= 4 {
+        let argc = r.read_u32()? as usize;
+        if argc > 0 {
+            let mut args = Vec::with_capacity(argc);
+            for _ in 0..argc {
+                let len = r.read_u32()? as usize;
+                args.push(r.read_bytes(len)?.to_vec());
+            }
+            Some(args)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let mut fork_fd_actions = Vec::new();
+    if r.remaining() >= 4 {
+        let action_count = r.read_u32()? as usize;
+        for _ in 0..action_count {
+            let action_type = r.read_u32()?;
+            let fd1 = r.read_u32()? as i32;
+            let fd2 = r.read_u32()? as i32;
+            use crate::process::FdAction;
+            match action_type {
+                0 => fork_fd_actions.push(FdAction::Dup2 { old_fd: fd1, new_fd: fd2 }),
+                1 => fork_fd_actions.push(FdAction::Close { fd: fd1 }),
+                _ => {} // skip unknown actions
+            }
+        }
+    }
+
     Ok(Process {
         pid: child_pid,
         ppid,
@@ -505,9 +590,9 @@ pub fn deserialize_fork_state(buf: &[u8], child_pid: u32) -> Result<Process, Err
         alarm_interval_ns: 0,
         thread_name: [0u8; 16],
         fork_child: true,
-        fork_exec_path: None,
-        fork_exec_argv: None,
-        fork_fd_actions: Vec::new(),
+        fork_exec_path,
+        fork_exec_argv,
+        fork_fd_actions,
     })
 }
 
@@ -921,6 +1006,47 @@ mod tests {
         let child = deserialize_fork_state(&buf[..written], 6).unwrap();
 
         assert_eq!(child.rlimits[7], [512, 1024]);
+    }
+
+    #[test]
+    fn test_fork_exec_params_roundtrip() {
+        use crate::process::FdAction;
+        let mut proc = Process::new(1);
+        proc.fork_exec_path = Some(b"/usr/bin/echo".to_vec());
+        proc.fork_exec_argv = Some(vec![
+            b"echo".to_vec(),
+            b"hello".to_vec(),
+            b"world".to_vec(),
+        ]);
+        proc.fork_fd_actions = vec![
+            FdAction::Close { fd: 3 },
+            FdAction::Dup2 { old_fd: 4, new_fd: 1 },
+            FdAction::Close { fd: 4 },
+        ];
+
+        let mut buf = vec![0u8; 64 * 1024];
+        let written = serialize_fork_state(&proc, &mut buf).unwrap();
+        let child = deserialize_fork_state(&buf[..written], 42).unwrap();
+
+        assert!(child.fork_child);
+        assert_eq!(child.fork_exec_path.as_deref(), Some(b"/usr/bin/echo".as_slice()));
+        let argv = child.fork_exec_argv.unwrap();
+        assert_eq!(argv.len(), 3);
+        assert_eq!(argv[0], b"echo");
+        assert_eq!(argv[1], b"hello");
+        assert_eq!(argv[2], b"world");
+        assert_eq!(child.fork_fd_actions.len(), 3);
+        match &child.fork_fd_actions[0] {
+            FdAction::Close { fd } => assert_eq!(*fd, 3),
+            _ => panic!("expected Close"),
+        }
+        match &child.fork_fd_actions[1] {
+            FdAction::Dup2 { old_fd, new_fd } => {
+                assert_eq!(*old_fd, 4);
+                assert_eq!(*new_fd, 1);
+            }
+            _ => panic!("expected Dup2"),
+        }
     }
 
     #[test]
