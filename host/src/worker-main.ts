@@ -853,8 +853,8 @@ export async function threadWorkerMain(
     });
 
     // Instantiate the user program module against the shared memory
-    if (initData.programBytes) {
-      const programModule = await WebAssembly.compile(initData.programBytes);
+    if (initData.programModule || initData.programBytes) {
+      const programModule = initData.programModule ?? await WebAssembly.compile(initData.programBytes!);
 
       // Build kernel stubs — minimal syscall implementations for threads.
       const kernelStubs = buildThreadKernelStubs(memory, tid, io);
