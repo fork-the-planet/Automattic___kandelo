@@ -1,10 +1,22 @@
 //! Wasm export layer -- FFI boundary that the TypeScript host calls.
 //!
+//! This module supports two operating modes:
+//!
+//! **Mode 0 (Traditional):** Each process Worker instantiates its own kernel.
+//! Syscalls go through 156 `kernel_*` exports. The Global Kernel Lock (GKL)
+//! serializes access when threads share the kernel. Process state lives in
+//! the global `PROCESS`.
+//!
+//! **Mode 1 (Centralized):** A single kernel instance manages all processes
+//! via `kernel_handle_channel`. Process state lives in `PROCESS_TABLE`.
+//! User programs use channel IPC (channel_syscall.c) instead of kernel imports.
+//! GKL is bypassed. The 156 `kernel_*` exports are unused.
+//!
 //! This module declares:
 //! 1. Host function imports (functions the host must provide).
 //! 2. A `WasmHostIO` struct implementing the `HostIO` trait via those imports.
-//! 3. Global kernel state (`PROCESS`).
-//! 4. Export functions for each syscall.
+//! 3. Global kernel state (`PROCESS` for mode=0, `PROCESS_TABLE` for mode=1).
+//! 4. Export functions: 156 `kernel_*` (mode=0) + channel/process-table (mode=1).
 
 extern crate alloc;
 
@@ -567,6 +579,12 @@ static PROCESS_TABLE: GlobalProcessTable = GlobalProcessTable(UnsafeCell::new(Pr
 /// Global Kernel Lock — a futex-backed spinlock in shared linear memory.
 /// Every syscall acquires it on entry and releases on exit. This serializes
 /// all kernel access when multiple threads share the same Memory.
+///
+/// DEPRECATED: In centralized mode (mode=1), GKL is bypassed because the
+/// centralized kernel is single-threaded (one syscall at a time from the
+/// JS event loop). GKL is only needed for mode=0 (traditional) where
+/// multiple threads in a process Worker share the kernel state.
+/// When mode=0 is fully removed, GKL and GklGuard can be deleted.
 static GKL: AtomicI32 = AtomicI32::new(0);
 
 #[cfg(target_arch = "wasm32")]

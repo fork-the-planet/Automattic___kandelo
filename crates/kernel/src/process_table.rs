@@ -1,3 +1,16 @@
+//! Process table for centralized kernel mode.
+//!
+//! In centralized mode (mode=1), a single kernel instance manages multiple
+//! processes. The `ProcessTable` maps PIDs to `Process` structs, allowing
+//! the kernel to service syscalls for any process based on the PID passed
+//! via `kernel_handle_channel`.
+//!
+//! Operations:
+//! - `create_process` — create a new empty process
+//! - `fork_process` — clone a parent process via serialize/deserialize
+//! - `remove_process` — remove a process from the table
+//! - `set_current_pid` — select which process is being serviced
+
 extern crate alloc;
 
 use alloc::collections::BTreeMap;
