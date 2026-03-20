@@ -1,6 +1,7 @@
 export { WasmPosixKernel } from "./kernel";
 export type { KernelCallbacks } from "./kernel";
 export { CentralizedKernelWorker } from "./kernel-worker";
+export type { CentralizedKernelCallbacks } from "./kernel-worker";
 export { ProgramRunner } from "./program-runner";
 export { SyscallChannel, ChannelStatus } from "./channel";
 export { NodePlatformIO } from "./platform/node";

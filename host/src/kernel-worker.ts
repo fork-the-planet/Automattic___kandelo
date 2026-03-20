@@ -39,6 +39,14 @@ const SYS_CLOCK_NANOSLEEP = 124;
 const SYS_FUTEX = 200;
 const SYS_POLL = 60;
 
+/** Syscall numbers for fork/exec/clone */
+const SYS_EXECVE = 211;
+const SYS_FORK = 212;
+const SYS_VFORK = 213;
+const SYS_CLONE = 201;
+const SYS_EXIT = 34;
+const SYS_EXIT_GROUP = 35;
+
 /** Retry interval for EAGAIN polling (ms) */
 const EAGAIN_RETRY_MS = 1;
 
@@ -301,6 +309,35 @@ interface ProcessRegistration {
   channels: ChannelInfo[];
 }
 
+/** Callbacks for fork/exec/exit handling in centralized mode. */
+export interface CentralizedKernelCallbacks {
+  /**
+   * Called when a process forks. The kernel has already cloned the Process
+   * in its ProcessTable. The callback should spawn a child Worker with
+   * a copy of the parent's Memory and register it with the kernel.
+   * Returns the channel offsets allocated for the child.
+   */
+  onFork?: (parentPid: number, childPid: number, parentMemory: WebAssembly.Memory) => Promise<number[]>;
+
+  /**
+   * Called when a process calls execve. The callback should resolve the
+   * program path and reinitialize the Worker with the new binary.
+   * Returns 0 on success, negative errno on error.
+   */
+  onExec?: (pid: number, path: string) => Promise<number>;
+
+  /**
+   * Called when a process calls clone (thread creation). The callback should
+   * spawn a thread Worker sharing the parent's Memory. Returns the TID.
+   */
+  onClone?: (pid: number, fnPtr: number, argPtr: number, stackPtr: number, tlsPtr: number, ctidPtr: number, memory: WebAssembly.Memory) => Promise<number>;
+
+  /**
+   * Called when a process exits.
+   */
+  onExit?: (pid: number, exitStatus: number) => void;
+}
+
 export class CentralizedKernelWorker {
   private kernel: WasmPosixKernel;
   private kernelInstance: WebAssembly.Instance | null = null;
@@ -309,10 +346,12 @@ export class CentralizedKernelWorker {
   private activeChannels: ChannelInfo[] = [];
   private scratchOffset = 0;
   private initialized = false;
+  private nextChildPid = 100;
 
   constructor(
     private config: KernelConfig,
     private io: PlatformIO,
+    private callbacks: CentralizedKernelCallbacks = {},
   ) {
     this.kernel = new WasmPosixKernel(config, io, {
       // In centralized mode, callbacks like onKill/onFork are handled
@@ -460,7 +499,6 @@ export class CentralizedKernelWorker {
    */
   private handleSyscall(channel: ChannelInfo): void {
     const processView = new DataView(channel.memory.buffer, channel.channelOffset);
-    const kernelView = new DataView(this.kernelMemory!.buffer, this.scratchOffset);
 
     // Read syscall number and args from process channel
     const syscallNr = processView.getUint32(CH_SYSCALL, true);
@@ -468,6 +506,33 @@ export class CentralizedKernelWorker {
     for (let i = 0; i < CH_ARGS_COUNT; i++) {
       origArgs.push(processView.getInt32(CH_ARGS + i * 4, true));
     }
+
+    // --- Intercept fork/exec/clone/exit before calling kernel ---
+    // These syscalls need special async handling that can't go through
+    // the blocking host_fork/host_exec imports.
+
+    if (syscallNr === SYS_FORK || syscallNr === SYS_VFORK) {
+      this.handleFork(channel, origArgs);
+      return;
+    }
+
+    if (syscallNr === SYS_EXECVE) {
+      this.handleExec(channel, origArgs);
+      return;
+    }
+
+    if (syscallNr === SYS_CLONE) {
+      this.handleClone(channel, origArgs);
+      return;
+    }
+
+    if (syscallNr === SYS_EXIT || syscallNr === SYS_EXIT_GROUP) {
+      this.handleExit(channel, syscallNr, origArgs);
+      return;
+    }
+
+    // --- Normal syscall path ---
+    const kernelView = new DataView(this.kernelMemory!.buffer, this.scratchOffset);
 
     // Copy raw args to kernel scratch header (will be adjusted below)
     const adjustedArgs = [...origArgs];
@@ -781,6 +846,200 @@ export class CentralizedKernelWorker {
     }
 
     return false;
+  }
+
+  // -----------------------------------------------------------------------
+  // Fork/exec/clone/exit handling
+  // -----------------------------------------------------------------------
+
+  /**
+   * Handle SYS_FORK/SYS_VFORK: clone the Process in the kernel's ProcessTable,
+   * then call the onFork callback to spawn the child Worker.
+   */
+  private handleFork(channel: ChannelInfo, _origArgs: number[]): void {
+    if (!this.callbacks.onFork) {
+      // No fork handler — return -ENOSYS
+      this.completeChannel(channel, SYS_FORK, _origArgs, undefined, -1, 38);
+      return;
+    }
+
+    const parentPid = channel.pid;
+    const childPid = this.nextChildPid++;
+
+    // Clone the Process in the kernel's ProcessTable
+    const kernelForkProcess = this.kernelInstance!.exports.kernel_fork_process as
+      (parentPid: number, childPid: number) => number;
+    const forkResult = kernelForkProcess(parentPid, childPid);
+    if (forkResult < 0) {
+      // Fork failed in kernel (e.g., ESRCH, ENOMEM)
+      this.completeChannel(channel, SYS_FORK, _origArgs, undefined, -1, (-forkResult) >>> 0);
+      return;
+    }
+
+    // Call the async fork handler to spawn child Worker
+    this.callbacks.onFork(parentPid, childPid, channel.memory).then((childChannelOffsets) => {
+      if (!this.processes.has(parentPid)) return;
+
+      // Register the child's channels with the kernel worker.
+      // The callback should have already created the child's Memory as a copy
+      // of the parent's. We need the child's Memory reference.
+      // For now, the onFork callback handles registration externally.
+      // We just need to complete the parent's channel with the child PID.
+
+      // Complete parent's channel with child PID
+      this.completeChannel(channel, SYS_FORK, _origArgs, undefined, childPid, 0);
+    }).catch(() => {
+      // Fork failed — remove child from kernel ProcessTable
+      const removeProcess = this.kernelInstance!.exports.kernel_remove_process as
+        (pid: number) => number;
+      removeProcess(childPid);
+
+      // Return -ENOMEM to parent
+      this.completeChannel(channel, SYS_FORK, _origArgs, undefined, -1, 12);
+    });
+  }
+
+  /**
+   * Handle SYS_EXECVE: read the path from process memory, call the onExec
+   * callback to resolve and load the new program.
+   */
+  private handleExec(channel: ChannelInfo, origArgs: number[]): void {
+    // Read path from process memory (arg 0 is a pointer to null-terminated string)
+    const pathPtr = origArgs[0];
+    const processMem = new Uint8Array(channel.memory.buffer);
+    let pathLen = 0;
+    while (processMem[pathPtr + pathLen] !== 0 && pathLen < 4096) {
+      pathLen++;
+    }
+    const path = new TextDecoder().decode(processMem.subarray(pathPtr, pathPtr + pathLen));
+
+    if (!this.callbacks.onExec) {
+      // No exec handler — return -ENOSYS
+      this.completeChannel(channel, SYS_EXECVE, origArgs, undefined, -1, 38);
+      return;
+    }
+
+    // Handle exec-related process cleanup in kernel (close CLOEXEC, reset signals)
+    const kernelExecSetup = this.kernelInstance!.exports.kernel_exec_setup as
+      (pid: number) => number;
+    const setupResult = kernelExecSetup(channel.pid);
+    if (setupResult < 0) {
+      this.completeChannel(channel, SYS_EXECVE, origArgs, undefined, -1, (-setupResult) >>> 0);
+      return;
+    }
+
+    // Call the async exec handler
+    this.callbacks.onExec(channel.pid, path).then((result) => {
+      if (!this.processes.has(channel.pid)) return;
+
+      if (result < 0) {
+        // Exec failed
+        this.completeChannel(channel, SYS_EXECVE, origArgs, undefined, -1, (-result) >>> 0);
+      }
+      // On success, execve doesn't return — the Worker gets reinitialized
+      // with the new program. The channel will be re-registered when the
+      // new program starts. Don't complete the channel.
+    }).catch(() => {
+      this.completeChannel(channel, SYS_EXECVE, origArgs, undefined, -1, 2); // ENOENT
+    });
+  }
+
+  /**
+   * Handle SYS_CLONE: thread creation. Call the onClone callback to spawn
+   * a thread Worker sharing the parent's Memory.
+   */
+  private handleClone(channel: ChannelInfo, origArgs: number[]): void {
+    // clone args: (fn_ptr, stack_ptr, flags, arg, ptid_ptr, tls_ptr)
+    // In musl's __syscall6 layout for clone
+    const fnPtr = origArgs[0];
+    const stackPtr = origArgs[1];
+    const _flags = origArgs[2];
+    const _arg = origArgs[3];
+    const _ptidPtr = origArgs[4];
+    const tlsPtr = origArgs[5];
+
+    // For clone, we also need ctidPtr. In the kernel dispatch:
+    // 201 => kernel_clone(a1, a2, a3, a4, a5, 0) -- 6th arg is ctid but mapped to 0
+    // Actually the musl clone sends: fn, stack, flags, arg, ptid, tls, ctid
+    // But our syscall only has 6 args. Let's pass through to the kernel for now.
+
+    // Route through the normal kernel_handle_channel for clone — the kernel's
+    // sys_clone will return a TID. The onClone callback handles Worker spawning.
+    if (!this.callbacks.onClone) {
+      // No clone handler — return -ENOSYS
+      this.completeChannel(channel, SYS_CLONE, origArgs, undefined, -1, 38);
+      return;
+    }
+
+    // We need ctidPtr which may be embedded differently. For simplicity,
+    // let the kernel handle the clone request and return the TID.
+    // Then call onClone to spawn the thread Worker.
+
+    // Call kernel_handle_channel normally for clone — the kernel allocates
+    // thread state and returns a TID.
+    const kernelView = new DataView(this.kernelMemory!.buffer, this.scratchOffset);
+    kernelView.setUint32(CH_SYSCALL, SYS_CLONE, true);
+    for (let i = 0; i < CH_ARGS_COUNT; i++) {
+      kernelView.setInt32(CH_ARGS + i * 4, origArgs[i], true);
+    }
+
+    const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as
+      (offset: number, pid: number) => number;
+    handleChannel(this.scratchOffset, channel.pid);
+
+    const retVal = kernelView.getInt32(CH_RETURN, true);
+    const errVal = kernelView.getUint32(CH_ERRNO, true);
+
+    if (retVal < 0) {
+      // Clone failed in kernel
+      this.completeChannel(channel, SYS_CLONE, origArgs, undefined, retVal, errVal);
+      return;
+    }
+
+    const tid = retVal;
+
+    // Call onClone to spawn thread Worker, then complete parent's channel with TID
+    this.callbacks.onClone(
+      channel.pid, fnPtr, _arg, stackPtr, tlsPtr, 0, channel.memory,
+    ).then((assignedTid) => {
+      if (!this.processes.has(channel.pid)) return;
+      this.completeChannel(channel, SYS_CLONE, origArgs, undefined, assignedTid, 0);
+    }).catch(() => {
+      this.completeChannel(channel, SYS_CLONE, origArgs, undefined, -1, 12); // ENOMEM
+    });
+  }
+
+  /**
+   * Handle SYS_EXIT/SYS_EXIT_GROUP: notify the kernel and clean up.
+   */
+  private handleExit(channel: ChannelInfo, syscallNr: number, origArgs: number[]): void {
+    const exitStatus = origArgs[0];
+
+    // Route through kernel to update process state
+    const kernelView = new DataView(this.kernelMemory!.buffer, this.scratchOffset);
+    kernelView.setUint32(CH_SYSCALL, syscallNr, true);
+    for (let i = 0; i < CH_ARGS_COUNT; i++) {
+      kernelView.setInt32(CH_ARGS + i * 4, origArgs[i], true);
+    }
+
+    const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as
+      (offset: number, pid: number) => number;
+    handleChannel(this.scratchOffset, channel.pid);
+
+    // Complete the channel so the process unblocks (it will exit after)
+    const retVal = kernelView.getInt32(CH_RETURN, true);
+    const errVal = kernelView.getUint32(CH_ERRNO, true);
+    this.completeChannel(channel, syscallNr, origArgs, undefined, retVal, errVal);
+
+    // Notify callback
+    if (this.callbacks.onExit) {
+      this.callbacks.onExit(channel.pid, exitStatus);
+    }
+  }
+
+  /** Set the next child PID to allocate. */
+  setNextChildPid(pid: number): void {
+    this.nextChildPid = pid;
   }
 
   /** Get the underlying kernel instance for direct access. */

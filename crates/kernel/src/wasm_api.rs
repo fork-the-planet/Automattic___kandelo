@@ -733,6 +733,77 @@ pub extern "C" fn kernel_remove_process(pid: u32) -> i32 {
     }
 }
 
+/// Fork a process in the process table (centralized mode).
+/// Clones parent's Process state and creates a child with `child_pid`.
+/// Returns 0 on success, negative errno on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_fork_process(parent_pid: u32, child_pid: u32) -> i32 {
+    let table = unsafe { &mut *PROCESS_TABLE.0.get() };
+    match table.fork_process(parent_pid, child_pid) {
+        Ok(()) => 0,
+        Err(e) => -(e as i32),
+    }
+}
+
+/// Check if a process is a fork child (centralized mode).
+/// Returns 1 if fork child, 0 otherwise, -ESRCH if not found.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_is_fork_child_pid(pid: u32) -> i32 {
+    let table = unsafe { &mut *PROCESS_TABLE.0.get() };
+    match table.get(pid) {
+        Some(proc) => if proc.fork_child { 1 } else { 0 },
+        None => -(Errno::ESRCH as i32),
+    }
+}
+
+/// Get fork exec path for a specific process (centralized mode).
+/// Writes path to buf, returns bytes written, 0 if no exec path, -ESRCH if not found.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_get_fork_exec_path_pid(pid: u32, buf_ptr: *mut u8, buf_len: u32) -> i32 {
+    let table = unsafe { &mut *PROCESS_TABLE.0.get() };
+    match table.get(pid) {
+        Some(proc) => match &proc.fork_exec_path {
+            Some(path) => {
+                let len = path.len().min(buf_len as usize);
+                let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, len) };
+                buf.copy_from_slice(&path[..len]);
+                len as i32
+            }
+            None => 0,
+        },
+        None => -(Errno::ESRCH as i32),
+    }
+}
+
+/// Handle exec semantics on a process in the process table (centralized mode).
+/// Serializes the process as exec state (closes CLOEXEC, resets handlers), then
+/// re-creates the process from that sanitized state.
+/// Returns 0 on success, negative errno on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_exec_setup(pid: u32) -> i32 {
+    let table = unsafe { &mut *PROCESS_TABLE.0.get() };
+    let proc = match table.get(pid) {
+        Some(p) => p,
+        None => return -(Errno::ESRCH as i32),
+    };
+
+    // Serialize as exec state (handles CLOEXEC fd removal, signal handler reset, etc.)
+    let mut buf = alloc::vec![0u8; 64 * 1024];
+    let written = match crate::fork::serialize_exec_state(proc, &mut buf) {
+        Ok(n) => n,
+        Err(e) => return -(e as i32),
+    };
+
+    // Deserialize back to replace the process with exec-sanitized version
+    match crate::fork::deserialize_exec_state(&buf[..written], pid) {
+        Ok(new_proc) => {
+            table.get_mut(pid).map(|p| *p = new_proc);
+            0
+        }
+        Err(e) => -(e as i32),
+    }
+}
+
 /// Handle a syscall via the channel protocol (centralized mode).
 ///
 /// Reads the channel layout from kernel Memory at `offset`:

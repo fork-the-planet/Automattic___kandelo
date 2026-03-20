@@ -306,7 +306,7 @@ pub fn sys_read(
                     if !pipe.is_write_end_open() {
                         return Ok(0); // EOF — write end closed
                     }
-                    if status_flags & O_NONBLOCK != 0 {
+                    if status_flags & O_NONBLOCK != 0 || crate::is_centralized_mode() {
                         return Err(Errno::EAGAIN);
                     }
                     // Block: check for signals then sleep 1ms
@@ -343,7 +343,7 @@ pub fn sys_read(
                             if !pipe.is_write_end_open() {
                                 return Ok(0);
                             }
-                            if status_flags & O_NONBLOCK != 0 {
+                            if status_flags & O_NONBLOCK != 0 || crate::is_centralized_mode() {
                                 return Err(Errno::EAGAIN);
                             }
                             if proc.signals.deliverable() != 0 {
@@ -373,7 +373,7 @@ pub fn sys_read(
                         if !pipe.is_write_end_open() {
                             return Ok(0); // EOF — peer closed
                         }
-                        if status_flags & O_NONBLOCK != 0 {
+                        if status_flags & O_NONBLOCK != 0 || crate::is_centralized_mode() {
                             return Err(Errno::EAGAIN);
                         }
                         if proc.signals.deliverable() != 0 {
@@ -457,7 +457,7 @@ pub fn sys_write(
                     if n > 0 {
                         return Ok(n);
                     }
-                    if status_flags & O_NONBLOCK != 0 {
+                    if status_flags & O_NONBLOCK != 0 || crate::is_centralized_mode() {
                         return Err(Errno::EAGAIN);
                     }
                     // Block: check for signals then sleep 1ms
@@ -496,7 +496,7 @@ pub fn sys_write(
                             if n > 0 {
                                 return Ok(n);
                             }
-                            if status_flags & O_NONBLOCK != 0 {
+                            if status_flags & O_NONBLOCK != 0 || crate::is_centralized_mode() {
                                 return Err(Errno::EAGAIN);
                             }
                             if proc.signals.deliverable() != 0 {
@@ -527,7 +527,7 @@ pub fn sys_write(
                         if n > 0 {
                             return Ok(n);
                         }
-                        if status_flags & O_NONBLOCK != 0 {
+                        if status_flags & O_NONBLOCK != 0 || crate::is_centralized_mode() {
                             return Err(Errno::EAGAIN);
                         }
                         if proc.signals.deliverable() != 0 {
@@ -1848,7 +1848,7 @@ pub fn sys_sigtimedwait(
         }
     }
 
-    if timeout_ms == 0 {
+    if timeout_ms == 0 || crate::is_centralized_mode() {
         return Err(Errno::EAGAIN);
     }
 
@@ -1887,6 +1887,12 @@ pub fn sys_sigsuspend(proc: &mut Process, host: &mut dyn HostIO, mask: u64) -> R
     if proc.signals.deliverable() != 0 {
         proc.signals.blocked = old_mask;
         return Err(Errno::EINTR);
+    }
+
+    // Centralized mode: return EAGAIN so the host can wait asynchronously
+    if crate::is_centralized_mode() {
+        proc.signals.blocked = old_mask;
+        return Err(Errno::EAGAIN);
     }
 
     // Block until a deliverable signal arrives
@@ -2049,6 +2055,10 @@ pub fn sys_nanosleep(
 ) -> Result<(), Errno> {
     if req.tv_sec < 0 || req.tv_nsec < 0 || req.tv_nsec >= 1_000_000_000 {
         return Err(Errno::EINVAL);
+    }
+    // Centralized mode: return immediately, host handles the delay
+    if crate::is_centralized_mode() {
+        return Ok(());
     }
     host.host_nanosleep(req.tv_sec, req.tv_nsec)
 }
@@ -2596,7 +2606,7 @@ pub fn sys_recv(
         SocketDomain::Unix => {
             let recv_buf_idx = sock.recv_buf_idx.ok_or(Errno::ENOTCONN)?;
             let peek = flags & MSG_PEEK != 0;
-            let nonblock = (status_flags & O_NONBLOCK != 0) || (flags & MSG_DONTWAIT != 0);
+            let nonblock = (status_flags & O_NONBLOCK != 0) || (flags & MSG_DONTWAIT != 0) || crate::is_centralized_mode();
             let waitall = flags & MSG_WAITALL != 0 && !peek;
             let mut total = 0usize;
 
@@ -3070,6 +3080,11 @@ pub fn sys_poll(
     let ready = poll_check(proc, fds);
     if ready > 0 || timeout_ms == 0 {
         return Ok(ready);
+    }
+
+    // Centralized mode: return EAGAIN so the host JS can retry asynchronously
+    if crate::is_centralized_mode() {
+        return Err(Errno::EAGAIN);
     }
 
     // timeout_ms < 0 means wait indefinitely; > 0 means wait up to that many ms.
@@ -3651,6 +3666,10 @@ pub fn sys_futex(
 
     match base_op {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
+            // Centralized mode: return EAGAIN so host can wait asynchronously
+            if crate::is_centralized_mode() {
+                return Err(Errno::EAGAIN);
+            }
             // timeout is a pointer to struct timespec {sec: i32, nsec: i32} in Wasm memory
             // For FUTEX_WAIT_BITSET, val3 is the bitmask (we ignore it, treat as full mask)
             let timeout_ns: i64 = if timeout != 0 {
