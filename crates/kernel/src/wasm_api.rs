@@ -557,6 +557,9 @@ unsafe impl Sync for GlobalProcess {}
 
 static PROCESS: GlobalProcess = GlobalProcess(UnsafeCell::new(None));
 
+use crate::process_table::{GlobalProcessTable, ProcessTable};
+static PROCESS_TABLE: GlobalProcessTable = GlobalProcessTable(UnsafeCell::new(ProcessTable::new()));
+
 // ---------------------------------------------------------------------------
 // 3a. Global Kernel Lock (GKL)
 // ---------------------------------------------------------------------------
@@ -602,31 +605,49 @@ struct GklGuard;
 
 impl GklGuard {
     fn acquire() -> Self {
-        gkl_acquire();
+        if !crate::is_centralized_mode() {
+            gkl_acquire();
+        }
         GklGuard
     }
 }
 
 impl Drop for GklGuard {
     fn drop(&mut self) {
-        gkl_release();
+        if !crate::is_centralized_mode() {
+            gkl_release();
+        }
     }
 }
 
 /// Get a mutable reference to the global process, acquiring the GKL.
 /// Returns a GklGuard that releases the lock when dropped.
 ///
+/// In mode 0 (traditional): uses the single global PROCESS.
+/// In mode 1 (centralized): looks up current_pid in PROCESS_TABLE.
+///
 /// SAFETY: Must only be called from kernel export functions.
 #[inline]
 unsafe fn get_process() -> (GklGuard, &'static mut Process) {
     let guard = GklGuard::acquire();
-    let ptr = PROCESS.0.get();
-    match unsafe { &mut *ptr } {
-        Some(p) => (guard, p),
-        #[cfg(target_arch = "wasm32")]
-        None => core::arch::wasm32::unreachable(),
-        #[cfg(not(target_arch = "wasm32"))]
-        None => panic!("kernel not initialized"),
+    if crate::is_centralized_mode() {
+        let table = unsafe { &mut *PROCESS_TABLE.0.get() };
+        match table.current_process() {
+            Some(p) => (guard, p),
+            #[cfg(target_arch = "wasm32")]
+            None => core::arch::wasm32::unreachable(),
+            #[cfg(not(target_arch = "wasm32"))]
+            None => panic!("no current process in table"),
+        }
+    } else {
+        let ptr = PROCESS.0.get();
+        match unsafe { &mut *ptr } {
+            Some(p) => (guard, p),
+            #[cfg(target_arch = "wasm32")]
+            None => core::arch::wasm32::unreachable(),
+            #[cfg(not(target_arch = "wasm32"))]
+            None => panic!("kernel not initialized"),
+        }
     }
 }
 
@@ -683,6 +704,488 @@ fn deliver_pending_signals(proc: &mut Process, host: &mut WasmHostIO) {
 // ---------------------------------------------------------------------------
 // 4. Exported kernel functions
 // ---------------------------------------------------------------------------
+
+/// Set kernel operating mode. 0 = traditional, 1 = centralized.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_set_mode(mode: u32) {
+    crate::set_kernel_mode(mode);
+}
+
+/// Create a new process in the process table (centralized mode).
+/// Returns 0 on success, -EEXIST if pid already exists.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_create_process(pid: u32) -> i32 {
+    let table = unsafe { &mut *PROCESS_TABLE.0.get() };
+    match table.create_process(pid) {
+        Ok(()) => 0,
+        Err(()) => -(Errno::EEXIST as i32),
+    }
+}
+
+/// Remove a process from the process table (centralized mode).
+/// Returns 0 on success, -ESRCH if pid not found.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_remove_process(pid: u32) -> i32 {
+    let table = unsafe { &mut *PROCESS_TABLE.0.get() };
+    match table.remove_process(pid) {
+        Some(_) => 0,
+        None => -(Errno::ESRCH as i32),
+    }
+}
+
+/// Handle a syscall via the channel protocol (centralized mode).
+///
+/// Reads the channel layout from kernel Memory at `offset`:
+///   - syscall number at offset+4
+///   - args[0..6] at offset+8
+///
+/// `pid` identifies which process to service.
+///
+/// Dispatches to the appropriate kernel function, then writes:
+///   - return value at offset+32
+///   - errno at offset+36
+///
+/// Returns the raw syscall result (also written to channel).
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_handle_channel(offset: u32, pid: u32) -> i32 {
+    use wasm_posix_shared::channel::*;
+
+    // Set current process for dispatch
+    let table = unsafe { &mut *PROCESS_TABLE.0.get() };
+    table.set_current_pid(pid);
+
+    // Read syscall number and args from kernel memory
+    let base = offset as usize;
+    let mem = unsafe {
+        let ptr = base as *const u8;
+        core::slice::from_raw_parts(ptr, MIN_CHANNEL_SIZE)
+    };
+
+    let syscall_nr = u32::from_le_bytes([mem[SYSCALL_OFFSET], mem[SYSCALL_OFFSET+1], mem[SYSCALL_OFFSET+2], mem[SYSCALL_OFFSET+3]]);
+
+    let mut args = [0i32; ARGS_COUNT];
+    for i in 0..ARGS_COUNT {
+        let off = ARGS_OFFSET + i * 4;
+        args[i] = i32::from_le_bytes([mem[off], mem[off+1], mem[off+2], mem[off+3]]);
+    }
+
+    // Pointer args in the channel reference kernel memory (JS copies data
+    // into the data buffer at offset + DATA_OFFSET). Convert relative
+    // data-buffer references: if an arg points to offset 0 of the data
+    // buffer in the channel, it should be `base + DATA_OFFSET` in absolute
+    // kernel memory terms. The JS layer sets pointer args as absolute
+    // kernel-memory addresses, so we pass them through unchanged.
+
+    let result = dispatch_channel_syscall(syscall_nr, &args);
+
+    // Write result back to channel
+    let out = unsafe {
+        let ptr = base as *mut u8;
+        core::slice::from_raw_parts_mut(ptr, MIN_CHANNEL_SIZE)
+    };
+
+    let ret_val: i32;
+    let errno_val: u32;
+    if result < 0 {
+        // Negative result: the absolute value is the errno
+        ret_val = -1;
+        errno_val = (-result) as u32;
+    } else {
+        ret_val = result;
+        errno_val = 0;
+    }
+
+    out[RETURN_OFFSET..RETURN_OFFSET+4].copy_from_slice(&ret_val.to_le_bytes());
+    out[ERRNO_OFFSET..ERRNO_OFFSET+4].copy_from_slice(&errno_val.to_le_bytes());
+
+    result
+}
+
+/// Compute the length of a null-terminated C string at `ptr` in kernel memory.
+/// Safety: `ptr` must point to valid kernel memory containing a null terminator.
+unsafe fn cstr_len(ptr: *const u8) -> u32 {
+    if ptr.is_null() { return 0; }
+    let mut len = 0u32;
+    while unsafe { *ptr.add(len as usize) } != 0 && len < 4096 {
+        len += 1;
+    }
+    len
+}
+
+/// Dispatch a syscall by number with raw musl arguments.
+///
+/// IMPORTANT: The args are in musl's raw format, NOT the kernel_* export format.
+/// For path syscalls, musl passes null-terminated string pointers without explicit
+/// lengths. This function computes string lengths via cstr_len() because the JS
+/// layer has already copied the strings into kernel memory.
+///
+/// Returns the raw kernel result (negative = -errno, non-negative = success value).
+fn dispatch_channel_syscall(nr: u32, args: &[i32; 6]) -> i32 {
+    let a1 = args[0];
+    let a2 = args[1];
+    let a3 = args[2];
+    let a4 = args[3];
+    let a5 = args[4];
+    let a6 = args[5];
+
+    // Syscall number constants (must match glue/syscall_glue.c)
+    match nr {
+        // Process info (0-arg)
+        28 => kernel_getpid(),                     // SYS_GETPID
+        29 => kernel_getppid(),                    // SYS_GETPPID
+        30 => kernel_getuid() as i32,              // SYS_GETUID
+        31 => kernel_geteuid() as i32,             // SYS_GETEUID
+        32 => kernel_getgid() as i32,              // SYS_GETGID
+        33 => kernel_getegid() as i32,             // SYS_GETEGID
+        89 => kernel_getpgrp() as i32,             // SYS_GETPGRP
+        92 => kernel_setsid() as i32,              // SYS_SETSID
+
+        // File operations — musl: (path, flags, mode)
+        1 => { // SYS_OPEN
+            let p = a1 as *const u8;
+            let len = unsafe { cstr_len(p) };
+            kernel_open(p, len, a2 as u32, a3 as u32)
+        }
+        2 => kernel_close(a1),                     // SYS_CLOSE
+        3 => kernel_read(a1, a2 as *mut u8, a3 as u32), // SYS_READ: (fd, buf, count)
+        4 => kernel_write(a1, a2 as *const u8, a3 as u32), // SYS_WRITE: (fd, buf, count)
+        5 => kernel_lseek(a1, a2 as u32, a3, a4 as u32) as i32, // SYS_LSEEK: (fd, off_lo, off_hi, whence)
+        6 => kernel_fstat(a1, a2 as *mut u8),      // SYS_FSTAT: (fd, stat_ptr)
+        64 => kernel_pread(a1, a2 as *mut u8, a3 as u32, a4 as u32, a5), // SYS_PREAD: (fd, buf, count, off_lo, off_hi)
+        65 => kernel_pwrite(a1, a2 as *const u8, a3 as u32, a4 as u32, a5), // SYS_PWRITE
+
+        // FD operations
+        7 => kernel_dup(a1),                       // SYS_DUP
+        8 => kernel_dup2(a1, a2),                  // SYS_DUP2
+        77 => kernel_dup3(a1, a2, a3 as u32),      // SYS_DUP3
+        9 => kernel_pipe(a1 as *mut i32),          // SYS_PIPE: (pipefd_ptr)
+        78 => kernel_pipe2(a2 as u32, a1 as *mut i32), // SYS_PIPE2: (pipefd_ptr, flags) → kernel wants (flags, pipefd_ptr)
+        10 => kernel_fcntl(a1, a2 as u32, a3 as u32), // SYS_FCNTL
+        121 => kernel_flock(a1, a2 as u32),        // SYS_FLOCK
+
+        // Stat — musl: (path, stat_buf) / (path, stat_buf) / (dirfd, path, stat_buf, flags)
+        11 => { // SYS_STAT
+            let p = a1 as *const u8;
+            let len = unsafe { cstr_len(p) };
+            kernel_stat(p, len, a2 as *mut u8)
+        }
+        12 => { // SYS_LSTAT
+            let p = a1 as *const u8;
+            let len = unsafe { cstr_len(p) };
+            kernel_lstat(p, len, a2 as *mut u8)
+        }
+        93 => { // SYS_FSTATAT: (dirfd, path, stat_buf, flags)
+            let p = a2 as *const u8;
+            let len = unsafe { cstr_len(p) };
+            kernel_fstatat(a1, p, len, a3 as *mut u8, a4 as u32)
+        }
+
+        // Directory operations — musl passes null-terminated paths
+        13 => { // SYS_MKDIR: (path, mode)
+            let p = a1 as *const u8;
+            let len = unsafe { cstr_len(p) };
+            kernel_mkdir(p, len, a2 as u32)
+        }
+        14 => { // SYS_RMDIR: (path)
+            let p = a1 as *const u8;
+            let len = unsafe { cstr_len(p) };
+            kernel_rmdir(p, len)
+        }
+        15 => { // SYS_UNLINK: (path)
+            let p = a1 as *const u8;
+            let len = unsafe { cstr_len(p) };
+            kernel_unlink(p, len)
+        }
+        16 => { // SYS_RENAME: (old_path, new_path)
+            let old = a1 as *const u8;
+            let new = a2 as *const u8;
+            kernel_rename(old, unsafe { cstr_len(old) }, new, unsafe { cstr_len(new) })
+        }
+        17 => { // SYS_LINK: (old_path, new_path)
+            let old = a1 as *const u8;
+            let new = a2 as *const u8;
+            kernel_link(old, unsafe { cstr_len(old) }, new, unsafe { cstr_len(new) })
+        }
+        18 => { // SYS_SYMLINK: (target, linkpath)
+            let tgt = a1 as *const u8;
+            let lnk = a2 as *const u8;
+            kernel_symlink(tgt, unsafe { cstr_len(tgt) }, lnk, unsafe { cstr_len(lnk) })
+        }
+        19 => { // SYS_READLINK: (path, buf, bufsiz)
+            let p = a1 as *const u8;
+            let len = unsafe { cstr_len(p) };
+            kernel_readlink(p, len, a2 as *mut u8, a3 as u32)
+        }
+        20 => { // SYS_CHMOD: (path, mode)
+            let p = a1 as *const u8;
+            let len = unsafe { cstr_len(p) };
+            kernel_chmod(p, len, a2 as u32)
+        }
+        21 => { // SYS_CHOWN: (path, uid, gid)
+            let p = a1 as *const u8;
+            let len = unsafe { cstr_len(p) };
+            kernel_chown(p, len, a2 as u32, a3 as u32)
+        }
+        22 => { // SYS_ACCESS: (path, mode)
+            let p = a1 as *const u8;
+            let len = unsafe { cstr_len(p) };
+            kernel_access(p, len, a2 as u32)
+        }
+        23 => kernel_getcwd(a1 as *mut u8, a2 as u32), // SYS_GETCWD: (buf, size)
+        24 => { // SYS_CHDIR: (path)
+            let p = a1 as *const u8;
+            let len = unsafe { cstr_len(p) };
+            kernel_chdir(p, len)
+        }
+        127 => kernel_fchdir(a1),                  // SYS_FCHDIR
+        25 => { // SYS_OPENDIR: (path)
+            let p = a1 as *const u8;
+            let len = unsafe { cstr_len(p) };
+            kernel_opendir(p, len)
+        }
+        26 => kernel_readdir(a1, a2 as *mut u8, a3 as *mut u8, a4 as u32), // SYS_READDIR
+        27 => kernel_closedir(a1),                 // SYS_CLOSEDIR
+        122 => kernel_getdents64(a1, a2 as *mut u8, a3 as u32), // SYS_GETDENTS64
+
+        // Process control
+        34 => { kernel_exit(a1); }                 // SYS_EXIT
+        35 => kernel_kill(a1, a2 as u32),          // SYS_KILL
+        38 => kernel_raise(a1 as u32),             // SYS_RAISE
+
+        // Signals
+        36 => kernel_sigaction(a1 as u32, a2 as *const u8, a3 as *mut u8), // SYS_SIGACTION
+        37 => kernel_sigprocmask(a1 as u32, a2 as u32, a3 as u32) as i32, // SYS_SIGPROCMASK
+        73 => kernel_signal(a1 as u32, a2 as u32), // SYS_SIGNAL
+        39 => kernel_alarm(a1 as u32),             // SYS_ALARM
+        110 => kernel_sigsuspend(a1 as u32, a2 as u32), // SYS_SIGSUSPEND
+        111 => kernel_pause(),                     // SYS_PAUSE
+        207 => kernel_rt_sigtimedwait(a1 as u32, a2 as u32, a3), // SYS_RT_SIGTIMEDWAIT
+
+        // Time
+        40 => kernel_clock_gettime(a1 as u32, a2 as *mut u8), // SYS_CLOCK_GETTIME
+        41 => kernel_nanosleep(a1 as *const u8),   // SYS_NANOSLEEP
+        123 => kernel_clock_getres(a1 as u32, a2 as *mut u8), // SYS_CLOCK_GETRES
+        124 => kernel_clock_nanosleep(a1 as u32, a2 as u32, a3 as *const u8), // SYS_CLOCK_NANOSLEEP
+        125 => { // SYS_UTIMENSAT: (dirfd, path, times, flags)
+            let p = a2 as *const u8;
+            let len = unsafe { cstr_len(p) };
+            kernel_utimensat(a1, p, len, a3 as *const u8, a4 as u32)
+        }
+        66 => kernel_time() as i32,                // SYS_TIME
+        68 => kernel_usleep(a1 as u32),            // SYS_USLEEP
+
+        // Memory
+        46 => kernel_mmap(a1 as u32, a2 as u32, a3 as u32, a4 as u32, a5, 0, 0) as i32, // SYS_MMAP
+        47 => kernel_munmap(a1 as u32, a2 as u32), // SYS_MUNMAP
+        48 => kernel_brk(a1 as u32) as i32,        // SYS_BRK
+        49 => kernel_mprotect(a1 as u32, a2 as u32, a3 as u32), // SYS_MPROTECT
+        126 => kernel_mremap(a1 as u32, a2 as u32, a3 as u32, a4 as u32) as i32, // SYS_MREMAP
+        128 => kernel_madvise(a1 as u32, a2 as u32, a3 as u32), // SYS_MADVISE
+
+        // Environment — musl: name/value are null-terminated strings
+        42 => kernel_isatty(a1),                   // SYS_ISATTY
+        43 => { // SYS_GETENV: (name, buf, buf_len)
+            let p = a1 as *const u8;
+            let len = unsafe { cstr_len(p) };
+            kernel_getenv(p, len, a2 as *mut u8, a3 as u32)
+        }
+        44 => { // SYS_SETENV: (name, value, overwrite)
+            let n = a1 as *const u8;
+            let v = a2 as *const u8;
+            kernel_setenv(n, unsafe { cstr_len(n) }, v, unsafe { cstr_len(v) }, a3 as u32)
+        }
+        45 => { // SYS_UNSETENV: (name)
+            let p = a1 as *const u8;
+            let len = unsafe { cstr_len(p) };
+            kernel_unsetenv(p, len)
+        }
+        74 => kernel_umask(a1 as u32) as i32,      // SYS_UMASK
+        75 => kernel_uname(a1 as *mut u8, a2 as u32), // SYS_UNAME
+        76 => kernel_sysconf(a1) as i32,           // SYS_SYSCONF
+        120 => kernel_getrandom(a1 as *mut u8, a2 as u32, a3 as u32), // SYS_GETRANDOM
+        109 => { // SYS_REALPATH: (path, buf, buf_len)
+            let p = a1 as *const u8;
+            let len = unsafe { cstr_len(p) };
+            kernel_realpath(p, len, a2 as *mut u8, a3 as u32)
+        }
+
+        // Sockets
+        50 => kernel_socket(a1 as u32, a2 as u32, a3 as u32), // SYS_SOCKET
+        61 => kernel_socketpair(a1 as u32, a2 as u32, a3 as u32, a4 as *mut i32), // SYS_SOCKETPAIR
+        51 => kernel_bind(a1, a2 as *const u8, a3 as u32), // SYS_BIND
+        52 => kernel_listen(a1, a2 as u32),        // SYS_LISTEN
+        53 => kernel_accept(a1),                   // SYS_ACCEPT
+        54 => kernel_connect(a1, a2 as *const u8, a3 as u32), // SYS_CONNECT
+        55 => kernel_send(a1, a2 as *const u8, a3 as u32, a4 as u32), // SYS_SEND
+        56 => kernel_recv(a1, a2 as *mut u8, a3 as u32, a4 as u32), // SYS_RECV
+        57 => kernel_shutdown(a1, a2 as u32),      // SYS_SHUTDOWN
+        58 => kernel_getsockopt(a1, a2 as u32, a3 as u32, a4 as *mut u32), // SYS_GETSOCKOPT
+        59 => kernel_setsockopt(a1, a2 as u32, a3 as u32, a4 as u32), // SYS_SETSOCKOPT
+        114 => kernel_getsockname(a1, a2 as u32, a3 as u32), // SYS_GETSOCKNAME
+        115 => kernel_getpeername(a1, a2 as u32, a3 as u32), // SYS_GETPEERNAME
+        140 => { // SYS_GETADDRINFO: (name, result_buf)
+            let p = a1 as *const u8;
+            let len = unsafe { cstr_len(p) };
+            kernel_getaddrinfo(p, len, a2 as *mut u8)
+        }
+        137 => kernel_sendmsg(a1, a2 as *const u8, a3 as u32), // SYS_SENDMSG
+        138 => kernel_recvmsg(a1, a2 as *mut u8, a3 as u32), // SYS_RECVMSG
+        62 => kernel_sendto(a1, a2 as *const u8, a3 as u32, a4 as u32, a5 as *const u8, a6 as u32), // SYS_SENDTO
+        63 => kernel_recvfrom(a1, a2 as *mut u8, a3 as u32, a4 as u32, a5 as *mut u8, a6 as u32), // SYS_RECVFROM
+
+        // Poll/select
+        60 => kernel_poll(a1 as *mut u8, a2 as u32, a3), // SYS_POLL
+        251 => kernel_ppoll(a1 as *mut u8, a2 as u32, a3, a4 as u32, a5 as u32), // SYS_PPOLL
+        103 => kernel_select(a1 as u32, a2 as *mut u8, a3 as *mut u8, a4 as *mut u8, a5 as i32), // SYS_SELECT
+
+        // Terminal
+        70 => kernel_tcgetattr(a1, a2 as *mut u8, 256), // SYS_TCGETATTR
+        71 => kernel_tcsetattr(a1, a2 as u32, a3 as *const u8, 256), // SYS_TCSETATTR
+        72 => kernel_ioctl(a1, a2 as u32, a3 as *mut u8, 256), // SYS_IOCTL
+
+        // File system
+        79 => kernel_ftruncate(a1, a2 as u32, a3 as u32), // SYS_FTRUNCATE
+        80 => kernel_fsync(a1),                    // SYS_FSYNC
+        85 => { // SYS_TRUNCATE: (path, len_lo, len_hi)
+            let p = a1 as *const u8;
+            let plen = unsafe { cstr_len(p) };
+            kernel_truncate(p, plen, a2 as u32, a3 as u32)
+        }
+        86 => kernel_fdatasync(a1),                // SYS_FDATASYNC
+        87 => kernel_fchmod(a1, a2 as u32),        // SYS_FCHMOD
+        88 => kernel_fchown(a1, a2 as u32, a3 as u32), // SYS_FCHOWN
+        129 => { // SYS_STATFS: (path, statfs_buf)
+            let p = a1 as *const u8;
+            let len = unsafe { cstr_len(p) };
+            kernel_statfs(p, len, a2 as *mut u8)
+        }
+        130 => kernel_fstatfs(a1, a2 as *mut u8),  // SYS_FSTATFS
+        81 => kernel_writev(a1, a2 as *const u8, a3), // SYS_WRITEV
+        82 => kernel_readv(a1, a2 as *mut u8, a3), // SYS_READV
+        295 => kernel_preadv(a1, a2 as *mut u8, a3, a4 as u32, a5), // SYS_PREADV
+        296 => kernel_pwritev(a1, a2 as *const u8, a3, a4 as u32, a5), // SYS_PWRITEV
+        294 => kernel_sendfile(a1, a2, a3 as *mut u8, a4 as u32), // SYS_SENDFILE
+
+        // *at variants — musl: (dirfd, path, ...) without explicit path_len
+        69 => { // SYS_OPENAT: (dirfd, path, flags, mode)
+            let p = a2 as *const u8;
+            let len = unsafe { cstr_len(p) };
+            kernel_openat(a1, p, len, a3 as u32, a4 as u32)
+        }
+        94 => { // SYS_UNLINKAT: (dirfd, path, flags)
+            let p = a2 as *const u8;
+            let len = unsafe { cstr_len(p) };
+            kernel_unlinkat(a1, p, len, a3 as u32)
+        }
+        95 => { // SYS_MKDIRAT: (dirfd, path, mode)
+            let p = a2 as *const u8;
+            let len = unsafe { cstr_len(p) };
+            kernel_mkdirat(a1, p, len, a3 as u32)
+        }
+        96 => { // SYS_RENAMEAT: (olddirfd, oldpath, newdirfd, newpath)
+            let old = a2 as *const u8;
+            let new = a4 as *const u8;
+            kernel_renameat(a1, old, unsafe { cstr_len(old) }, a3, new, unsafe { cstr_len(new) })
+        }
+        97 => { // SYS_FACCESSAT: (dirfd, path, mode, flags)
+            let p = a2 as *const u8;
+            let len = unsafe { cstr_len(p) };
+            kernel_faccessat(a1, p, len, a3 as u32, a4 as u32)
+        }
+        98 => { // SYS_FCHMODAT: (dirfd, path, mode, flags)
+            let p = a2 as *const u8;
+            let len = unsafe { cstr_len(p) };
+            kernel_fchmodat(a1, p, len, a3 as u32, a4 as u32)
+        }
+        99 => { // SYS_FCHOWNAT: (dirfd, path, uid, gid, flags)
+            let p = a2 as *const u8;
+            let len = unsafe { cstr_len(p) };
+            kernel_fchownat(a1, p, len, a3 as u32, a4 as u32, a5 as u32)
+        }
+        100 => { // SYS_LINKAT: (olddirfd, oldpath, newdirfd, newpath, flags)
+            let old = a2 as *const u8;
+            let new = a4 as *const u8;
+            kernel_linkat(a1, old, unsafe { cstr_len(old) }, a3, new, unsafe { cstr_len(new) }, a5 as u32)
+        }
+        101 => { // SYS_SYMLINKAT: (target, newdirfd, linkpath)
+            let tgt = a1 as *const u8;
+            let lnk = a3 as *const u8;
+            kernel_symlinkat(tgt, unsafe { cstr_len(tgt) }, a2, lnk, unsafe { cstr_len(lnk) })
+        }
+        102 => { // SYS_READLINKAT: (dirfd, path, buf, bufsiz)
+            let p = a2 as *const u8;
+            let len = unsafe { cstr_len(p) };
+            kernel_readlinkat(a1, p, len, a3 as *mut u8, a4 as u32)
+        }
+
+        // Resource limits
+        83 => kernel_getrlimit(a1 as u32, a2 as *mut u8), // SYS_GETRLIMIT
+        84 => kernel_setrlimit(a1 as u32, a2 as *const u8), // SYS_SETRLIMIT
+
+        // UID/GID
+        90 => kernel_setpgid(a1 as u32, a2 as u32), // SYS_SETPGID
+        91 => kernel_getsid(a1 as u32),            // SYS_GETSID
+        104 => kernel_setuid(a1 as u32),           // SYS_SETUID
+        105 => kernel_setgid(a1 as u32),           // SYS_SETGID
+        106 => kernel_seteuid(a1 as u32),          // SYS_SETEUID
+        107 => kernel_setegid(a1 as u32),          // SYS_SETEGID
+        108 => kernel_getrusage(a1, a2 as *mut u8, a3 as u32), // SYS_GETRUSAGE
+        131 => kernel_setresuid(a1 as u32, a2 as u32, a3 as u32), // SYS_SETRESUID
+        132 => kernel_getresuid(a1 as *mut u32, a2 as *mut u32, a3 as *mut u32), // SYS_GETRESUID
+        133 => kernel_setresgid(a1 as u32, a2 as u32, a3 as u32), // SYS_SETRESGID
+        134 => kernel_getresgid(a1 as *mut u32, a2 as *mut u32, a3 as *mut u32), // SYS_GETRESGID
+        135 => kernel_getgroups(a1 as u32, a2 as *mut u32), // SYS_GETGROUPS
+        136 => kernel_setgroups(a1 as u32, a2 as *const u32), // SYS_SETGROUPS
+
+        // Wait
+        139 => kernel_wait4(a1, a2 as *mut i32, a3 as u32, a4 as *mut u8), // SYS_WAIT4
+
+        // Fork/exec/clone
+        211 => { // SYS_EXECVE: (path, ...)
+            let p = a1 as *const u8;
+            let len = unsafe { cstr_len(p) };
+            kernel_execve(p, len)
+        }
+        212 => kernel_fork(),                      // SYS_FORK
+        213 => kernel_fork(),                      // SYS_VFORK (treat as fork)
+        201 => kernel_clone(a1 as u32, a2 as u32, a3 as u32, a4 as u32, a5 as u32, 0), // SYS_CLONE
+
+        // Futex
+        200 => kernel_futex(a1 as u32, a2 as u32, a3 as u32, a4 as u32, a5 as u32, a6 as u32), // SYS_FUTEX
+
+        // Thread
+        202 => kernel_gettid(),                    // SYS_GETTID
+        203 => kernel_set_tid_address(a1 as u32),  // SYS_SET_TID_ADDRESS
+        261 => kernel_set_robust_list(a1 as u32, a2 as u32), // SYS_SET_ROBUST_LIST
+
+        // prctl
+        223 => kernel_prctl(a1 as u32, a2 as u32, a3 as *mut u8, a4 as u32), // SYS_PRCTL
+
+        // pathconf
+        112 => kernel_pathconf(a1 as u32, a2 as u32, a3) as i32, // SYS_PATHCONF
+        113 => kernel_fpathconf(a1, a2),           // SYS_FPATHCONF
+
+        // Timer
+        225 => kernel_setitimer(a1 as u32, a2 as *const u8, a3 as *mut u8), // SYS_SETITIMER
+        224 => kernel_getitimer(a1 as u32, a2 as *mut u8), // SYS_GETITIMER
+
+        // statx — musl: (dirfd, path, flags, mask, statxbuf)
+        260 => {
+            let p = a2 as *const u8;
+            let len = unsafe { cstr_len(p) };
+            kernel_statx(a1, p, len, a3 as u32, a4 as *mut u8)
+        }
+
+        // Stubs that return 0 or -ENOSYS
+        204 => kernel_raise(a2 as u32),            // SYS_TKILL
+        208 | 209 | 226 | 230..=238 | 239..=249 | 252..=254 | 256..=257 | 262 | 265..=268 | 271..=274 | 287 | 289..=293 | 297..=298 | 301..=305 | 306 | 308..=324 | 325..=336 | 337..=349 | 350..=369 | 370..=371 | 373..=383 | 386 => {
+            // Many of these are stubs in the glue layer too; return ENOSYS
+            -(Errno::ENOSYS as i32)
+        }
+
+        _ => -(Errno::ENOSYS as i32),
+    }
+}
 
 /// Initialize the kernel with a new process.
 #[unsafe(no_mangle)]
