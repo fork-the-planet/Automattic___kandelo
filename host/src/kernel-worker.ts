@@ -29,6 +29,19 @@ const CH_IDLE = 0;
 const CH_PENDING = 1;
 const CH_COMPLETE = 2;
 
+/** Errno values */
+const EAGAIN = 11;
+
+/** Syscall numbers for sleep/delay */
+const SYS_NANOSLEEP = 41;
+const SYS_USLEEP = 68;
+const SYS_CLOCK_NANOSLEEP = 124;
+const SYS_FUTEX = 200;
+const SYS_POLL = 60;
+
+/** Retry interval for EAGAIN polling (ms) */
+const EAGAIN_RETRY_MS = 1;
+
 /** Channel layout offsets */
 const CH_STATUS = 0;
 const CH_SYSCALL = 4;
@@ -525,6 +538,38 @@ export class CentralizedKernelWorker {
     const retVal = kernelView.getInt32(CH_RETURN, true);
     const errVal = kernelView.getUint32(CH_ERRNO, true);
 
+    // --- Blocking syscall handling ---
+
+    // 1. EAGAIN: kernel returned EAGAIN for a blocking syscall.
+    //    Schedule async retry — the process stays blocked on Atomics.wait.
+    if (retVal === -1 && errVal === EAGAIN) {
+      this.handleBlockingRetry(channel, syscallNr, origArgs);
+      return;
+    }
+
+    // 2. Sleep syscalls: kernel returned success immediately, but we need
+    //    to delay the response to simulate the sleep duration.
+    if (this.handleSleepDelay(channel, syscallNr, origArgs, retVal, errVal)) {
+      return;
+    }
+
+    // --- Normal completion ---
+    this.completeChannel(channel, syscallNr, origArgs, argDescs, retVal, errVal);
+  }
+
+  /**
+   * Complete a syscall by copying output data and notifying the process.
+   */
+  private completeChannel(
+    channel: ChannelInfo,
+    syscallNr: number,
+    origArgs: number[],
+    argDescs: ArgDesc[] | undefined,
+    retVal: number,
+    errVal: number,
+  ): void {
+    const processView = new DataView(channel.memory.buffer, channel.channelOffset);
+
     // Copy output data from kernel scratch back to process memory
     if (argDescs) {
       const processMem = new Uint8Array(channel.memory.buffer);
@@ -536,7 +581,7 @@ export class CentralizedKernelWorker {
         const origPtr = origArgs[desc.argIndex];
         if (origPtr === 0) continue;
 
-        // Recompute size (same logic as above)
+        // Recompute size (same logic as prepareInputData)
         let size: number;
         if (desc.size.type === "cstring") {
           let len = 0;
@@ -546,7 +591,7 @@ export class CentralizedKernelWorker {
           size = len + 1;
         } else if (desc.size.type === "arg") {
           size = origArgs[desc.size.argIndex];
-          if (syscallNr === 60) size *= 8;
+          if (syscallNr === SYS_POLL) size *= 8;
         } else {
           size = desc.size.size;
         }
@@ -557,10 +602,8 @@ export class CentralizedKernelWorker {
 
         // Copy output data from kernel to process
         if (desc.direction === "out" || desc.direction === "inout") {
-          // For read-like syscalls, only copy the actual bytes returned
           let copySize = size;
           if (desc.direction === "out" && desc.size.type === "arg") {
-            // For read/recv etc., retVal is the actual bytes read
             if (retVal > 0 && retVal < size) {
               copySize = retVal;
             }
@@ -587,9 +630,157 @@ export class CentralizedKernelWorker {
 
     // Re-listen for next syscall
     if (this.processes.has(channel.pid)) {
-      // Use queueMicrotask to avoid stack buildup from rapid syscalls
       queueMicrotask(() => this.listenOnChannel(channel));
     }
+  }
+
+  /**
+   * Handle EAGAIN retry for blocking syscalls.
+   * The process stays blocked while we retry asynchronously.
+   */
+  private handleBlockingRetry(
+    channel: ChannelInfo,
+    syscallNr: number,
+    origArgs: number[],
+  ): void {
+    if (!this.processes.has(channel.pid)) return;
+
+    // Futex wait: use Atomics.waitAsync on the target address in process memory
+    if (syscallNr === SYS_FUTEX) {
+      const futexOp = origArgs[1] & 0x7f; // mask out FUTEX_PRIVATE_FLAG
+      if (futexOp === 0) { // FUTEX_WAIT
+        const addr = origArgs[0]; // address in process memory
+        const expectedVal = origArgs[2];
+        const i32View = new Int32Array(channel.memory.buffer);
+        const index = addr >>> 2; // convert byte offset to i32 index
+
+        // Check if value already changed
+        const currentVal = Atomics.load(i32View, index);
+        if (currentVal !== expectedVal) {
+          // Value changed, retry syscall immediately — kernel should succeed
+          this.retrySyscall(channel);
+          return;
+        }
+
+        // Wait for value to change
+        const waitResult = Atomics.waitAsync(i32View, index, expectedVal);
+        if (waitResult.async) {
+          waitResult.value.then(() => {
+            if (this.processes.has(channel.pid)) {
+              this.retrySyscall(channel);
+            }
+          });
+        } else {
+          // Already changed
+          queueMicrotask(() => this.retrySyscall(channel));
+        }
+        return;
+      }
+    }
+
+    // Poll with timeout: the kernel did a non-blocking check and returned EAGAIN.
+    // We retry after a short delay. If poll has timeout=0 (EAGAIN means no events),
+    // we should return 0 immediately instead of retrying.
+    if (syscallNr === SYS_POLL) {
+      const timeout = origArgs[2]; // timeout in ms
+      if (timeout === 0) {
+        // Non-blocking poll — return 0 (no events)
+        this.completeChannel(channel, syscallNr, origArgs, SYSCALL_ARGS[syscallNr], 0, 0);
+        return;
+      }
+      // For timeout > 0, retry after min(timeout, retry_interval)
+      const retryMs = timeout > 0 ? Math.min(timeout, EAGAIN_RETRY_MS) : EAGAIN_RETRY_MS;
+      setTimeout(() => {
+        if (this.processes.has(channel.pid)) {
+          this.retrySyscall(channel);
+        }
+      }, retryMs);
+      return;
+    }
+
+    // Default: retry after short delay (pipe read/write, socket operations, etc.)
+    setTimeout(() => {
+      if (this.processes.has(channel.pid)) {
+        this.retrySyscall(channel);
+      }
+    }, EAGAIN_RETRY_MS);
+  }
+
+  /**
+   * Retry a syscall by re-invoking handleSyscall with the original
+   * args still in the process channel.
+   */
+  private retrySyscall(channel: ChannelInfo): void {
+    // The process channel still has the original args (we never wrote a response).
+    // Just re-handle it.
+    this.handleSyscall(channel);
+  }
+
+  /**
+   * Handle sleep syscalls where the kernel returns success immediately
+   * but we need to delay the channel response.
+   * Returns true if this is a sleep syscall that was handled.
+   */
+  private handleSleepDelay(
+    channel: ChannelInfo,
+    syscallNr: number,
+    origArgs: number[],
+    retVal: number,
+    errVal: number,
+  ): boolean {
+    if (syscallNr === SYS_NANOSLEEP && retVal >= 0) {
+      // nanosleep: a1 = pointer to timespec {sec, nsec} in kernel scratch
+      const kernelView = new DataView(this.kernelMemory!.buffer, this.scratchOffset);
+      const sec = kernelView.getUint32(CH_DATA, true);
+      const nsec = kernelView.getUint32(CH_DATA + 4, true);
+      const delayMs = sec * 1000 + Math.floor(nsec / 1_000_000);
+
+      if (delayMs > 0) {
+        setTimeout(() => {
+          if (this.processes.has(channel.pid)) {
+            this.completeChannel(channel, syscallNr, origArgs, SYSCALL_ARGS[syscallNr], retVal, errVal);
+          }
+        }, delayMs);
+        return true;
+      }
+    }
+
+    if (syscallNr === SYS_USLEEP && retVal >= 0) {
+      // usleep: a1 = microseconds
+      const usec = origArgs[0] >>> 0;
+      const delayMs = Math.max(1, Math.floor(usec / 1000));
+
+      if (delayMs > 0) {
+        setTimeout(() => {
+          if (this.processes.has(channel.pid)) {
+            this.completeChannel(channel, syscallNr, origArgs, SYSCALL_ARGS[syscallNr], retVal, errVal);
+          }
+        }, delayMs);
+        return true;
+      }
+    }
+
+    if (syscallNr === SYS_CLOCK_NANOSLEEP && retVal >= 0) {
+      // clock_nanosleep: a3 = pointer to timespec in kernel scratch
+      const kernelView = new DataView(this.kernelMemory!.buffer, this.scratchOffset);
+      // The timespec was copied to scratch data at a specific offset.
+      // We need to find where it was placed. Since it's arg index 2 (the 3rd arg),
+      // and it's the only pointer arg for this syscall, it should be at CH_DATA.
+      const sec = kernelView.getUint32(CH_DATA, true);
+      const nsec = kernelView.getUint32(CH_DATA + 4, true);
+      const delayMs = sec * 1000 + Math.floor(nsec / 1_000_000);
+
+      if (delayMs > 0) {
+        setTimeout(() => {
+          if (this.processes.has(channel.pid)) {
+            this.completeChannel(channel, syscallNr, origArgs, SYSCALL_ARGS[syscallNr], retVal, errVal);
+          }
+        }, delayMs);
+        return true;
+      }
+    }
+
+    return false;
   }
 
   /** Get the underlying kernel instance for direct access. */
