@@ -184,6 +184,8 @@ export interface ThreadInitMessage {
   wasmBytes: ArrayBuffer;
   kernelConfig: KernelConfig;
   programBytes?: ArrayBuffer;
+  /** Pre-compiled program module — avoids recompilation per thread. */
+  programModule?: WebAssembly.Module;
   fnPtr: number;
   argPtr: number;
   stackPtr: number;

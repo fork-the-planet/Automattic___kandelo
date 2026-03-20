@@ -22,6 +22,8 @@ export interface ProcessInfo {
   forkSab?: SharedArrayBuffer;
   waitpidSab?: SharedArrayBuffer;
   programBytes?: ArrayBuffer;
+  /** Cached compiled program module — shared with thread workers to avoid recompilation. */
+  programModule?: WebAssembly.Module;
 }
 
 export interface ProcessManagerConfig {
@@ -104,6 +106,13 @@ export class ProcessManager {
     };
 
     this.processes.set(pid, info);
+
+    // Pre-compile program module so thread workers can skip compilation.
+    if (options?.programBytes) {
+      WebAssembly.compile(options.programBytes).then((mod) => {
+        info.programModule = mod;
+      }).catch(() => {});
+    }
 
     const cleanup = () => {
       this.processes.delete(pid);
@@ -659,7 +668,8 @@ export class ProcessManager {
       tid,
       wasmBytes: this.config.wasmBytes.slice(0),
       kernelConfig: this.config.kernelConfig,
-      programBytes: parentInfo.programBytes?.slice(0),
+      programBytes: parentInfo.programModule ? undefined : parentInfo.programBytes?.slice(0),
+      programModule: parentInfo.programModule,
       fnPtr,
       argPtr,
       stackPtr,
