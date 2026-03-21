@@ -1,20 +1,19 @@
 # libc-test Failure Report
 
-Generated: 2026-03-20 22:49 UTC
+Generated: 2026-03-21 02:59 UTC
 
 | Status | Count |
 |--------|-------|
-| PASS | 295 |
-| FAIL | 15 |
+| PASS | 296 |
+| FAIL | 14 |
 | BUILD | 0 |
 | TIMEOUT | 14 |
 | **TOTAL** | **324** |
 
-## Runtime Failures (15)
+## Runtime Failures (14)
 
 | Test | Category |
 |------|----------|
-| `execle-env` |  regression |
 | `acosh` |  math |
 | `asinh` |  math |
 | `erfc` |  math |
@@ -49,7 +48,7 @@ Generated: 2026-03-20 22:49 UTC
 | `sigaltstack` |  regression |
 | `tls_get_new-dtv` |  regression |
 
-## Passing Tests (295)
+## Passing Tests (296)
 
 <details>
 <summary>Click to expand</summary>
@@ -118,6 +117,7 @@ Generated: 2026-03-20 22:49 UTC
 | `daemon-failure` |  regression |
 | `dn_expand-empty` |  regression |
 | `dn_expand-ptr-0` |  regression |
+| `execle-env` |  regression |
 | `fflush-exit` |  regression |
 | `fgets-eof` |  regression |
 | `fpclassify-invalid-ld80` |  regression |
