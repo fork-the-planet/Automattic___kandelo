@@ -106,6 +106,11 @@ export async function workerMain(
   createIO: CreateIOFn,
 ): Promise<void> {
   try {
+    // Track whether an exec is in progress. When exec succeeds, the kernel
+    // traps (unreachable) to stop the old program. We use this flag to
+    // distinguish an exec-trap from a bug-trap.
+    let execInProgress = false;
+
     const callbacks: KernelCallbacks = {
       onKill: (pid: number, signal: number): number => {
         port.postMessage({
@@ -117,6 +122,7 @@ export async function workerMain(
         return 0; // fire-and-forget from kernel's perspective
       },
       onExec: (path: string): number => {
+        execInProgress = true;
         port.postMessage({
           type: "exec_request",
           pid: initData.pid,
@@ -238,12 +244,15 @@ export async function workerMain(
                 },
               },
             );
-            port.postMessage({
-              type: "exit",
-              pid: initData.pid,
-              status: exitCode,
-            } satisfies WorkerToHostMessage);
+            if (!execInProgress) {
+              port.postMessage({
+                type: "exit",
+                pid: initData.pid,
+                status: exitCode,
+              } satisfies WorkerToHostMessage);
+            }
           } catch (err) {
+            if (execInProgress) return;
             port.postMessage({
               type: "error",
               pid: initData.pid,
@@ -389,12 +398,20 @@ export async function workerMain(
               forkHandler: createAsyncifyForkHandler(kernel, port, initData),
             },
           );
-          port.postMessage({
-            type: "exit",
-            pid: initData.pid,
-            status: exitCode,
-          } satisfies WorkerToHostMessage);
+          if (!execInProgress) {
+            port.postMessage({
+              type: "exit",
+              pid: initData.pid,
+              status: exitCode,
+            } satisfies WorkerToHostMessage);
+          }
+          // If exec is in progress, the exec_reply handler will send exit.
         } catch (err) {
+          if (execInProgress) {
+            // Exec succeeded — the kernel trapped to stop the old program.
+            // The exec_reply handler will run the new program.
+            return;
+          }
           port.postMessage({
             type: "error",
             pid: initData.pid,

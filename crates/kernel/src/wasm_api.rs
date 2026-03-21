@@ -4001,18 +4001,42 @@ pub extern "C" fn kernel_realpath(
 // execve
 // ---------------------------------------------------------------------------
 
-/// Execute a new program. Returns 0 on success, or negative errno.
+/// Execute a new program. On success, traps (never returns) because the
+/// process image is being replaced asynchronously by the host. On failure,
+/// returns negative errno.
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_execve(path_ptr: *const u8, path_len: u32) -> i32 {
-    let (_gkl, proc) = unsafe { get_process() };
-    let path = unsafe { slice::from_raw_parts(path_ptr, path_len as usize) };
-    let mut host = WasmHostIO;
-    let result = match syscalls::sys_execve(proc, &mut host, path) {
-        Ok(()) => 0,
-        Err(e) => -(e as i32),
+    let result = {
+        let (_gkl, proc) = unsafe { get_process() };
+        let path = unsafe { slice::from_raw_parts(path_ptr, path_len as usize) };
+        let mut host = WasmHostIO;
+        match syscalls::sys_execve(proc, &mut host, path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                deliver_pending_signals(proc, &mut host);
+                Err(e)
+            }
+        }
+        // _gkl is dropped here, releasing the Global Kernel Lock
     };
-    deliver_pending_signals(proc, &mut host);
-    result
+
+    match result {
+        Ok(()) => {
+            // Exec succeeded — the host is asynchronously replacing this process
+            // image. Trap to stop the current wasm execution immediately.
+            // GKL must be released before trapping so subsequent kernel calls
+            // (e.g. kernel_get_exec_state) don't deadlock.
+            #[cfg(target_arch = "wasm32")]
+            unsafe {
+                core::arch::wasm32::unreachable();
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                0
+            }
+        }
+        Err(e) => -(e as i32),
+    }
 }
 
 // ---------------------------------------------------------------------------
