@@ -132,6 +132,27 @@ impl EpollInstance {
     }
 }
 
+/// Per-timerfd state: clock, interval, and next expiration.
+#[derive(Debug, Clone)]
+pub struct TimerFdState {
+    pub clock_id: u32,
+    /// Interval for repeating timers (0 = one-shot).
+    pub interval_sec: i64,
+    pub interval_nsec: i64,
+    /// Next expiration time (absolute, in the timer's clock).
+    /// 0/0 = disarmed.
+    pub value_sec: i64,
+    pub value_nsec: i64,
+    /// Number of expirations not yet read.
+    pub expirations: u64,
+}
+
+/// Per-signalfd state: the set of signals to watch.
+#[derive(Debug, Clone)]
+pub struct SignalFdState {
+    pub mask: u64,
+}
+
 /// File descriptor action to apply in a fork child before exec.
 #[derive(Debug, Clone)]
 pub enum FdAction {
@@ -187,6 +208,10 @@ pub struct Process {
     pub eventfds: Vec<Option<EventFdState>>,
     /// Epoll instances owned by this process.
     pub epolls: Vec<Option<EpollInstance>>,
+    /// Timerfd instances owned by this process.
+    pub timerfds: Vec<Option<TimerFdState>>,
+    /// Signalfd instances owned by this process.
+    pub signalfds: Vec<Option<SignalFdState>>,
 }
 
 impl Process {
@@ -248,6 +273,8 @@ impl Process {
             next_tid: 0, // will be set to pid + 1 after pid is known
             eventfds: Vec::new(),
             epolls: Vec::new(),
+            timerfds: Vec::new(),
+            signalfds: Vec::new(),
         }
     }
 

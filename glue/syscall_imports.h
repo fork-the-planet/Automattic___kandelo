@@ -99,6 +99,18 @@ int32_t kernel_epoll_ctl(int32_t epfd, int32_t op, int32_t fd, uint8_t *event_pt
 KERNEL_IMPORT(kernel_epoll_pwait)
 int32_t kernel_epoll_pwait(int32_t epfd, uint8_t *events_ptr, int32_t maxevents, int32_t timeout, uint32_t sigmask_ptr);
 
+KERNEL_IMPORT(kernel_timerfd_create)
+int32_t kernel_timerfd_create(uint32_t clock_id, uint32_t flags);
+
+KERNEL_IMPORT(kernel_timerfd_settime)
+int32_t kernel_timerfd_settime(int32_t fd, uint32_t flags, const uint8_t *new_ptr, uint8_t *old_ptr);
+
+KERNEL_IMPORT(kernel_timerfd_gettime)
+int32_t kernel_timerfd_gettime(int32_t fd, uint8_t *cur_ptr);
+
+KERNEL_IMPORT(kernel_signalfd4)
+int32_t kernel_signalfd4(int32_t fd, uint32_t mask_ptr, uint32_t sigsetsize, uint32_t flags);
+
 KERNEL_IMPORT(kernel_fcntl)
 int32_t kernel_fcntl(int32_t fd, uint32_t cmd, uint32_t arg);
 

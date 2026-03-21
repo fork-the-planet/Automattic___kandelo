@@ -138,6 +138,18 @@ impl SignalState {
         (self.pending & (1u64 << signum)) != 0
     }
 
+    /// Return the raw pending signal bitmask.
+    pub fn pending_mask(&self) -> u64 {
+        self.pending
+    }
+
+    /// Clear a signal from the pending set.
+    pub fn clear_pending(&mut self, signum: u32) {
+        if signum > 0 && signum < 64 {
+            self.pending &= !(1u64 << signum);
+        }
+    }
+
     /// Check if a signal is blocked.
     pub fn is_blocked(&self, signum: u32) -> bool {
         if signum >= 64 { return false; }

@@ -1306,9 +1306,18 @@ fn dispatch_channel_syscall(nr: u32, args: &[i32; 6]) -> i32 {
         242 => kernel_eventfd2(a1 as u32, a2 as u32), // SYS_EVENTFD2: (initval, flags)
         380 => kernel_eventfd2(a1 as u32, 0),          // SYS_EVENTFD: (initval) — no flags
 
+        // timerfd
+        243 => kernel_timerfd_create(a1 as u32, a2 as u32), // SYS_TIMERFD_CREATE: (clockid, flags)
+        244 => kernel_timerfd_settime(a1, a2 as u32, a3 as *const u8, a4 as *mut u8), // SYS_TIMERFD_SETTIME
+        245 => kernel_timerfd_gettime(a1, a2 as *mut u8), // SYS_TIMERFD_GETTIME
+
+        // signalfd
+        246 => kernel_signalfd4(a1, a2 as u32, a3 as u32, a4 as u32), // SYS_SIGNALFD4: (fd, mask_ptr, sigsetsize, flags)
+        377 => kernel_signalfd4(a1, a2 as u32, a3 as u32, 0),          // SYS_SIGNALFD: (fd, mask_ptr, sigsetsize)
+
         // Stubs that return 0 or -ENOSYS
         204 => kernel_raise(a2 as u32),            // SYS_TKILL
-        208 | 209 | 226 | 230..=238 | 243..=249 | 252..=254 | 256..=257 | 262 | 265..=268 | 271..=274 | 287 | 289..=293 | 297..=298 | 301..=305 | 306 | 308..=324 | 325..=336 | 348..=349 | 350..=369 | 370..=371 | 373..=377 | 381..=383 | 386 => {
+        208 | 209 | 226 | 230..=238 | 247..=249 | 252..=254 | 256..=257 | 262 | 265..=268 | 271..=274 | 287 | 289..=293 | 297..=298 | 301..=305 | 306 | 308..=324 | 325..=336 | 348..=349 | 350..=369 | 370..=371 | 373..=376 | 381..=383 | 386 => {
             // Many of these are stubs in the glue layer too; return ENOSYS
             -(Errno::ENOSYS as i32)
         }
@@ -1766,6 +1775,103 @@ pub extern "C" fn kernel_epoll_pwait(
         }
         Err(e) => -(e as i32),
     };
+    deliver_pending_signals(proc, &mut host);
+    result
+}
+
+/// Create a timerfd.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_timerfd_create(clock_id: u32, flags: u32) -> i32 {
+    let (_gkl, proc) = unsafe { get_process() };
+    let result = match syscalls::sys_timerfd_create(proc, clock_id, flags) {
+        Ok(fd) => fd,
+        Err(e) => -(e as i32),
+    };
+    let mut host = WasmHostIO;
+    deliver_pending_signals(proc, &mut host);
+    result
+}
+
+/// Set or disarm a timerfd timer.
+/// new_value_ptr points to itimerspec (32 bytes: interval_sec, interval_nsec, value_sec, value_nsec).
+/// old_value_ptr (if non-null) receives the old itimerspec.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_timerfd_settime(fd: i32, flags: u32, new_ptr: *const u8, old_ptr: *mut u8) -> i32 {
+    let (_gkl, proc) = unsafe { get_process() };
+    let mut host = WasmHostIO;
+
+    // Read itimerspec: { it_interval: { tv_sec, tv_nsec }, it_value: { tv_sec, tv_nsec } }
+    // On wasm32: each field is i64, so 4 x 8 = 32 bytes total
+    let (isec, insec, vsec, vnsec) = unsafe {
+        let isec = core::ptr::read_unaligned(new_ptr as *const i64);
+        let insec = core::ptr::read_unaligned(new_ptr.add(8) as *const i64);
+        let vsec = core::ptr::read_unaligned(new_ptr.add(16) as *const i64);
+        let vnsec = core::ptr::read_unaligned(new_ptr.add(24) as *const i64);
+        (isec, insec, vsec, vnsec)
+    };
+
+    let result = match syscalls::sys_timerfd_settime(proc, &mut host, fd, flags, isec, insec, vsec, vnsec) {
+        Ok((oisec, oinsec, ovsec, ovnsec)) => {
+            if !old_ptr.is_null() {
+                unsafe {
+                    core::ptr::write_unaligned(old_ptr as *mut i64, oisec);
+                    core::ptr::write_unaligned(old_ptr.add(8) as *mut i64, oinsec);
+                    core::ptr::write_unaligned(old_ptr.add(16) as *mut i64, ovsec);
+                    core::ptr::write_unaligned(old_ptr.add(24) as *mut i64, ovnsec);
+                }
+            }
+            0
+        }
+        Err(e) => -(e as i32),
+    };
+    deliver_pending_signals(proc, &mut host);
+    result
+}
+
+/// Get the remaining time of a timerfd timer.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_timerfd_gettime(fd: i32, cur_ptr: *mut u8) -> i32 {
+    let (_gkl, proc) = unsafe { get_process() };
+    let mut host = WasmHostIO;
+
+    let result = match syscalls::sys_timerfd_gettime(proc, &mut host, fd) {
+        Ok((isec, insec, vsec, vnsec)) => {
+            unsafe {
+                core::ptr::write_unaligned(cur_ptr as *mut i64, isec);
+                core::ptr::write_unaligned(cur_ptr.add(8) as *mut i64, insec);
+                core::ptr::write_unaligned(cur_ptr.add(16) as *mut i64, vsec);
+                core::ptr::write_unaligned(cur_ptr.add(24) as *mut i64, vnsec);
+            }
+            0
+        }
+        Err(e) => -(e as i32),
+    };
+    deliver_pending_signals(proc, &mut host);
+    result
+}
+
+/// Create or update a signalfd.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_signalfd4(fd: i32, mask_ptr: u32, _sigsetsize: u32, flags: u32) -> i32 {
+    let (_gkl, proc) = unsafe { get_process() };
+
+    // Read signal mask from pointer
+    let mask = if mask_ptr != 0 {
+        #[cfg(target_arch = "wasm32")]
+        {
+            unsafe { *(mask_ptr as *const u64) }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        { 0u64 }
+    } else {
+        0u64
+    };
+
+    let result = match syscalls::sys_signalfd4(proc, fd, mask, flags) {
+        Ok(fd) => fd,
+        Err(e) => -(e as i32),
+    };
+    let mut host = WasmHostIO;
     deliver_pending_signals(proc, &mut host);
     result
 }

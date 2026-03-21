@@ -1834,14 +1834,16 @@ static long __do_syscall(long n, long a1, long a2, long a3,
         return (long)kernel_eventfd2((uint32_t)a1, 0);
 
     case SYS_SIGNALFD4:
+        return (long)kernel_signalfd4((int32_t)a1, (uint32_t)(uintptr_t)a2, (uint32_t)a3, (uint32_t)a4);
     case SYS_SIGNALFD:
-        return ENOSYS_NEG;
+        return (long)kernel_signalfd4((int32_t)a1, (uint32_t)(uintptr_t)a2, (uint32_t)a3, 0);
 
     case SYS_TIMERFD_CREATE:
-        return ENOSYS_NEG;
+        return (long)kernel_timerfd_create((uint32_t)a1, (uint32_t)a2);
     case SYS_TIMERFD_SETTIME:
+        return (long)kernel_timerfd_settime((int32_t)a1, (uint32_t)a2, (const uint8_t *)(uintptr_t)a3, (uint8_t *)(uintptr_t)a4);
     case SYS_TIMERFD_GETTIME:
-        return -22; /* -EINVAL */
+        return (long)kernel_timerfd_gettime((int32_t)a1, (uint8_t *)(uintptr_t)a2);
 
     case SYS_INOTIFY_INIT1:
     case SYS_INOTIFY_INIT:

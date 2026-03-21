@@ -15,6 +15,8 @@ pub enum FileType {
     Socket,
     EventFd,
     Epoll,
+    TimerFd,
+    SignalFd,
 }
 
 #[derive(Clone)]

@@ -252,11 +252,16 @@ pub fn sys_close(
                 }
             }
             FileType::Epoll => {
-                // Free the epoll instance
                 let ep_idx = (-(host_handle + 1)) as usize;
-                if let Some(slot) = proc.epolls.get_mut(ep_idx) {
-                    *slot = None;
-                }
+                if let Some(slot) = proc.epolls.get_mut(ep_idx) { *slot = None; }
+            }
+            FileType::TimerFd => {
+                let tfd_idx = (-(host_handle + 1)) as usize;
+                if let Some(slot) = proc.timerfds.get_mut(tfd_idx) { *slot = None; }
+            }
+            FileType::SignalFd => {
+                let sfd_idx = (-(host_handle + 1)) as usize;
+                if let Some(slot) = proc.signalfds.get_mut(sfd_idx) { *slot = None; }
             }
             _ => {
                 // Close any lazily-opened directory iteration handle
@@ -399,6 +404,97 @@ pub fn sys_read(
                     }
                 }
             }
+        }
+        FileType::TimerFd => {
+            if buf.len() < 8 {
+                return Err(Errno::EINVAL);
+            }
+            let tfd_idx = (-(host_handle + 1)) as usize;
+            // Compute expirations lazily
+            let (now_sec, now_nsec) = host.host_clock_gettime(0)?;
+            if let Some(Some(tfd)) = proc.timerfds.get_mut(tfd_idx) {
+                timerfd_compute_expirations(tfd, now_sec, now_nsec);
+            }
+            let tfd = proc.timerfds.get_mut(tfd_idx)
+                .and_then(|s| s.as_mut())
+                .ok_or(Errno::EBADF)?;
+            if tfd.expirations == 0 {
+                if status_flags & O_NONBLOCK != 0 || crate::is_centralized_mode() {
+                    return Err(Errno::EAGAIN);
+                }
+                loop {
+                    if proc.signals.deliverable() != 0 && !proc.signals.should_restart() {
+                        return Err(Errno::EINTR);
+                    }
+                    let _ = host.host_nanosleep(0, 1_000_000);
+                    let (now_sec, now_nsec) = host.host_clock_gettime(0)?;
+                    if let Some(Some(tfd)) = proc.timerfds.get_mut(tfd_idx) {
+                        timerfd_compute_expirations(tfd, now_sec, now_nsec);
+                        if tfd.expirations > 0 { break; }
+                    } else {
+                        return Err(Errno::EBADF);
+                    }
+                }
+            }
+            let tfd = proc.timerfds.get_mut(tfd_idx)
+                .and_then(|s| s.as_mut())
+                .ok_or(Errno::EBADF)?;
+            let count = tfd.expirations;
+            tfd.expirations = 0;
+            buf[..8].copy_from_slice(&count.to_le_bytes());
+            Ok(8)
+        }
+        FileType::SignalFd => {
+            // signalfd read: return signalfd_siginfo for pending signals matching mask.
+            // signalfd_siginfo is 128 bytes. For simplicity, we return a minimal version.
+            if buf.len() < 128 {
+                return Err(Errno::EINVAL);
+            }
+            let sfd_idx = (-(host_handle + 1)) as usize;
+            let mask = proc.signalfds.get(sfd_idx)
+                .and_then(|s| s.as_ref())
+                .ok_or(Errno::EBADF)?
+                .mask;
+            // Find a pending signal matching the mask
+            let pending = proc.signals.pending_mask();
+            let matching = pending & mask;
+            if matching == 0 {
+                if status_flags & O_NONBLOCK != 0 || crate::is_centralized_mode() {
+                    return Err(Errno::EAGAIN);
+                }
+                // Block until signal arrives (non-centralized only)
+                loop {
+                    if proc.signals.deliverable() != 0 && !proc.signals.should_restart() {
+                        return Err(Errno::EINTR);
+                    }
+                    let _ = host.host_nanosleep(0, 1_000_000);
+                    let mask2 = proc.signalfds.get(sfd_idx)
+                        .and_then(|s| s.as_ref())
+                        .ok_or(Errno::EBADF)?
+                        .mask;
+                    if proc.signals.pending_mask() & mask2 != 0 {
+                        break;
+                    }
+                }
+            }
+            // Re-read mask and find signal
+            let mask = proc.signalfds.get(sfd_idx)
+                .and_then(|s| s.as_ref())
+                .ok_or(Errno::EBADF)?
+                .mask;
+            let pending = proc.signals.pending_mask();
+            let matching = pending & mask;
+            if matching == 0 {
+                return Err(Errno::EAGAIN);
+            }
+            // Find lowest matching signal (bit N = signal N)
+            let signo = matching.trailing_zeros();
+            // Consume the signal from pending
+            proc.signals.clear_pending(signo);
+            // Write signalfd_siginfo (128 bytes): only ssi_signo at offset 0
+            for b in buf[..128].iter_mut() { *b = 0; }
+            buf[..4].copy_from_slice(&signo.to_le_bytes());
+            Ok(128)
         }
         FileType::EventFd => {
             // eventfd read: must be exactly 8 bytes
@@ -683,8 +779,8 @@ pub fn sys_lseek(
 
     let ofd = proc.ofd_table.get_mut(ofd_idx).ok_or(Errno::EBADF)?;
 
-    // Pipes, sockets, eventfds, and epolls are not seekable.
-    if matches!(ofd.file_type, FileType::Pipe | FileType::Socket | FileType::EventFd | FileType::Epoll) {
+    // Non-seekable file types.
+    if matches!(ofd.file_type, FileType::Pipe | FileType::Socket | FileType::EventFd | FileType::Epoll | FileType::TimerFd | FileType::SignalFd) {
         return Err(Errno::ESPIPE);
     }
 
@@ -733,7 +829,7 @@ pub fn sys_pread(
     }
 
     // pread is only valid for seekable fds
-    if matches!(ofd.file_type, FileType::Pipe | FileType::Socket | FileType::EventFd | FileType::Epoll) {
+    if matches!(ofd.file_type, FileType::Pipe | FileType::Socket | FileType::EventFd | FileType::Epoll | FileType::TimerFd | FileType::SignalFd) {
         return Err(Errno::ESPIPE);
     }
 
@@ -766,7 +862,7 @@ pub fn sys_pwrite(
         return Err(Errno::EBADF);
     }
 
-    if matches!(ofd.file_type, FileType::Pipe | FileType::Socket | FileType::EventFd | FileType::Epoll) {
+    if matches!(ofd.file_type, FileType::Pipe | FileType::Socket | FileType::EventFd | FileType::Epoll | FileType::TimerFd | FileType::SignalFd) {
         return Err(Errno::ESPIPE);
     }
 
@@ -1057,7 +1153,7 @@ pub fn sys_fstat(
 
     let ofd = proc.ofd_table.get(ofd_idx).ok_or(Errno::EBADF)?;
 
-    if matches!(ofd.file_type, FileType::Pipe | FileType::EventFd | FileType::Epoll) {
+    if matches!(ofd.file_type, FileType::Pipe | FileType::EventFd | FileType::Epoll | FileType::TimerFd | FileType::SignalFd) {
         Ok(WasmStat {
             st_dev: 0,
             st_ino: 0,
@@ -3263,6 +3359,24 @@ fn poll_check(proc: &mut Process, fds: &mut [WasmPollFd]) -> i32 {
             FileType::Epoll => {
                 // Epoll fds are not typically polled; report not ready
             }
+            FileType::TimerFd => {
+                let tfd_idx = (-(ofd.host_handle + 1)) as usize;
+                if let Some(Some(tfd)) = proc.timerfds.get(tfd_idx) {
+                    // Check if timer has expired (lazy: just check expirations counter)
+                    if pollfd.events & POLLIN != 0 && tfd.expirations > 0 {
+                        revents |= POLLIN;
+                    }
+                }
+            }
+            FileType::SignalFd => {
+                let sfd_idx = (-(ofd.host_handle + 1)) as usize;
+                if let Some(Some(sfd)) = proc.signalfds.get(sfd_idx) {
+                    let matching = proc.signals.pending_mask() & sfd.mask;
+                    if pollfd.events & POLLIN != 0 && matching != 0 {
+                        revents |= POLLIN;
+                    }
+                }
+            }
             FileType::Regular | FileType::CharDevice | FileType::Directory => {
                 // Regular files and char devices are always ready
                 if pollfd.events & POLLIN != 0 {
@@ -4225,7 +4339,7 @@ pub fn sys_epoll_pwait(
         let _ = sys_sigprocmask(proc, SIG_SETMASK, old);
     }
 
-    let ready_count = ready?;
+    let _ready_count = ready?;
 
     // Map poll results back to epoll events
     let mut events_out: Vec<(u32, u64)> = Vec::new();
@@ -4241,6 +4355,242 @@ pub fn sys_epoll_pwait(
     }
 
     Ok((events_out.len() as i32, events_out))
+}
+
+/// timerfd_create — create a timer file descriptor.
+pub fn sys_timerfd_create(proc: &mut Process, clock_id: u32, flags: u32) -> Result<i32, Errno> {
+    use crate::ofd::FileType;
+    use crate::process::TimerFdState;
+    use wasm_posix_shared::fd_flags::FD_CLOEXEC;
+
+    // TFD_CLOEXEC = O_CLOEXEC, TFD_NONBLOCK = O_NONBLOCK
+    let cloexec = flags & O_CLOEXEC != 0;
+    let nonblock = flags & O_NONBLOCK != 0;
+    let valid_flags = O_CLOEXEC | O_NONBLOCK;
+    if flags & !valid_flags != 0 {
+        return Err(Errno::EINVAL);
+    }
+
+    let state = TimerFdState {
+        clock_id,
+        interval_sec: 0,
+        interval_nsec: 0,
+        value_sec: 0,
+        value_nsec: 0,
+        expirations: 0,
+    };
+
+    let tfd_idx = {
+        let mut found = None;
+        for (i, slot) in proc.timerfds.iter().enumerate() {
+            if slot.is_none() { found = Some(i); break; }
+        }
+        match found {
+            Some(i) => { proc.timerfds[i] = Some(state); i }
+            None => { let i = proc.timerfds.len(); proc.timerfds.push(Some(state)); i }
+        }
+    };
+
+    let handle = -((tfd_idx as i64) + 1);
+    let mut status_flags = O_RDWR;
+    if nonblock { status_flags |= O_NONBLOCK; }
+    let ofd_idx = proc.ofd_table.create(FileType::TimerFd, status_flags, handle, b"/dev/timerfd".to_vec());
+    let fd_flags = if cloexec { FD_CLOEXEC } else { 0 };
+    match proc.fd_table.alloc(OpenFileDescRef(ofd_idx), fd_flags) {
+        Ok(fd) => Ok(fd),
+        Err(e) => {
+            proc.ofd_table.dec_ref(ofd_idx);
+            proc.timerfds[tfd_idx] = None;
+            Err(e)
+        }
+    }
+}
+
+/// timerfd_settime — arm or disarm a timer.
+///
+/// new_value: (interval_sec, interval_nsec, value_sec, value_nsec).
+/// Returns old timer value if successful.
+pub fn sys_timerfd_settime(
+    proc: &mut Process,
+    host: &mut dyn HostIO,
+    fd: i32,
+    flags: u32,
+    interval_sec: i64,
+    interval_nsec: i64,
+    value_sec: i64,
+    value_nsec: i64,
+) -> Result<(i64, i64, i64, i64), Errno> {
+    let entry = proc.fd_table.get(fd)?;
+    let ofd = proc.ofd_table.get(entry.ofd_ref.0).ok_or(Errno::EBADF)?;
+    if ofd.file_type != FileType::TimerFd {
+        return Err(Errno::EINVAL);
+    }
+    let tfd_idx = (-(ofd.host_handle + 1)) as usize;
+    let tfd = proc.timerfds.get_mut(tfd_idx)
+        .and_then(|s| s.as_mut())
+        .ok_or(Errno::EBADF)?;
+
+    let old = (tfd.interval_sec, tfd.interval_nsec, tfd.value_sec, tfd.value_nsec);
+
+    const TFD_TIMER_ABSTIME: u32 = 1;
+
+    if value_sec == 0 && value_nsec == 0 {
+        // Disarm the timer
+        tfd.interval_sec = 0;
+        tfd.interval_nsec = 0;
+        tfd.value_sec = 0;
+        tfd.value_nsec = 0;
+        tfd.expirations = 0;
+    } else {
+        tfd.interval_sec = interval_sec;
+        tfd.interval_nsec = interval_nsec;
+        if flags & TFD_TIMER_ABSTIME != 0 {
+            tfd.value_sec = value_sec;
+            tfd.value_nsec = value_nsec;
+        } else {
+            // Relative: add current time
+            let clock_id = tfd.clock_id;
+            let (now_sec, now_nsec) = host.host_clock_gettime(clock_id)?;
+            let mut total_nsec = now_nsec + value_nsec;
+            let mut total_sec = now_sec + value_sec;
+            if total_nsec >= 1_000_000_000 {
+                total_sec += total_nsec / 1_000_000_000;
+                total_nsec %= 1_000_000_000;
+            }
+            tfd.value_sec = total_sec;
+            tfd.value_nsec = total_nsec;
+        }
+        tfd.expirations = 0;
+    }
+
+    Ok(old)
+}
+
+/// timerfd_gettime — get remaining time until next expiration.
+pub fn sys_timerfd_gettime(
+    proc: &mut Process,
+    host: &mut dyn HostIO,
+    fd: i32,
+) -> Result<(i64, i64, i64, i64), Errno> {
+    let entry = proc.fd_table.get(fd)?;
+    let ofd = proc.ofd_table.get(entry.ofd_ref.0).ok_or(Errno::EBADF)?;
+    if ofd.file_type != FileType::TimerFd {
+        return Err(Errno::EINVAL);
+    }
+    let tfd_idx = (-(ofd.host_handle + 1)) as usize;
+    let tfd = proc.timerfds.get(tfd_idx)
+        .and_then(|s| s.as_ref())
+        .ok_or(Errno::EBADF)?;
+
+    if tfd.value_sec == 0 && tfd.value_nsec == 0 {
+        return Ok((0, 0, 0, 0));
+    }
+
+    let (now_sec, now_nsec) = host.host_clock_gettime(tfd.clock_id)?;
+    let mut remain_sec = tfd.value_sec - now_sec;
+    let mut remain_nsec = tfd.value_nsec - now_nsec;
+    if remain_nsec < 0 {
+        remain_sec -= 1;
+        remain_nsec += 1_000_000_000;
+    }
+    if remain_sec < 0 {
+        remain_sec = 0;
+        remain_nsec = 0;
+    }
+    Ok((tfd.interval_sec, tfd.interval_nsec, remain_sec, remain_nsec))
+}
+
+/// Helper: compute timerfd expirations lazily.
+fn timerfd_compute_expirations(tfd: &mut crate::process::TimerFdState, now_sec: i64, now_nsec: i64) {
+    if tfd.value_sec == 0 && tfd.value_nsec == 0 {
+        return; // disarmed
+    }
+    // Check if timer has expired
+    if now_sec > tfd.value_sec || (now_sec == tfd.value_sec && now_nsec >= tfd.value_nsec) {
+        if tfd.interval_sec == 0 && tfd.interval_nsec == 0 {
+            // One-shot: one expiration
+            tfd.expirations = 1;
+            tfd.value_sec = 0;
+            tfd.value_nsec = 0;
+        } else {
+            // Repeating: compute number of intervals elapsed
+            let elapsed_sec = now_sec - tfd.value_sec;
+            let elapsed_nsec = now_nsec - tfd.value_nsec;
+            let elapsed_total_ns = elapsed_sec * 1_000_000_000 + elapsed_nsec;
+            let interval_ns = tfd.interval_sec * 1_000_000_000 + tfd.interval_nsec;
+            if interval_ns > 0 {
+                let count = (elapsed_total_ns / interval_ns) + 1;
+                tfd.expirations += count as u64;
+                // Advance value to next future expiration
+                let advance_ns = count * interval_ns;
+                let new_ns = (tfd.value_sec * 1_000_000_000 + tfd.value_nsec) + advance_ns;
+                tfd.value_sec = new_ns / 1_000_000_000;
+                tfd.value_nsec = new_ns % 1_000_000_000;
+            } else {
+                tfd.expirations = 1;
+            }
+        }
+    }
+}
+
+/// signalfd4 — create or update a signal fd.
+///
+/// If fd == -1, create a new signalfd. Otherwise, update the mask of an existing one.
+pub fn sys_signalfd4(proc: &mut Process, fd: i32, mask: u64, flags: u32) -> Result<i32, Errno> {
+    use crate::ofd::FileType;
+    use crate::process::SignalFdState;
+    use wasm_posix_shared::fd_flags::FD_CLOEXEC;
+
+    // SFD_CLOEXEC = O_CLOEXEC, SFD_NONBLOCK = O_NONBLOCK
+    let cloexec = flags & O_CLOEXEC != 0;
+    let nonblock = flags & O_NONBLOCK != 0;
+    let valid_flags = O_CLOEXEC | O_NONBLOCK;
+    if flags & !valid_flags != 0 {
+        return Err(Errno::EINVAL);
+    }
+
+    if fd != -1 {
+        // Update existing signalfd
+        let entry = proc.fd_table.get(fd)?;
+        let ofd = proc.ofd_table.get(entry.ofd_ref.0).ok_or(Errno::EBADF)?;
+        if ofd.file_type != FileType::SignalFd {
+            return Err(Errno::EINVAL);
+        }
+        let sfd_idx = (-(ofd.host_handle + 1)) as usize;
+        let sfd = proc.signalfds.get_mut(sfd_idx)
+            .and_then(|s| s.as_mut())
+            .ok_or(Errno::EBADF)?;
+        sfd.mask = mask;
+        return Ok(fd);
+    }
+
+    // Create new signalfd
+    let state = SignalFdState { mask };
+
+    let sfd_idx = {
+        let mut found = None;
+        for (i, slot) in proc.signalfds.iter().enumerate() {
+            if slot.is_none() { found = Some(i); break; }
+        }
+        match found {
+            Some(i) => { proc.signalfds[i] = Some(state); i }
+            None => { let i = proc.signalfds.len(); proc.signalfds.push(Some(state)); i }
+        }
+    };
+
+    let handle = -((sfd_idx as i64) + 1);
+    let mut status_flags = O_RDONLY;
+    if nonblock { status_flags |= O_NONBLOCK; }
+    let ofd_idx = proc.ofd_table.create(FileType::SignalFd, status_flags, handle, b"/dev/signalfd".to_vec());
+    let fd_flags = if cloexec { FD_CLOEXEC } else { 0 };
+    match proc.fd_table.alloc(OpenFileDescRef(ofd_idx), fd_flags) {
+        Ok(fd) => Ok(fd),
+        Err(e) => {
+            proc.ofd_table.dec_ref(ofd_idx);
+            proc.signalfds[sfd_idx] = None;
+            Err(e)
+        }
+    }
 }
 
 /// umask — set file creation mask, return previous mask
@@ -4882,11 +5232,12 @@ mod tests {
         dir_entry_count: usize,     // total number of mock entries
         sigsuspend_signal: u32,
         sigsuspend_error: bool,
+        clock_time: (i64, i64),
     }
 
     impl MockHostIO {
         fn new() -> Self {
-            MockHostIO { next_handle: 100, dir_entry_returned: false, dir_entry_index: 0, dir_entry_count: 1, sigsuspend_signal: 0, sigsuspend_error: false }
+            MockHostIO { next_handle: 100, dir_entry_returned: false, dir_entry_index: 0, dir_entry_count: 1, sigsuspend_signal: 0, sigsuspend_error: false, clock_time: (1234567890, 123456789) }
         }
     }
 
@@ -5012,7 +5363,7 @@ mod tests {
         fn host_closedir(&mut self, _handle: i64) -> Result<(), Errno> { Ok(()) }
 
         fn host_clock_gettime(&mut self, _clock_id: u32) -> Result<(i64, i64), Errno> {
-            Ok((1234567890, 123456789))
+            Ok(self.clock_time)
         }
 
         fn host_nanosleep(&mut self, _seconds: i64, _nanoseconds: i64) -> Result<(), Errno> {
@@ -9704,5 +10055,359 @@ mod tests {
         let mut buf = [0u8; 8];
         sys_read(&mut proc, &mut host, fd2, &mut buf).unwrap();
         assert_eq!(u64::from_le_bytes(buf), 7);
+    }
+
+    // ── timerfd tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_timerfd_create_basic() {
+        let mut proc = Process::new(1);
+        let fd = sys_timerfd_create(&mut proc, 0, 0).unwrap(); // CLOCK_REALTIME
+        assert!(fd >= 3);
+
+        let entry = proc.fd_table.get(fd).unwrap();
+        let ofd = proc.ofd_table.get(entry.ofd_ref.0).unwrap();
+        assert_eq!(ofd.file_type, FileType::TimerFd);
+    }
+
+    #[test]
+    fn test_timerfd_create_with_flags() {
+        let mut proc = Process::new(1);
+        let fd = sys_timerfd_create(&mut proc, 1, O_NONBLOCK | O_CLOEXEC).unwrap();
+        assert!(fd >= 3);
+
+        let entry = proc.fd_table.get(fd).unwrap();
+        let ofd = proc.ofd_table.get(entry.ofd_ref.0).unwrap();
+        assert_ne!(ofd.status_flags & O_NONBLOCK, 0);
+    }
+
+    #[test]
+    fn test_timerfd_create_invalid_flags() {
+        let mut proc = Process::new(1);
+        let result = sys_timerfd_create(&mut proc, 0, 0xDEAD);
+        assert_eq!(result, Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn test_timerfd_settime_disarm() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_timerfd_create(&mut proc, 0, 0).unwrap();
+
+        // Set then disarm
+        host.clock_time = (100, 0);
+        sys_timerfd_settime(&mut proc, &mut host, fd, 0, 0, 0, 105, 0).unwrap();
+        let (isec, insec, _vsec, _vnsec) = sys_timerfd_settime(&mut proc, &mut host, fd, 0, 0, 0, 0, 0).unwrap();
+        // Old value was: interval=(0,0), value was set
+        assert_eq!(isec, 0);
+        assert_eq!(insec, 0);
+
+        // After disarming, gettime should return all zeros
+        let result = sys_timerfd_gettime(&mut proc, &mut host, fd).unwrap();
+        assert_eq!(result, (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_timerfd_settime_relative() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_timerfd_create(&mut proc, 0, 0).unwrap();
+
+        host.clock_time = (100, 0);
+        // Set timer to expire in 5 seconds (relative)
+        let old = sys_timerfd_settime(&mut proc, &mut host, fd, 0, 0, 0, 5, 0).unwrap();
+        // Old timer was disarmed
+        assert_eq!(old, (0, 0, 0, 0));
+
+        // Timer should now expire at absolute time 105
+        let (isec, insec, vsec, vnsec) = sys_timerfd_gettime(&mut proc, &mut host, fd).unwrap();
+        assert_eq!(isec, 0);
+        assert_eq!(insec, 0);
+        assert_eq!(vsec, 5); // 5 seconds remaining
+        assert_eq!(vnsec, 0);
+    }
+
+    #[test]
+    fn test_timerfd_settime_absolute() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_timerfd_create(&mut proc, 0, 0).unwrap();
+
+        host.clock_time = (100, 0);
+        // Set timer to expire at absolute time 110 (TFD_TIMER_ABSTIME = 1)
+        sys_timerfd_settime(&mut proc, &mut host, fd, 1, 0, 0, 110, 0).unwrap();
+
+        // Timer should show ~10 seconds remaining
+        let (_, _, vsec, _) = sys_timerfd_gettime(&mut proc, &mut host, fd).unwrap();
+        assert_eq!(vsec, 10);
+    }
+
+    #[test]
+    fn test_timerfd_read_no_expiration_eagain() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_timerfd_create(&mut proc, 0, O_NONBLOCK).unwrap();
+
+        host.clock_time = (100, 0);
+        // Set timer to expire in 5 seconds
+        sys_timerfd_settime(&mut proc, &mut host, fd, 0, 0, 0, 5, 0).unwrap();
+
+        // Read before expiration should return EAGAIN
+        let mut buf = [0u8; 8];
+        let result = sys_read(&mut proc, &mut host, fd, &mut buf);
+        assert_eq!(result, Err(Errno::EAGAIN));
+    }
+
+    #[test]
+    fn test_timerfd_read_after_expiration() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_timerfd_create(&mut proc, 0, O_NONBLOCK).unwrap();
+
+        host.clock_time = (100, 0);
+        // Set one-shot timer to expire in 5 seconds
+        sys_timerfd_settime(&mut proc, &mut host, fd, 0, 0, 0, 5, 0).unwrap();
+
+        // Advance time past expiration
+        host.clock_time = (106, 0);
+        let mut buf = [0u8; 8];
+        let n = sys_read(&mut proc, &mut host, fd, &mut buf).unwrap();
+        assert_eq!(n, 8);
+        let expirations = u64::from_le_bytes(buf);
+        assert_eq!(expirations, 1);
+    }
+
+    #[test]
+    fn test_timerfd_read_repeating() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_timerfd_create(&mut proc, 0, O_NONBLOCK).unwrap();
+
+        host.clock_time = (100, 0);
+        // Set repeating timer: interval=2s, first expiration in 1s
+        sys_timerfd_settime(&mut proc, &mut host, fd, 0, 2, 0, 1, 0).unwrap();
+
+        // Advance 5.5 seconds: first at 101, then 103, 105 => 3 expirations
+        host.clock_time = (105, 500_000_000);
+        let mut buf = [0u8; 8];
+        let n = sys_read(&mut proc, &mut host, fd, &mut buf).unwrap();
+        assert_eq!(n, 8);
+        let expirations = u64::from_le_bytes(buf);
+        assert!(expirations >= 3);
+    }
+
+    #[test]
+    fn test_timerfd_read_small_buf() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_timerfd_create(&mut proc, 0, O_NONBLOCK).unwrap();
+
+        let mut buf = [0u8; 4]; // too small
+        let result = sys_read(&mut proc, &mut host, fd, &mut buf);
+        assert_eq!(result, Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn test_timerfd_poll_not_expired() {
+        use wasm_posix_shared::WasmPollFd;
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_timerfd_create(&mut proc, 0, O_NONBLOCK).unwrap();
+
+        host.clock_time = (100, 0);
+        sys_timerfd_settime(&mut proc, &mut host, fd, 0, 0, 0, 5, 0).unwrap();
+
+        // Timer not yet expired: poll should report not ready
+        let mut pollfd = WasmPollFd { fd, events: POLLIN, revents: 0 };
+        let n = sys_poll(&mut proc, &mut host, core::slice::from_mut(&mut pollfd), 0).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_timerfd_lseek_fails() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_timerfd_create(&mut proc, 0, 0).unwrap();
+
+        let result = sys_lseek(&mut proc, &mut host, fd, 0, 0);
+        assert_eq!(result, Err(Errno::ESPIPE));
+    }
+
+    #[test]
+    fn test_timerfd_close() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_timerfd_create(&mut proc, 0, 0).unwrap();
+
+        sys_close(&mut proc, &mut host, fd).unwrap();
+        let result = sys_read(&mut proc, &mut host, fd, &mut [0u8; 8]);
+        assert_eq!(result, Err(Errno::EBADF));
+    }
+
+    #[test]
+    fn test_timerfd_gettime_not_timerfd() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        // fd 0 is stdin, not a timerfd
+        let result = sys_timerfd_gettime(&mut proc, &mut host, 0);
+        assert_eq!(result, Err(Errno::EINVAL));
+    }
+
+    // ── signalfd tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_signalfd4_create() {
+        let mut proc = Process::new(1);
+        use wasm_posix_shared::signal::SIGINT;
+        let mask = 1u64 << SIGINT;
+        let fd = sys_signalfd4(&mut proc, -1, mask, 0).unwrap();
+        assert!(fd >= 3);
+
+        let entry = proc.fd_table.get(fd).unwrap();
+        let ofd = proc.ofd_table.get(entry.ofd_ref.0).unwrap();
+        assert_eq!(ofd.file_type, FileType::SignalFd);
+    }
+
+    #[test]
+    fn test_signalfd4_create_with_flags() {
+        let mut proc = Process::new(1);
+        let fd = sys_signalfd4(&mut proc, -1, 0x04, O_NONBLOCK | O_CLOEXEC).unwrap();
+        assert!(fd >= 3);
+
+        let entry = proc.fd_table.get(fd).unwrap();
+        let ofd = proc.ofd_table.get(entry.ofd_ref.0).unwrap();
+        assert_ne!(ofd.status_flags & O_NONBLOCK, 0);
+    }
+
+    #[test]
+    fn test_signalfd4_invalid_flags() {
+        let mut proc = Process::new(1);
+        let result = sys_signalfd4(&mut proc, -1, 0x04, 0xDEAD);
+        assert_eq!(result, Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn test_signalfd4_update_existing() {
+        let mut proc = Process::new(1);
+        use wasm_posix_shared::signal::{SIGINT, SIGTERM};
+        let mask1 = 1u64 << SIGINT;
+        let fd = sys_signalfd4(&mut proc, -1, mask1, 0).unwrap();
+
+        // Update mask
+        let mask2 = 1u64 << SIGTERM;
+        let fd2 = sys_signalfd4(&mut proc, fd, mask2, 0).unwrap();
+        assert_eq!(fd, fd2); // Same fd returned
+    }
+
+    #[test]
+    fn test_signalfd4_read_no_signal_eagain() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::signal::SIGINT;
+        let mask = 1u64 << SIGINT;
+        let fd = sys_signalfd4(&mut proc, -1, mask, O_NONBLOCK).unwrap();
+
+        // No signal pending: read should EAGAIN
+        let mut buf = [0u8; 128];
+        let result = sys_read(&mut proc, &mut host, fd, &mut buf);
+        assert_eq!(result, Err(Errno::EAGAIN));
+    }
+
+    #[test]
+    fn test_signalfd4_read_with_pending_signal() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::signal::SIGINT;
+        let mask = 1u64 << SIGINT;
+        let fd = sys_signalfd4(&mut proc, -1, mask, O_NONBLOCK).unwrap();
+
+        // Raise SIGINT
+        proc.signals.raise(SIGINT);
+
+        // Read should return signalfd_siginfo with ssi_signo=SIGINT
+        let mut buf = [0u8; 128];
+        let n = sys_read(&mut proc, &mut host, fd, &mut buf).unwrap();
+        assert_eq!(n, 128);
+        let signo = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        assert_eq!(signo, SIGINT);
+
+        // Signal should be consumed from pending
+        assert!(!proc.signals.is_pending(SIGINT));
+    }
+
+    #[test]
+    fn test_signalfd4_read_small_buf() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_signalfd4(&mut proc, -1, 0x04, O_NONBLOCK).unwrap();
+
+        let mut buf = [0u8; 64]; // too small (needs 128)
+        let result = sys_read(&mut proc, &mut host, fd, &mut buf);
+        assert_eq!(result, Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn test_signalfd4_read_ignores_unmasked_signals() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        use wasm_posix_shared::signal::{SIGINT, SIGTERM};
+        let mask = 1u64 << SIGINT; // only watching SIGINT
+        let fd = sys_signalfd4(&mut proc, -1, mask, O_NONBLOCK).unwrap();
+
+        // Raise SIGTERM (not in mask)
+        proc.signals.raise(SIGTERM);
+
+        // Read should EAGAIN (SIGTERM not in mask)
+        let mut buf = [0u8; 128];
+        let result = sys_read(&mut proc, &mut host, fd, &mut buf);
+        assert_eq!(result, Err(Errno::EAGAIN));
+
+        // SIGTERM should still be pending
+        assert!(proc.signals.is_pending(SIGTERM));
+    }
+
+    #[test]
+    fn test_signalfd4_poll_with_signal() {
+        use wasm_posix_shared::WasmPollFd;
+        use wasm_posix_shared::signal::SIGINT;
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let mask = 1u64 << SIGINT;
+        let fd = sys_signalfd4(&mut proc, -1, mask, O_NONBLOCK).unwrap();
+
+        // No signal: poll should report not ready
+        let mut pollfd = WasmPollFd { fd, events: POLLIN, revents: 0 };
+        let n = sys_poll(&mut proc, &mut host, core::slice::from_mut(&mut pollfd), 0).unwrap();
+        assert_eq!(n, 0);
+
+        // Raise signal
+        proc.signals.raise(SIGINT);
+
+        // Now poll should report readable
+        let mut pollfd = WasmPollFd { fd, events: POLLIN, revents: 0 };
+        let n = sys_poll(&mut proc, &mut host, core::slice::from_mut(&mut pollfd), 0).unwrap();
+        assert_eq!(n, 1);
+        assert_ne!(pollfd.revents & POLLIN, 0);
+    }
+
+    #[test]
+    fn test_signalfd4_lseek_fails() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_signalfd4(&mut proc, -1, 0x04, 0).unwrap();
+
+        let result = sys_lseek(&mut proc, &mut host, fd, 0, 0);
+        assert_eq!(result, Err(Errno::ESPIPE));
+    }
+
+    #[test]
+    fn test_signalfd4_close() {
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_signalfd4(&mut proc, -1, 0x04, 0).unwrap();
+
+        sys_close(&mut proc, &mut host, fd).unwrap();
+        let result = sys_read(&mut proc, &mut host, fd, &mut [0u8; 128]);
+        assert_eq!(result, Err(Errno::EBADF));
     }
 }
