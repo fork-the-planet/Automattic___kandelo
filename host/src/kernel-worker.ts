@@ -88,7 +88,7 @@ const SCRATCH_SIZE = CH_TOTAL_SIZE;
 
 /** Struct sizes for output data copying */
 const WASM_STAT_SIZE = 88;
-const TIMESPEC_SIZE = 8;  // 2 x i32 (sec, nsec) on wasm32
+const TIMESPEC_SIZE = 8;  // 2 x i32 (sec, nsec) on wasm32 — only copies first 8 bytes
 const ITIMERVAL_SIZE = 16; // 2 x timespec
 const RLIMIT_SIZE = 16;   // 2 x i64 on wasm32
 
@@ -125,11 +125,6 @@ const SYSCALL_ARGS: Record<number, ArgDesc[]> = {
 
   // _llseek
   119: [{ argIndex: 3, direction: "out", size: { type: "fixed", size: 8 } }],  // _LLSEEK: result_ptr (off_t)
-
-  // wait4
-  139: [
-    { argIndex: 1, direction: "out", size: { type: "fixed", size: 4 } },      // WAIT4: wstatus (i32)
-  ],
 
   // FD operations
   9:  [{ argIndex: 0, direction: "out", size: { type: "fixed", size: 8 } }],   // PIPE: 2 x i32
@@ -204,16 +199,6 @@ const SYSCALL_ARGS: Record<number, ArgDesc[]> = {
     { argIndex: 2, direction: "in", size: { type: "fixed", size: TIMESPEC_SIZE * 2 } },
   ],
 
-  // Filesystem info
-  129: [
-    { argIndex: 0, direction: "in", size: { type: "cstring" } },              // STATFS: path
-    { argIndex: 1, direction: "out", size: { type: "fixed", size: 72 } },     //         statfs_buf
-  ],
-  130: [{ argIndex: 1, direction: "out", size: { type: "fixed", size: 72 } }], // FSTATFS: statfs_buf
-
-  // Resource limits
-  83: [{ argIndex: 1, direction: "out", size: { type: "fixed", size: 16 } }],  // GETRLIMIT: rlim (2 x u64)
-  84: [{ argIndex: 1, direction: "in", size: { type: "fixed", size: 16 } }],   // SETRLIMIT: rlim (2 x u64)
   250: [
     { argIndex: 2, direction: "in", size: { type: "fixed", size: 16 } },      // PRLIMIT64: new_rlim
     { argIndex: 3, direction: "out", size: { type: "fixed", size: 16 } },     //            old_rlim
@@ -240,6 +225,14 @@ const SYSCALL_ARGS: Record<number, ArgDesc[]> = {
   // Sockets
   51: [{ argIndex: 1, direction: "in", size: { type: "arg", argIndex: 2 } }],  // BIND: addr
   54: [{ argIndex: 1, direction: "in", size: { type: "arg", argIndex: 2 } }],  // CONNECT: addr
+  114: [                                                                        // GETSOCKNAME: addr + addrlen
+    { argIndex: 1, direction: "out", size: { type: "arg", argIndex: 2 } },     //   addr (output, size from addrlen)
+    { argIndex: 2, direction: "inout", size: { type: "fixed", size: 4 } },     //   addrlen (inout, socklen_t = 4 bytes)
+  ],
+  115: [                                                                        // GETPEERNAME: addr + addrlen
+    { argIndex: 1, direction: "out", size: { type: "arg", argIndex: 2 } },
+    { argIndex: 2, direction: "inout", size: { type: "fixed", size: 4 } },
+  ],
   55: [{ argIndex: 1, direction: "in", size: { type: "arg", argIndex: 2 } }],  // SEND: buf
   56: [{ argIndex: 1, direction: "out", size: { type: "arg", argIndex: 2 } }], // RECV: buf
   58: [{ argIndex: 3, direction: "out", size: { type: "fixed", size: 4 } }],   // GETSOCKOPT: val
@@ -272,9 +265,9 @@ const SYSCALL_ARGS: Record<number, ArgDesc[]> = {
   85: [{ argIndex: 0, direction: "in", size: { type: "cstring" } }],           // TRUNCATE: path
   129: [
     { argIndex: 0, direction: "in", size: { type: "cstring" } },               // STATFS: path
-    { argIndex: 1, direction: "out", size: { type: "fixed", size: 64 } },      //         buf
+    { argIndex: 1, direction: "out", size: { type: "fixed", size: 72 } },      //         buf (WasmStatfs = 72 bytes)
   ],
-  130: [{ argIndex: 1, direction: "out", size: { type: "fixed", size: 64 } }], // FSTATFS: buf
+  130: [{ argIndex: 1, direction: "out", size: { type: "fixed", size: 72 } }], // FSTATFS: buf (WasmStatfs = 72 bytes)
 
   // *at variants
   69: [{ argIndex: 1, direction: "in", size: { type: "cstring" } }],           // OPENAT: path
