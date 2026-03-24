@@ -1687,6 +1687,20 @@ fn dispatch_channel_syscall(nr: u32, args: &[i32; 6]) -> i32 {
             }
         }
         282 | 283 => 0, // mlockall, munlockall: success
+        285 => { // SYS_GETPRIORITY
+            let (_gkl, proc) = unsafe { get_process() };
+            match syscalls::sys_getpriority(proc, a1, a2 as u32) {
+                Ok(v) => v,
+                Err(e) => -(e as i32),
+            }
+        }
+        286 => { // SYS_SETPRIORITY
+            let (_gkl, proc) = unsafe { get_process() };
+            match syscalls::sys_setpriority(proc, a1, a2 as u32, a3) {
+                Ok(()) => 0,
+                Err(e) => -(e as i32),
+            }
+        }
 
         208 | 226 | 237..=238 | 247..=249 | 252..=254 | 256..=257 | 262 | 265..=268 | 271..=274 | 287 | 289..=293 | 297..=298 | 301..=305 | 306 | 308..=324 | 325..=336 | 348..=349 | 350..=369 | 370..=371 | 373..=376 | 381..=383 | 386 => {
             // Many of these are stubs in the glue layer too; return ENOSYS

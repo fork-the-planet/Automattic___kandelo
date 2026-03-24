@@ -242,6 +242,7 @@ pub fn serialize_fork_state(proc: &Process, buf: &mut [u8]) -> Result<usize, Err
     w.write_u32(proc.pgid)?;
     w.write_u32(proc.sid)?;
     w.write_u32(proc.umask)?;
+    w.write_u32(proc.nice as u32)?;
 
     // ── Signal state ──
     w.write_u64(proc.signals.blocked)?;
@@ -405,6 +406,7 @@ pub fn deserialize_fork_state(buf: &[u8], child_pid: u32) -> Result<Process, Err
     let pgid = r.read_u32()?;
     let sid = r.read_u32()?;
     let umask = r.read_u32()?;
+    let nice = r.read_u32()? as i32;
 
     // ── Signal state ──
     let blocked = r.read_u64()?;
@@ -597,6 +599,7 @@ pub fn deserialize_fork_state(buf: &[u8], child_pid: u32) -> Result<Process, Err
         environ,
         argv,
         umask,
+        nice,
         rlimits,
         alarm_deadline_ns: 0,
         alarm_interval_ns: 0,
@@ -649,6 +652,7 @@ pub fn serialize_exec_state(proc: &Process, buf: &mut [u8]) -> Result<usize, Err
     w.write_u32(proc.pgid)?;
     w.write_u32(proc.sid)?;
     w.write_u32(proc.umask)?;
+    w.write_u32(proc.nice as u32)?;
 
     // ── Signal state ──
     w.write_u64(proc.signals.blocked)?;
@@ -780,6 +784,7 @@ pub fn deserialize_exec_state(buf: &[u8], pid: u32) -> Result<Process, Errno> {
     let pgid = r.read_u32()?;
     let sid = r.read_u32()?;
     let umask = r.read_u32()?;
+    let nice = r.read_u32()? as i32;
 
     // ── Signal state ──
     let blocked = r.read_u64()?;
@@ -932,6 +937,7 @@ pub fn deserialize_exec_state(buf: &[u8], pid: u32) -> Result<Process, Errno> {
         environ,
         argv,
         umask,
+        nice,
         rlimits,
         alarm_deadline_ns: 0,
         alarm_interval_ns: 0,
@@ -974,6 +980,7 @@ mod tests {
         assert_eq!(child.uid, proc.uid);
         assert_eq!(child.gid, proc.gid);
         assert_eq!(child.umask, proc.umask);
+        assert_eq!(child.nice, proc.nice);
         assert_eq!(child.cwd, proc.cwd);
         assert_eq!(child.signals.pending, 0);
     }

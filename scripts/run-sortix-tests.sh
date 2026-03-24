@@ -163,7 +163,7 @@ BASIC_EXPECTED_FAIL=(
     "time/clock_settime" "unistd/fchownat" "unistd/lchown"
     # -- Process management requiring fork/exec or process groups
     "sys_wait/waitpid"
-    "unistd/setregid" "unistd/setreuid" "unistd/nice"
+    "unistd/setregid" "unistd/setreuid"
     "stdlib/abort" "stdlib/system"
     # -- Signals (limited Wasm signal model)
     "signal/kill" "signal/killpg"
@@ -238,7 +238,6 @@ BASIC_EXPECTED_FAIL=(
     "time/clock_getcpuclockid"
     "time/timer_create" "time/timer_delete" "time/timer_getoverrun"
     "time/timer_gettime" "time/timer_settime"
-    "sys_resource/getpriority" "sys_resource/setpriority"
     "sys_select/pselect" "sys_select/select" "sys_time/select"
     "locale/getlocalename_l"
     "monetary/strfmon" "monetary/strfmon_l"
