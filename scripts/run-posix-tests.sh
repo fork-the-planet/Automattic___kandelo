@@ -54,7 +54,7 @@ EXPECTED_FAIL=(
     kill/3-1          # EPERM test: PID 1 is our process, not init
     sigqueue/3-1      # needs pwd.h
     sigqueue/12-1     # needs pwd.h
-    sigwaitinfo/7-1   # RT signal FIFO ordering not implemented
+    # (sigwaitinfo/7-1 removed — RT signal si_value now returned by sigtimedwait)
 )
 
 # ── Auto-detect LLVM ──────────────────────────────────────

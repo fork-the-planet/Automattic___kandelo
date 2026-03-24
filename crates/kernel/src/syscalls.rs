@@ -2152,12 +2152,13 @@ pub fn sys_getitimer(
 /// If `timeout_ms` >= 0, waits up to that many milliseconds for a signal.
 /// If `timeout_ms` < 0, waits indefinitely.
 /// Returns the signal number on success, or EAGAIN on timeout.
+/// Returns (signum, si_value, si_code) on success.
 pub fn sys_sigtimedwait(
     proc: &mut Process,
     host: &mut dyn HostIO,
     mask: u64,
     timeout_ms: i32,
-) -> Result<u32, Errno> {
+) -> Result<(u32, i32, i32), Errno> {
     use wasm_posix_shared::signal::NSIG;
 
     // Check if any signal in mask is already pending
@@ -2166,8 +2167,8 @@ pub fn sys_sigtimedwait(
         // Consume the lowest numbered matching signal
         let signum = pending_in_mask.trailing_zeros() + 1;
         if signum < NSIG {
-            proc.signals.consume_one(signum);
-            return Ok(signum);
+            let (si_value, si_code) = proc.signals.consume_one(signum);
+            return Ok((signum, si_value, si_code));
         }
     }
 
@@ -2184,8 +2185,8 @@ pub fn sys_sigtimedwait(
         if pending_in_mask != 0 {
             let signum = pending_in_mask.trailing_zeros() + 1;
             if signum < NSIG {
-                proc.signals.consume_one(signum);
-                return Ok(signum);
+                let (si_value, si_code) = proc.signals.consume_one(signum);
+                return Ok((signum, si_value, si_code));
             }
         }
     }
@@ -6514,7 +6515,7 @@ mod tests {
 
         // Step 5: Now dequeue should work
         let sig = proc.signals.dequeue();
-        assert_eq!(sig, Some((SIGINT, 0)), "Should dequeue SIGINT");
+        assert_eq!(sig, Some((SIGINT, 0, 0)), "Should dequeue SIGINT");
 
         // And handler should be Handler(42)
         let handler = proc.signals.get_handler(SIGINT);
@@ -9391,8 +9392,8 @@ mod tests {
         proc.signals.pending |= crate::signal::sig_bit(10);
         // Wait for SIGUSR1
         let mask = crate::signal::sig_bit(10);
-        let result = sys_sigtimedwait(&mut proc, &mut host, mask, 0).unwrap();
-        assert_eq!(result, 10);
+        let (sig, _val, _code) = sys_sigtimedwait(&mut proc, &mut host, mask, 0).unwrap();
+        assert_eq!(sig, 10);
         // Signal should be dequeued
         assert_eq!(proc.signals.pending & crate::signal::sig_bit(10), 0);
     }
@@ -9413,8 +9414,8 @@ mod tests {
         // Raise both SIGUSR1 (10) and SIGUSR2 (12)
         proc.signals.pending |= crate::signal::sig_bit(10) | crate::signal::sig_bit(12);
         let mask = crate::signal::sig_bit(10) | crate::signal::sig_bit(12);
-        let result = sys_sigtimedwait(&mut proc, &mut host, mask, 0).unwrap();
-        assert_eq!(result, 10); // lowest first
+        let (sig, _val, _code) = sys_sigtimedwait(&mut proc, &mut host, mask, 0).unwrap();
+        assert_eq!(sig, 10); // lowest first
         // Only SIGUSR1 should be dequeued
         assert_eq!(proc.signals.pending & crate::signal::sig_bit(10), 0);
         assert_ne!(proc.signals.pending & crate::signal::sig_bit(12), 0);
@@ -9430,16 +9431,16 @@ mod tests {
         proc.signals.raise(32);
         let mask = crate::signal::sig_bit(32);
         // First dequeue should return signal 32 and leave 2 queued
-        let r1 = sys_sigtimedwait(&mut proc, &mut host, mask, 0).unwrap();
-        assert_eq!(r1, 32);
+        let (s1, _, _) = sys_sigtimedwait(&mut proc, &mut host, mask, 0).unwrap();
+        assert_eq!(s1, 32);
         assert!(proc.signals.is_pending(32), "should still be pending with 2 queued");
         // Second
-        let r2 = sys_sigtimedwait(&mut proc, &mut host, mask, 0).unwrap();
-        assert_eq!(r2, 32);
+        let (s2, _, _) = sys_sigtimedwait(&mut proc, &mut host, mask, 0).unwrap();
+        assert_eq!(s2, 32);
         assert!(proc.signals.is_pending(32), "should still be pending with 1 queued");
         // Third
-        let r3 = sys_sigtimedwait(&mut proc, &mut host, mask, 0).unwrap();
-        assert_eq!(r3, 32);
+        let (s3, _, _) = sys_sigtimedwait(&mut proc, &mut host, mask, 0).unwrap();
+        assert_eq!(s3, 32);
         assert!(!proc.signals.is_pending(32), "should no longer be pending");
         // Fourth should fail
         let r4 = sys_sigtimedwait(&mut proc, &mut host, mask, 0);
@@ -11113,9 +11114,9 @@ mod tests {
         state.raise(rt_sig);
 
         // Should dequeue 3 separate instances
-        assert_eq!(state.dequeue(), Some((rt_sig, 0)));
-        assert_eq!(state.dequeue(), Some((rt_sig, 0)));
-        assert_eq!(state.dequeue(), Some((rt_sig, 0)));
+        assert_eq!(state.dequeue(), Some((rt_sig, 0, 0)));
+        assert_eq!(state.dequeue(), Some((rt_sig, 0, 0)));
+        assert_eq!(state.dequeue(), Some((rt_sig, 0, 0)));
         // Now exhausted
         assert_eq!(state.dequeue(), None);
     }
@@ -11131,7 +11132,7 @@ mod tests {
         state.raise(SIGUSR1);
 
         // Should only dequeue once (coalesced)
-        assert_eq!(state.dequeue(), Some((SIGUSR1, 0)));
+        assert_eq!(state.dequeue(), Some((SIGUSR1, 0, 0)));
         assert_eq!(state.dequeue(), None);
     }
 
@@ -11146,8 +11147,8 @@ mod tests {
         state.raise(rt1);
 
         // Should dequeue in signal number order (lowest first from bitmask)
-        assert_eq!(state.dequeue(), Some((rt1, 0)));
-        assert_eq!(state.dequeue(), Some((rt2, 0)));
+        assert_eq!(state.dequeue(), Some((rt1, 0, 0)));
+        assert_eq!(state.dequeue(), Some((rt2, 0, 0)));
         assert_eq!(state.dequeue(), None);
     }
 
@@ -11177,10 +11178,10 @@ mod tests {
         state.raise(SIGINT); // standard signal 2
 
         // Standard signals have lower numbers, so SIGINT dequeues first
-        assert_eq!(state.dequeue(), Some((SIGINT, 0)));
+        assert_eq!(state.dequeue(), Some((SIGINT, 0, 0)));
         // Then both RT signal instances
-        assert_eq!(state.dequeue(), Some((rt_sig, 0)));
-        assert_eq!(state.dequeue(), Some((rt_sig, 0)));
+        assert_eq!(state.dequeue(), Some((rt_sig, 0, 0)));
+        assert_eq!(state.dequeue(), Some((rt_sig, 0, 0)));
         assert_eq!(state.dequeue(), None);
     }
 }

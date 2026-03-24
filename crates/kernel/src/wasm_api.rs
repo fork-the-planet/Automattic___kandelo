@@ -737,7 +737,7 @@ fn deliver_pending_signals(proc: &mut Process, host: &mut WasmHostIO) {
             }
         } else {
             // Traditional mode: dequeue and handle all signals directly
-            let (signum, _si_value) = match proc.signals.dequeue() {
+            let (signum, _si_value, _si_code) = match proc.signals.dequeue() {
                 Some(s) => s,
                 None => break,
             };
@@ -897,7 +897,7 @@ pub extern "C" fn kernel_dequeue_signal(pid: u32, out_ptr: *mut u8) -> i32 {
         let action = proc.signals.get_action(signum);
         match action.handler {
             SignalHandler::Handler(idx) => {
-                let (_dequeued_sig, si_value) = proc.signals.dequeue().unwrap();
+                let (_dequeued_sig, si_value, _si_code) = proc.signals.dequeue().unwrap();
                 // If returning from sigsuspend, restore original mask before saving
                 // old_mask for the handler. This ensures the handler's saved mask
                 // is the pre-sigsuspend mask (POSIX: sigsuspend restores mask on return).
@@ -1316,13 +1316,19 @@ fn dispatch_channel_syscall(nr: u32, args: &[i32; 6]) -> i32 {
                 -1 // NULL timeout = wait indefinitely
             };
             let result = match syscalls::sys_sigtimedwait(proc, &mut host, mask, timeout_ms) {
-                Ok(sig) => {
+                Ok((sig, si_value, si_code)) => {
                     // Write siginfo_t if pointer is non-null
                     if a2 != 0 {
                         let p = a2 as usize as *mut u8;
-                        // siginfo_t: si_signo at offset 0 (4 bytes)
+                        // siginfo_t: si_signo at offset 0, si_code at 8, si_value at 20
                         let sig_bytes = (sig as i32).to_le_bytes();
-                        unsafe { for i in 0..4 { *p.add(i) = sig_bytes[i]; } }
+                        let code_bytes = si_code.to_le_bytes();
+                        let val_bytes = si_value.to_le_bytes();
+                        unsafe {
+                            for i in 0..4 { *p.add(i) = sig_bytes[i]; }
+                            for i in 0..4 { *p.add(8 + i) = code_bytes[i]; }
+                            for i in 0..4 { *p.add(20 + i) = val_bytes[i]; }
+                        }
                     }
                     sig as i32
                 }
@@ -5087,7 +5093,7 @@ pub extern "C" fn kernel_rt_sigtimedwait(mask_lo: u32, mask_hi: u32, timeout_ms:
     let mut host = WasmHostIO;
     let mask = ((mask_hi as u64) << 32) | (mask_lo as u64);
     let result = match syscalls::sys_sigtimedwait(proc, &mut host, mask, timeout_ms) {
-        Ok(sig) => sig as i32,
+        Ok((sig, _si_value, _si_code)) => sig as i32,
         Err(e) => -(e as i32),
     };
     deliver_pending_signals(proc, &mut host);
