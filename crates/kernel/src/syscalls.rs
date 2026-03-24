@@ -5270,6 +5270,36 @@ pub fn sys_getrusage(_proc: &mut Process, who: i32, buf: &mut [u8]) -> Result<()
     Ok(())
 }
 
+/// getpriority -- get scheduling priority.
+/// In Wasm there is no real scheduler, so we store a per-process nice value.
+/// Returns 20-nice (Linux convention: kernel returns 20-nice so 0 is never error).
+pub fn sys_getpriority(proc: &Process, which: i32, who: u32) -> Result<i32, Errno> {
+    // PRIO_PROCESS=0, PRIO_PGRP=1, PRIO_USER=2
+    if which < 0 || which > 2 {
+        return Err(Errno::EINVAL);
+    }
+    // who=0 means "self" for PRIO_PROCESS
+    if which == 0 && who != 0 && who != proc.pid {
+        return Err(Errno::ESRCH);
+    }
+    // Linux convention: return 20-nice so the result is always positive
+    Ok(20 - proc.nice)
+}
+
+/// setpriority -- set scheduling priority.
+pub fn sys_setpriority(proc: &mut Process, which: i32, who: u32, prio: i32) -> Result<(), Errno> {
+    if which < 0 || which > 2 {
+        return Err(Errno::EINVAL);
+    }
+    if which == 0 && who != 0 && who != proc.pid {
+        return Err(Errno::ESRCH);
+    }
+    // Clamp to [-20, 19]
+    let clamped = prio.max(-20).min(19);
+    proc.nice = clamped;
+    Ok(())
+}
+
 /// realpath -- resolve a pathname to a canonical absolute form.
 ///
 /// Resolves the path against cwd, normalizes `.` and `..` components,
