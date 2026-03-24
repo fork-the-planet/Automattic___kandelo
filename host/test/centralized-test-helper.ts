@@ -168,13 +168,17 @@ export async function runCentralizedProgram(
         return tid;
       },
       onExit: (pid, exitStatus) => {
-        kernelWorker.unregisterProcess(pid);
         if (pid === 1) {
-          // Main process exited — terminate the Worker (stuck in _exit loop)
+          // Main process exited — full cleanup
+          kernelWorker.unregisterProcess(pid);
           if (mainWorker) {
             mainWorker.terminate().catch(() => {});
           }
           resolveExit(exitStatus);
+        } else {
+          // Child process exited — deactivate channels but keep in kernel
+          // process table as zombie until reaped by wait/waitpid
+          kernelWorker.deactivateProcess(pid);
         }
       },
     },
