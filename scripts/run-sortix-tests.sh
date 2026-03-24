@@ -158,10 +158,9 @@ BASIC_EXPECTED_FAIL=(
     # -- Memory locking (mlock/munlock are stubs; mlockall/munlockall work)
     # (mlock, mlockall, munlock, munlockall removed — stubs pass basic invocation tests)
     # -- Privileged operations
-    "time/clock_settime" "unistd/fchownat" "unistd/lchown"
+    "unistd/fchownat" "unistd/lchown"
     # -- Process management requiring fork/exec or process groups
     "sys_wait/waitpid"
-    "unistd/setregid" "unistd/setreuid"
     "stdlib/abort" "stdlib/system"
     # -- Signals (limited Wasm signal model)
     "signal/kill" "signal/killpg"
@@ -186,8 +185,7 @@ BASIC_EXPECTED_FAIL=(
     "pthread/pthread_mutexattr_setpshared" "pthread/pthread_rwlock_clockrdlock"
     "pthread/pthread_rwlock_clockwrlock"
     "pthread/pthread_setcancelstate"
-    # -- Scheduler (sched_yield is a no-op stub; others have basic stubs)
-    "sched/sched_yield"
+    # -- Scheduler
     # -- Semaphore named (not supported in Wasm)
     "semaphore/sem_clockwait" "semaphore/sem_close" "semaphore/sem_open" "semaphore/sem_unlink"
     # -- Terminal I/O (no terminal device in Wasm)
@@ -259,8 +257,6 @@ MALLOC_EXPECTED_FAIL=()
 STDIO_EXPECTED_FAIL=()
 
 IO_EXPECTED_FAIL=(
-    # OFD locks require fork() for cross-process testing
-    "ofd-*"
     # O_CLOFORK is POSIX.1-2024; not in musl
     "dup3-clofork-fork" "open-clofork-fork"
 )
@@ -277,7 +273,9 @@ SIGNAL_EXPECTED_FAIL=(
     "ppoll-block-sleep-raise" "ppoll-block-sleep-raise-write" "ppoll-block-sleep-write-raise"
 )
 PROCESS_EXPECTED_FAIL=(
-    # Cross-process setsid+setpgid with pipe synchronization (timing issue)
+    # Cross-process pipes don't work: fork child gets empty pipes vec, so pipe
+    # synchronization between parent and child fails (parent reads EOF immediately).
+    # The kernel session check is correct but untestable without shared pipes.
     "fork-setsid-setpgid-in-parent" "fork-setsid-setpgid-in-parent-move"
     # Zombie: setpgid-move requires cross-process kill + pgid group validation
     "zombie-setpgid-move"

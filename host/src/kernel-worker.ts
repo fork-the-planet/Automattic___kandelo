@@ -22,6 +22,7 @@
  */
 
 import { WasmPosixKernel } from "./kernel";
+import { SharedLockTable } from "./shared-lock-table";
 import type { KernelConfig, PlatformIO } from "./types";
 
 /** Channel status values */
@@ -88,6 +89,9 @@ const F_SETLKW = 7;
 const F_GETLK64 = 12;
 const F_SETLK64 = 13;
 const F_SETLKW64 = 14;
+const F_OFD_GETLK = 36;
+const F_OFD_SETLK = 37;
+const F_OFD_SETLKW = 38;
 
 /** Retry interval for EAGAIN polling (ms) */
 const EAGAIN_RETRY_MS = 1;
@@ -500,6 +504,11 @@ export class CentralizedKernelWorker {
     // Ensure scratch area is zeroed
     new Uint8Array(this.kernelMemory.buffer, this.scratchOffset, SCRATCH_SIZE).fill(0);
 
+    // Register a SharedLockTable so host_fcntl_lock can handle advisory locks
+    // (including OFD locks) within the centralized kernel.
+    const lockTable = SharedLockTable.create();
+    this.kernel.registerSharedLockTable(lockTable.getBuffer());
+
     this.initialized = true;
   }
 
@@ -743,7 +752,8 @@ export class CentralizedKernelWorker {
     if (syscallNr === SYS_FCNTL) {
       const cmd = origArgs[1];
       if (cmd === F_GETLK || cmd === F_SETLK || cmd === F_SETLKW ||
-          cmd === F_GETLK64 || cmd === F_SETLK64 || cmd === F_SETLKW64) {
+          cmd === F_GETLK64 || cmd === F_SETLK64 || cmd === F_SETLKW64 ||
+          cmd === F_OFD_GETLK || cmd === F_OFD_SETLK || cmd === F_OFD_SETLKW) {
         this.handleFcntlLock(channel, origArgs);
         return;
       }

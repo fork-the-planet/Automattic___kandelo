@@ -1136,7 +1136,9 @@ fn dispatch_channel_syscall(nr: u32, args: &[i32; 6]) -> i32 {
         10 => {  // SYS_FCNTL: (fd, cmd, arg)
             match a2 as u32 {
                 // Lock commands: arg is a pointer to struct flock
-                5 | 6 | 7 | 12 | 13 | 14 => kernel_fcntl_lock(a1, a2 as u32, a3 as *mut u8),
+                // POSIX: 5=F_GETLK, 6=F_SETLK, 7=F_SETLKW; 12-14=64-bit variants
+                // OFD:   36=F_OFD_GETLK, 37=F_OFD_SETLK, 38=F_OFD_SETLKW
+                5 | 6 | 7 | 12 | 13 | 14 | 36 | 37 | 38 => kernel_fcntl_lock(a1, a2 as u32, a3 as *mut u8),
                 _ => kernel_fcntl(a1, a2 as u32, a3 as u32),
             }
         }
@@ -1546,6 +1548,9 @@ fn dispatch_channel_syscall(nr: u32, args: &[i32; 6]) -> i32 {
                         // POSIX: can only setpgid on a child of the calling process
                         if target.ppid != proc.pid {
                             -(Errno::ESRCH as i32)
+                        } else if target.sid != proc.sid {
+                            // POSIX: both processes must be in the same session
+                            -(Errno::EPERM as i32)
                         } else if target.sid == target.pid {
                             // POSIX: cannot change pgid of a session leader
                             -(Errno::EPERM as i32)
@@ -1606,9 +1611,17 @@ fn dispatch_channel_syscall(nr: u32, args: &[i32; 6]) -> i32 {
         }
         113 => kernel_fpathconf(a1, a2) as i32,    // SYS_FPATHCONF
 
+        // setreuid/setregid — map to setresuid/setresgid with -1 for saved ID
+        215 => kernel_setresuid(a1 as u32, a2 as u32, 0xFFFFFFFF), // SYS_SETREUID
+        216 => kernel_setresgid(a1 as u32, a2 as u32, 0xFFFFFFFF), // SYS_SETREGID
+
         // Timer
         225 => kernel_setitimer(a1 as u32, a2 as *const u8, a3 as *mut u8), // SYS_SETITIMER
         224 => kernel_getitimer(a1 as u32, a2 as *mut u8), // SYS_GETITIMER
+        // clock_settime — always return EPERM (cannot set clock in Wasm sandbox)
+        226 => -(Errno::EPERM as i32), // SYS_CLOCK_SETTIME
+        // sched_yield — no-op in Wasm (single-threaded per worker)
+        229 => 0, // SYS_SCHED_YIELD
 
         // statx — musl: (dirfd, path, flags, mask, statxbuf)
         260 => {
@@ -1750,7 +1763,7 @@ fn dispatch_channel_syscall(nr: u32, args: &[i32; 6]) -> i32 {
             }
         }
 
-        208 | 226 | 237..=238 | 247..=249 | 252..=254 | 256..=257 | 262 | 265..=268 | 271..=274 | 287 | 289..=293 | 297..=298 | 301..=305 | 306 | 308..=324 | 325..=336 | 348..=349 | 350..=369 | 370..=371 | 373..=376 | 381..=383 | 386 => {
+        208 | 237..=238 | 247..=249 | 252..=254 | 256..=257 | 262 | 265..=268 | 271..=274 | 287 | 289..=293 | 297..=298 | 301..=305 | 306 | 308..=324 | 325..=336 | 348..=349 | 350..=369 | 370..=371 | 373..=376 | 381..=383 | 386 => {
             // Many of these are stubs in the glue layer too; return ENOSYS
             -(Errno::ENOSYS as i32)
         }

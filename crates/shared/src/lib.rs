@@ -468,6 +468,9 @@ pub mod fcntl_cmd {
     pub const F_SETOWN: u32 = 8;
     pub const F_GETOWN: u32 = 9;
     pub const F_DUPFD_CLOEXEC: u32 = 1030;
+    pub const F_OFD_GETLK: u32 = 36;
+    pub const F_OFD_SETLK: u32 = 37;
+    pub const F_OFD_SETLKW: u32 = 38;
 }
 
 /// Lock type constants for advisory record locking.
