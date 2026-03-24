@@ -230,7 +230,7 @@ const SYSCALL_ARGS: Record<number, ArgDesc[]> = {
   ],
   45: [{ argIndex: 0, direction: "in", size: { type: "cstring" } }],           // UNSETENV: name
 
-  75: [{ argIndex: 0, direction: "out", size: { type: "arg", argIndex: 1 } }], // UNAME: buf
+  75: [{ argIndex: 0, direction: "out", size: { type: "fixed", size: 390 } }], // UNAME: buf (struct utsname = 6x65)
   120: [{ argIndex: 0, direction: "out", size: { type: "arg", argIndex: 1 } }], // GETRANDOM: buf
   109: [
     { argIndex: 0, direction: "in", size: { type: "cstring" } },               // REALPATH: path
@@ -333,7 +333,7 @@ const SYSCALL_ARGS: Record<number, ArgDesc[]> = {
   83: [{ argIndex: 1, direction: "out", size: { type: "fixed", size: RLIMIT_SIZE } }],  // GETRLIMIT
   84: [{ argIndex: 1, direction: "in", size: { type: "fixed", size: RLIMIT_SIZE } }],   // SETRLIMIT
 
-  108: [{ argIndex: 1, direction: "out", size: { type: "arg", argIndex: 2 } }], // GETRUSAGE: buf
+  108: [{ argIndex: 1, direction: "out", size: { type: "fixed", size: 144 } }], // GETRUSAGE: buf (time64 rusage = 18x8)
   132: [
     { argIndex: 0, direction: "out", size: { type: "fixed", size: 4 } },       // GETRESUID
     { argIndex: 1, direction: "out", size: { type: "fixed", size: 4 } },

@@ -1377,7 +1377,7 @@ fn dispatch_channel_syscall(nr: u32, args: &[i32; 6]) -> i32 {
             kernel_unsetenv(p, len)
         }
         74 => kernel_umask(a1 as u32) as i32,      // SYS_UMASK
-        75 => kernel_uname(a1 as *mut u8, a2 as u32), // SYS_UNAME
+        75 => kernel_uname(a1 as *mut u8, 390), // SYS_UNAME (musl passes 1 arg; struct utsname = 6x65 = 390)
         76 => kernel_sysconf(a1) as i32,           // SYS_SYSCONF
         120 => kernel_getrandom(a1 as *mut u8, a2 as u32, a3 as u32), // SYS_GETRANDOM
         109 => { // SYS_REALPATH: (path, buf, buf_len)
@@ -1517,7 +1517,7 @@ fn dispatch_channel_syscall(nr: u32, args: &[i32; 6]) -> i32 {
         105 => kernel_setgid(a1 as u32),           // SYS_SETGID
         106 => kernel_seteuid(a1 as u32),          // SYS_SETEUID
         107 => kernel_setegid(a1 as u32),          // SYS_SETEGID
-        108 => kernel_getrusage(a1, a2 as *mut u8, a3 as u32), // SYS_GETRUSAGE
+        108 => kernel_getrusage(a1, a2 as *mut u8, 144), // SYS_GETRUSAGE (musl passes 2 args; time64 rusage = 18x8 = 144)
         131 => kernel_setresuid(a1 as u32, a2 as u32, a3 as u32), // SYS_SETRESUID
         132 => kernel_getresuid(a1 as *mut u32, a2 as *mut u32, a3 as *mut u32), // SYS_GETRESUID
         133 => kernel_setresgid(a1 as u32, a2 as u32, a3 as u32), // SYS_SETRESGID

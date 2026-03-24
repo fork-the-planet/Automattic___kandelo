@@ -1936,6 +1936,10 @@ pub fn sys_getpgid(proc: &Process, pid: u32) -> Result<u32, Errno> {
 /// setpgid -- set process group ID.
 /// pid=0 means current process, pgid=0 means use pid as pgid.
 pub fn sys_setpgid(proc: &mut Process, pid: u32, pgid: u32) -> Result<(), Errno> {
+    // POSIX: negative pgid is invalid
+    if (pgid as i32) < 0 {
+        return Err(Errno::EINVAL);
+    }
     // Only support setting own pgid (cross-process setpgid not yet implemented)
     if pid != 0 && pid != proc.pid {
         return Err(Errno::ESRCH);
@@ -4784,22 +4788,24 @@ pub fn sys_uname(buf: &mut [u8]) -> Result<(), Errno> {
     if buf.len() < 325 {
         return Err(Errno::EINVAL);
     }
-    // Zero out buffer first
-    for b in buf[..325].iter_mut() {
+    // Zero out buffer (up to 6 fields for _GNU_SOURCE domainname)
+    let fill_len = buf.len().min(390);
+    for b in buf[..fill_len].iter_mut() {
         *b = 0;
     }
-    let fields: [&[u8]; 5] = [
+    let fields: [&[u8]; 6] = [
         b"wasm-posix",        // sysname
         b"localhost",         // nodename
         b"1.0.0",             // release
         b"wasm-posix-kernel", // version
         b"wasm32",            // machine
+        b"",                  // domainname (empty)
     ];
-    for (i, field) in fields.iter().enumerate() {
+    let num_fields = if buf.len() >= 390 { 6 } else { 5 };
+    for (i, field) in fields[..num_fields].iter().enumerate() {
         let offset = i * 65;
         let len = field.len().min(64);
         buf[offset..offset + len].copy_from_slice(&field[..len]);
-        // null terminator already set by zeroing
     }
     Ok(())
 }
