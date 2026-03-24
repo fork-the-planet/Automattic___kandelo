@@ -157,47 +157,40 @@ BASIC_EXPECTED_FAIL=(
     # -- Process exec (not implemented in centralized mode)
     "unistd/execl" "unistd/execle" "unistd/execlp" "unistd/execv"
     "unistd/execve" "unistd/execvp" "unistd/fexecve"
-    # -- Memory locking (not supported in Wasm)
-    "sys_mman/mlock" "sys_mman/mlockall" "sys_mman/munlock" "sys_mman/munlockall"
+    # -- Memory locking (mlock/munlock are stubs; mlockall/munlockall work)
+    # (mlock, mlockall, munlock, munlockall removed — stubs pass basic invocation tests)
     # -- Privileged operations
     "time/clock_settime" "unistd/fchownat" "unistd/lchown"
     # -- Process management requiring fork/exec or process groups
-    "sys_wait/wait" "sys_wait/waitpid"
-    "unistd/getpgid" "unistd/setpgid" "unistd/setsid"
+    "sys_wait/waitpid"
     "unistd/setregid" "unistd/setreuid" "unistd/nice"
     "stdlib/abort" "stdlib/system"
     # -- Signals (limited Wasm signal model)
-    "signal/kill" "signal/killpg" "signal/pthread_sigmask" "signal/raise"
-    "signal/sig2str" "signal/sigaction" "signal/sigaltstack" "signal/sigismember"
-    "signal/sigpending" "signal/sigprocmask" "signal/sigqueue"
-    "signal/sigwaitinfo" "signal/str2sig"
+    "signal/kill" "signal/killpg"
+    "signal/sig2str" "signal/sigaltstack"
+    "signal/sigqueue" "signal/sigwaitinfo" "signal/str2sig"
     # -- Timers/signals that block (timeout)
     "aio/aio_error" "aio/aio_fsync" "aio/aio_read"
     "poll/ppoll"
     "pthread/pthread_barrierattr_setpshared" "pthread/pthread_cancel"
     "pthread/pthread_cleanup_pop" "pthread/pthread_cleanup_push"
-    "pthread/pthread_cond_timedwait" "pthread/pthread_condattr_setpshared"
-    "pthread/pthread_create" "pthread/pthread_mutex_timedlock"
-    "pthread/pthread_rwlock_timedrdlock" "pthread/pthread_rwlock_timedwrlock"
-    "semaphore/sem_timedwait"
-    "signal/pthread_kill" "signal/sigsuspend" "signal/sigtimedwait" "signal/sigwait"
-    "threads/cnd_timedwait" "threads/mtx_timedlock" "threads/thrd_create"
+    "pthread/pthread_condattr_setpshared"
+    "pthread/pthread_create"
+    "signal/pthread_kill" "signal/sigtimedwait"
+    "threads/thrd_create"
     "unistd/pause" "unistd/alarm"
     # -- Pthread features not supported (priority scheduling, pshared)
     "pthread/pthread_atfork" "pthread/pthread_attr_getstack"
-    "pthread/pthread_attr_setinheritsched" "pthread/pthread_attr_setschedparam"
-    "pthread/pthread_attr_setschedpolicy" "pthread/pthread_cond_clockwait"
-    "pthread/pthread_getschedparam" "pthread/pthread_mutex_clocklock"
+    "pthread/pthread_attr_setinheritsched"
+    "pthread/pthread_cond_clockwait"
+    "pthread/pthread_mutex_clocklock"
     "pthread/pthread_mutex_getprioceiling" "pthread/pthread_mutex_setprioceiling"
     "pthread/pthread_mutexattr_getprioceiling" "pthread/pthread_mutexattr_setprioceiling"
     "pthread/pthread_mutexattr_setpshared" "pthread/pthread_rwlock_clockrdlock"
-    "pthread/pthread_rwlock_clockwrlock" "pthread/pthread_rwlockattr_setpshared"
-    "pthread/pthread_setcancelstate" "pthread/pthread_setschedparam"
-    "pthread/pthread_setschedprio"
-    # -- Scheduler (not implemented)
-    "sched/sched_get_priority_max" "sched/sched_get_priority_min" "sched/sched_getparam"
-    "sched/sched_getscheduler" "sched/sched_rr_get_interval" "sched/sched_setparam"
-    "sched/sched_setscheduler" "sched/sched_yield"
+    "pthread/pthread_rwlock_clockwrlock"
+    "pthread/pthread_setcancelstate"
+    # -- Scheduler (sched_yield is a no-op stub; others have basic stubs)
+    "sched/sched_get_priority_max" "sched/sched_yield"
     # -- Semaphore named (not supported in Wasm)
     "semaphore/sem_clockwait" "semaphore/sem_close" "semaphore/sem_open" "semaphore/sem_unlink"
     # -- Terminal I/O (no terminal device in Wasm)
@@ -226,13 +219,13 @@ BASIC_EXPECTED_FAIL=(
     "dirent/fdopendir" "dirent/posix_getdents" "dirent/readdir" "dirent/readdir_r"
     "dirent/rewinddir" "dirent/scandir" "dirent/seekdir"
     "stdio/fopen" "stdio/pclose" "stdio/popen" "stdio/remove"
-    "unistd/faccessat" "unistd/gethostname" "unistd/lockf"
+    "unistd/faccessat"
     "unistd/lseek" "unistd/read" "unistd/readlinkat"
     "ftw/nftw" "glob/glob" "glob/globfree"
     "wordexp/wordexp" "wordexp/wordfree"
     "sys_stat/fchmodat" "sys_stat/fstat" "sys_stat/fstatat" "sys_stat/futimens"
     "sys_stat/lstat" "sys_stat/mkfifo" "sys_stat/mkfifoat" "sys_stat/mknod"
-    "sys_stat/mknodat" "sys_stat/stat" "sys_stat/utimensat"
+    "sys_stat/mknodat" "sys_stat/stat"
     "sys_statvfs/fstatvfs"
     "sys_mman/msync" "sys_mman/posix_mem_offset" "sys_mman/posix_typed_mem_get_info"
     "sys_mman/posix_typed_mem_open" "sys_mman/shm_open"
@@ -242,12 +235,11 @@ BASIC_EXPECTED_FAIL=(
     "grp/endgrent" "grp/getgrent" "grp/getgrgid" "grp/getgrgid_r"
     "grp/getgrnam" "grp/getgrnam_r" "grp/setgrent"
     # -- Misc not supported
-    "time/clock" "time/clock_getcpuclockid" "time/clock_getres"
+    "time/clock_getcpuclockid"
     "time/timer_create" "time/timer_delete" "time/timer_getoverrun"
-    "time/timer_gettime" "time/timer_settime" "time/timespec_get"
-    "sys_resource/getpriority" "sys_resource/getrusage" "sys_resource/setpriority"
-    "sys_select/pselect" "sys_select/select" "sys_time/select" "sys_time/utimes"
-    "sys_utsname/uname"
+    "time/timer_gettime" "time/timer_settime"
+    "sys_resource/getpriority" "sys_resource/setpriority"
+    "sys_select/pselect" "sys_select/select" "sys_time/select"
     "locale/getlocalename_l"
     "monetary/strfmon" "monetary/strfmon_l"
     "syslog/closelog" "syslog/syslog"
@@ -292,7 +284,7 @@ SIGNAL_EXPECTED_FAIL=(
 )
 PROCESS_EXPECTED_FAIL=(
     # Process groups: setpgid undo/redo and cross-process not implemented
-    "fork-setpgid-another-*" "fork-setpgid-invalid"
+    "fork-setpgid-another-*"
     "fork-setpgid-undo*"
     "fork-setsid*"
     "limbo-getpgid" "zombie-getpgid" "zombie-setpgid*"
