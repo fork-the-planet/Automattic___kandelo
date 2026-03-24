@@ -1318,7 +1318,7 @@ pub fn sys_fcntl(
     }
 }
 
-/// fcntl lock operations (F_GETLK, F_SETLK, F_SETLKW).
+/// fcntl lock operations (F_GETLK, F_SETLK, F_SETLKW, F_OFD_*).
 pub fn sys_fcntl_lock(
     proc: &mut Process,
     fd: i32,
@@ -1326,10 +1326,24 @@ pub fn sys_fcntl_lock(
     flock: &mut WasmFlock,
     host: &mut dyn HostIO,
 ) -> Result<(), Errno> {
+    use wasm_posix_shared::fcntl_cmd::{F_OFD_GETLK, F_OFD_SETLK, F_OFD_SETLKW};
+
     let entry = proc.fd_table.get(fd)?;
     let ofd_idx = entry.ofd_ref.0;
     let ofd = proc.ofd_table.get(ofd_idx).ok_or(Errno::EBADF)?;
     let host_handle = ofd.host_handle;
+
+    // OFD locks use the OFD index as lock owner (not PID).
+    // Map OFD commands to their POSIX equivalents for the lock table.
+    let is_ofd = matches!(cmd, F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW);
+    let base_cmd = match cmd {
+        F_OFD_GETLK => F_GETLK,
+        F_OFD_SETLK => F_SETLK,
+        F_OFD_SETLKW => F_SETLKW,
+        other => other,
+    };
+    // OFD lock owners use high bit to avoid colliding with PIDs
+    let lock_owner = if is_ofd { (ofd_idx as u32) | 0x80000000 } else { proc.pid };
 
     // Resolve start offset based on whence
     let start = match flock.l_whence {
@@ -1342,7 +1356,7 @@ pub fn sys_fcntl_lock(
     // For host-backed files, delegate to the shared lock table via host import
     if host_handle >= 0 && !ofd.path.is_empty() {
         // Access mode check
-        if cmd == F_SETLK || cmd == F_SETLKW {
+        if base_cmd == F_SETLK || base_cmd == F_SETLKW {
             let access_mode = ofd.status_flags & O_ACCMODE;
             if flock.l_type == F_RDLCK && access_mode == O_WRONLY {
                 return Err(Errno::EBADF);
@@ -1354,14 +1368,17 @@ pub fn sys_fcntl_lock(
         let path = &ofd.path;
         let mut result_buf = [0u8; 24];
         host.host_fcntl_lock(
-            path, proc.pid, cmd, flock.l_type,
+            path, lock_owner, base_cmd, flock.l_type,
             start, flock.l_len, &mut result_buf,
         )?;
-        // For F_GETLK, parse result_buf back into flock
-        if cmd == F_GETLK {
+        // For GETLK variants, parse result_buf back into flock
+        if base_cmd == F_GETLK {
             flock.l_type = u32::from_le_bytes(result_buf[0..4].try_into().unwrap());
             if flock.l_type != F_UNLCK {
-                flock.l_pid = u32::from_le_bytes(result_buf[4..8].try_into().unwrap());
+                // OFD locks: POSIX says l_pid should be -1
+                flock.l_pid = if is_ofd { 0xFFFFFFFF } else {
+                    u32::from_le_bytes(result_buf[4..8].try_into().unwrap())
+                };
                 flock.l_start = i64::from_le_bytes(result_buf[8..16].try_into().unwrap());
                 flock.l_len = i64::from_le_bytes(result_buf[16..24].try_into().unwrap());
                 flock.l_whence = 0;
@@ -1371,17 +1388,18 @@ pub fn sys_fcntl_lock(
     }
 
     // Fallback: use local lock_table for non-host files (pipes, etc.)
-    match cmd {
+    match base_cmd {
         F_GETLK => {
             match proc
                 .lock_table
-                .get_blocking_lock(host_handle, flock.l_type, start, flock.l_len, proc.pid)
+                .get_blocking_lock(host_handle, flock.l_type, start, flock.l_len, lock_owner)
             {
                 Some(blocking) => {
                     flock.l_type = blocking.lock_type;
                     flock.l_start = blocking.start;
                     flock.l_len = blocking.len;
-                    flock.l_pid = blocking.pid;
+                    // OFD locks: POSIX says l_pid should be -1
+                    flock.l_pid = if is_ofd { 0xFFFFFFFF } else { blocking.pid };
                     flock.l_whence = 0;
                 }
                 None => {
@@ -1401,7 +1419,7 @@ pub fn sys_fcntl_lock(
 
             if flock.l_type == F_UNLCK {
                 let lock = FileLock {
-                    pid: proc.pid,
+                    pid: lock_owner,
                     lock_type: F_UNLCK,
                     start,
                     len: flock.l_len,
@@ -1412,17 +1430,17 @@ pub fn sys_fcntl_lock(
 
             if proc
                 .lock_table
-                .get_blocking_lock(host_handle, flock.l_type, start, flock.l_len, proc.pid)
+                .get_blocking_lock(host_handle, flock.l_type, start, flock.l_len, lock_owner)
                 .is_some()
             {
-                if cmd == F_SETLK {
+                if base_cmd == F_SETLK {
                     return Err(Errno::EAGAIN);
                 }
                 return Err(Errno::ENOSYS);
             }
 
             let lock = FileLock {
-                pid: proc.pid,
+                pid: lock_owner,
                 lock_type: flock.l_type,
                 start,
                 len: flock.l_len,
