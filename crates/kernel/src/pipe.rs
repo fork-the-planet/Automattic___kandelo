@@ -1,6 +1,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use core::cell::UnsafeCell;
 
 /// POSIX default pipe capacity.
 pub const DEFAULT_PIPE_CAPACITY: usize = 65536;
@@ -13,13 +14,17 @@ pub const PIPE_BUF: usize = 4096;
 ///
 /// Uses a fixed-capacity `Vec<u8>` with head/tail pointers and a length
 /// counter for O(1) read and write operations.
+///
+/// Endpoints are reference-counted: `read_count` and `write_count` track
+/// how many open file descriptions reference each end. This supports
+/// cross-process pipe sharing (e.g., after fork).
 pub struct PipeBuffer {
     buf: Vec<u8>,
     head: usize,
     tail: usize,
     len: usize,
-    read_open: bool,
-    write_open: bool,
+    read_count: u32,
+    write_count: u32,
 }
 
 impl PipeBuffer {
@@ -32,8 +37,8 @@ impl PipeBuffer {
             head: 0,
             tail: 0,
             len: 0,
-            read_open: true,
-            write_open: true,
+            read_count: 1,
+            write_count: 1,
         }
     }
 
@@ -105,25 +110,101 @@ impl PipeBuffer {
         n
     }
 
-    /// Close the read end of the pipe.
+    /// Close one read end of the pipe. Decrements the read reference count.
     pub fn close_read_end(&mut self) {
-        self.read_open = false;
+        self.read_count = self.read_count.saturating_sub(1);
     }
 
-    /// Close the write end of the pipe.
+    /// Close one write end of the pipe. Decrements the write reference count.
     pub fn close_write_end(&mut self) {
-        self.write_open = false;
+        self.write_count = self.write_count.saturating_sub(1);
     }
 
-    /// Returns true if the read end is still open.
+    /// Add a reader reference (e.g., after fork or dup).
+    pub fn add_reader(&mut self) {
+        self.read_count += 1;
+    }
+
+    /// Add a writer reference (e.g., after fork or dup).
+    pub fn add_writer(&mut self) {
+        self.write_count += 1;
+    }
+
+    /// Returns true if the read end is still open (any readers remain).
     pub fn is_read_end_open(&self) -> bool {
-        self.read_open
+        self.read_count > 0
     }
 
-    /// Returns true if the write end is still open.
+    /// Returns true if the write end is still open (any writers remain).
     pub fn is_write_end_open(&self) -> bool {
-        self.write_open
+        self.write_count > 0
     }
+
+    /// Returns true if both endpoints are closed and the pipe can be freed.
+    pub fn is_fully_closed(&self) -> bool {
+        self.read_count == 0 && self.write_count == 0
+    }
+}
+
+/// Table of pipe buffers shared across all processes in centralized mode.
+pub struct PipeTable {
+    pipes: Vec<Option<PipeBuffer>>,
+}
+
+impl PipeTable {
+    pub const fn new() -> Self {
+        PipeTable { pipes: Vec::new() }
+    }
+
+    /// Allocate a pipe buffer in the table. Returns the index.
+    pub fn alloc(&mut self, pipe: PipeBuffer) -> usize {
+        for (i, slot) in self.pipes.iter().enumerate() {
+            if slot.is_none() {
+                self.pipes[i] = Some(pipe);
+                return i;
+            }
+        }
+        let i = self.pipes.len();
+        self.pipes.push(Some(pipe));
+        i
+    }
+
+    /// Get a reference to a pipe buffer by index.
+    pub fn get(&self, idx: usize) -> Option<&PipeBuffer> {
+        self.pipes.get(idx).and_then(|p| p.as_ref())
+    }
+
+    /// Get a mutable reference to a pipe buffer by index.
+    pub fn get_mut(&mut self, idx: usize) -> Option<&mut PipeBuffer> {
+        self.pipes.get_mut(idx).and_then(|p| p.as_mut())
+    }
+
+    /// Free a pipe buffer slot if both endpoints are closed.
+    pub fn free_if_closed(&mut self, idx: usize) {
+        if let Some(Some(pipe)) = self.pipes.get(idx) {
+            if pipe.is_fully_closed() {
+                self.pipes[idx] = None;
+            }
+        }
+    }
+}
+
+/// Global pipe table wrapper for static storage.
+pub struct GlobalPipeTable(pub UnsafeCell<PipeTable>);
+
+/// SAFETY: Access is serialized — the centralized kernel services one syscall
+/// at a time from the JS event loop (no concurrent Wasm execution).
+unsafe impl Sync for GlobalPipeTable {}
+
+/// Global pipe table shared across all processes in centralized mode.
+pub static PIPE_TABLE: GlobalPipeTable = GlobalPipeTable(UnsafeCell::new(PipeTable::new()));
+
+/// Get a mutable reference to the global pipe table.
+///
+/// # Safety
+/// Only safe when access is serialized (single-threaded kernel).
+pub unsafe fn global_pipe_table() -> &'static mut PipeTable {
+    unsafe { &mut *PIPE_TABLE.0.get() }
 }
 
 #[cfg(test)]
@@ -249,5 +330,51 @@ mod tests {
         pipe.write(b"hello");
         assert_eq!(pipe.available(), 5);
         assert_eq!(pipe.free_space(), DEFAULT_PIPE_CAPACITY - 5);
+    }
+
+    #[test]
+    fn test_ref_counting() {
+        let mut pipe = PipeBuffer::new(DEFAULT_PIPE_CAPACITY);
+        assert!(pipe.is_read_end_open());
+        assert!(pipe.is_write_end_open());
+
+        // Add extra reader and writer (simulating fork)
+        pipe.add_reader();
+        pipe.add_writer();
+
+        // Close one reader — still open
+        pipe.close_read_end();
+        assert!(pipe.is_read_end_open());
+        assert!(!pipe.is_fully_closed());
+
+        // Close second reader — now closed
+        pipe.close_read_end();
+        assert!(!pipe.is_read_end_open());
+        assert!(!pipe.is_fully_closed()); // writer still open
+
+        // Close both writers
+        pipe.close_write_end();
+        assert!(!pipe.is_fully_closed());
+        pipe.close_write_end();
+        assert!(pipe.is_fully_closed());
+    }
+
+    #[test]
+    fn test_pipe_table_alloc_and_free() {
+        let mut table = PipeTable::new();
+        let idx = table.alloc(PipeBuffer::new(64));
+        assert_eq!(idx, 0);
+
+        let idx2 = table.alloc(PipeBuffer::new(64));
+        assert_eq!(idx2, 1);
+
+        // Close both endpoints of first pipe
+        table.get_mut(idx).unwrap().close_read_end();
+        table.get_mut(idx).unwrap().close_write_end();
+        table.free_if_closed(idx);
+
+        // Slot 0 should be reusable
+        let idx3 = table.alloc(PipeBuffer::new(64));
+        assert_eq!(idx3, 0);
     }
 }

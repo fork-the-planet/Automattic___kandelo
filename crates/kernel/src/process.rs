@@ -226,6 +226,11 @@ pub struct Process {
     pub alt_stack_sp: u32,
     pub alt_stack_flags: u32,
     pub alt_stack_size: u32,
+    /// Pipe FD pairs inherited from parent, for replay during fork child
+    /// re-execution. Each entry is (read_fd, write_fd). sys_pipe pops
+    /// from this list to return the correct FDs when the child re-runs
+    /// code before fork(). Empty in non-fork-child processes.
+    pub fork_pipe_replay: Vec<(i32, i32)>,
 }
 
 impl Process {
@@ -294,6 +299,7 @@ impl Process {
             alt_stack_sp: 0,
             alt_stack_flags: 2, // SS_DISABLE
             alt_stack_size: 0,
+            fork_pipe_replay: Vec::new(),
         }
     }
 
