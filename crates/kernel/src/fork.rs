@@ -619,6 +619,7 @@ pub fn deserialize_fork_state(buf: &[u8], child_pid: u32) -> Result<Process, Err
         alt_stack_sp: 0,
         alt_stack_flags: 2, // SS_DISABLE
         alt_stack_size: 0,
+        fork_pipe_replay: Vec::new(),
     })
 }
 
@@ -957,6 +958,7 @@ pub fn deserialize_exec_state(buf: &[u8], pid: u32) -> Result<Process, Errno> {
         alt_stack_sp: 0,
         alt_stack_flags: 2, // SS_DISABLE
         alt_stack_size: 0,
+        fork_pipe_replay: Vec::new(),
     })
 }
 

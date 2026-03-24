@@ -163,7 +163,6 @@ BASIC_EXPECTED_FAIL=(
     "sys_wait/waitpid"
     "stdlib/abort" "stdlib/system"
     # -- Signals (limited Wasm signal model)
-    "signal/kill" "signal/killpg"
     "signal/sigaltstack"
     # -- Timers/signals that block (timeout)
     "aio/aio_error" "aio/aio_fsync" "aio/aio_read"
@@ -273,10 +272,6 @@ SIGNAL_EXPECTED_FAIL=(
     "ppoll-block-sleep-raise" "ppoll-block-sleep-raise-write" "ppoll-block-sleep-write-raise"
 )
 PROCESS_EXPECTED_FAIL=(
-    # Cross-process pipes don't work: fork child gets empty pipes vec, so pipe
-    # synchronization between parent and child fails (parent reads EOF immediately).
-    # The kernel session check is correct but untestable without shared pipes.
-    "fork-setsid-setpgid-in-parent" "fork-setsid-setpgid-in-parent-move"
     # Zombie: setpgid-move requires cross-process kill + pgid group validation
     "zombie-setpgid-move"
     # waitpid with PGID matching

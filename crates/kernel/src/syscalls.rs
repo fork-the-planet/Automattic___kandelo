@@ -225,12 +225,21 @@ pub fn sys_close(
                 } else {
                     // Kernel-internal pipe
                     let pipe_idx = (-(host_handle + 1)) as usize;
-                    if let Some(pipe) = proc.pipes.get_mut(pipe_idx).and_then(|p| p.as_mut()) {
+                    let pipe = if crate::is_centralized_mode() {
+                        unsafe { crate::pipe::global_pipe_table().get_mut(pipe_idx) }
+                    } else {
+                        proc.pipes.get_mut(pipe_idx).and_then(|p| p.as_mut())
+                    };
+                    if let Some(pipe) = pipe {
                         let access_mode = status_flags & O_ACCMODE;
                         if access_mode == O_RDONLY {
                             pipe.close_read_end();
                         } else {
                             pipe.close_write_end();
+                        }
+                        // Free pipe slot if both endpoints are closed
+                        if crate::is_centralized_mode() {
+                            unsafe { crate::pipe::global_pipe_table().free_if_closed(pipe_idx) };
                         }
                     }
                 }
@@ -322,7 +331,32 @@ pub fn sys_read(
             } else {
                 // Kernel-internal pipe
                 let pipe_idx = (-(host_handle + 1)) as usize;
+                // First attempt: try to read from pipe (centralized uses global table)
+                {
+                    let pipe = if crate::is_centralized_mode() {
+                        unsafe { crate::pipe::global_pipe_table().get_mut(pipe_idx) }
+                    } else {
+                        proc.pipes.get_mut(pipe_idx).and_then(|p| p.as_mut())
+                    }.ok_or(Errno::EBADF)?;
+                    let n = pipe.read(buf);
+                    if n > 0 {
+                        return Ok(n);
+                    }
+                    if !pipe.is_write_end_open() {
+                        return Ok(0); // EOF — write end closed
+                    }
+                }
+                if status_flags & O_NONBLOCK != 0 || crate::is_centralized_mode() {
+                    return Err(Errno::EAGAIN);
+                }
+                // Non-centralized blocking loop (per-process pipes only)
                 loop {
+                    if proc.signals.deliverable() != 0 {
+                        if !proc.signals.should_restart() {
+                            return Err(Errno::EINTR);
+                        }
+                    }
+                    let _ = host.host_nanosleep(0, 1_000_000);
                     let pipe = proc
                         .pipes
                         .get_mut(pipe_idx)
@@ -333,18 +367,8 @@ pub fn sys_read(
                         return Ok(n);
                     }
                     if !pipe.is_write_end_open() {
-                        return Ok(0); // EOF — write end closed
+                        return Ok(0);
                     }
-                    if status_flags & O_NONBLOCK != 0 || crate::is_centralized_mode() {
-                        return Err(Errno::EAGAIN);
-                    }
-                    // Block: check for signals then sleep 1ms
-                    if proc.signals.deliverable() != 0 {
-                        if !proc.signals.should_restart() {
-                            return Err(Errno::EINTR);
-                        }
-                    }
-                    let _ = host.host_nanosleep(0, 1_000_000);
                 }
             }
         }
@@ -645,7 +669,38 @@ pub fn sys_write(
                 // Kernel-internal pipe
                 const PIPE_BUF: usize = 4096;
                 let pipe_idx = (-(host_handle + 1)) as usize;
+                // First attempt: try to write to pipe (centralized uses global table)
+                {
+                    let pipe = if crate::is_centralized_mode() {
+                        unsafe { crate::pipe::global_pipe_table().get_mut(pipe_idx) }
+                    } else {
+                        proc.pipes.get_mut(pipe_idx).and_then(|p| p.as_mut())
+                    }.ok_or(Errno::EBADF)?;
+                    if !pipe.is_read_end_open() {
+                        proc.signals.raise(wasm_posix_shared::signal::SIGPIPE);
+                        return Err(Errno::EPIPE);
+                    }
+                    // POSIX PIPE_BUF atomicity: writes ≤ PIPE_BUF must not be partial
+                    if buf.len() <= PIPE_BUF && pipe.free_space() < buf.len() {
+                        // Not enough space for atomic write — fall through to block/EAGAIN
+                    } else {
+                        let n = pipe.write(buf);
+                        if n > 0 {
+                            return Ok(n);
+                        }
+                    }
+                }
+                if status_flags & O_NONBLOCK != 0 || crate::is_centralized_mode() {
+                    return Err(Errno::EAGAIN);
+                }
+                // Non-centralized blocking loop (per-process pipes only)
                 loop {
+                    if proc.signals.deliverable() != 0 {
+                        if !proc.signals.should_restart() {
+                            return Err(Errno::EINTR);
+                        }
+                    }
+                    let _ = host.host_nanosleep(0, 1_000_000);
                     let pipe = proc
                         .pipes
                         .get_mut(pipe_idx)
@@ -655,28 +710,13 @@ pub fn sys_write(
                         proc.signals.raise(wasm_posix_shared::signal::SIGPIPE);
                         return Err(Errno::EPIPE);
                     }
-                    // POSIX PIPE_BUF atomicity: writes ≤ PIPE_BUF must not be partial
                     if buf.len() <= PIPE_BUF && pipe.free_space() < buf.len() {
-                        // Not enough space for atomic write
-                        if status_flags & O_NONBLOCK != 0 || crate::is_centralized_mode() {
-                            return Err(Errno::EAGAIN);
-                        }
-                    } else {
-                        let n = pipe.write(buf);
-                        if n > 0 {
-                            return Ok(n);
-                        }
-                        if status_flags & O_NONBLOCK != 0 || crate::is_centralized_mode() {
-                            return Err(Errno::EAGAIN);
-                        }
+                        continue; // Not enough space for atomic write
                     }
-                    // Block: check for signals then sleep 1ms
-                    if proc.signals.deliverable() != 0 {
-                        if !proc.signals.should_restart() {
-                            return Err(Errno::EINTR);
-                        }
+                    let n = pipe.write(buf);
+                    if n > 0 {
+                        return Ok(n);
                     }
-                    let _ = host.host_nanosleep(0, 1_000_000);
                 }
             }
         }
@@ -1119,10 +1159,22 @@ pub fn sys_dup3(
 
 /// Create a pipe, returning (read_fd, write_fd).
 pub fn sys_pipe(proc: &mut Process) -> Result<(i32, i32), Errno> {
+    // Fork child re-execution: return inherited pipe FDs instead of creating
+    // new pipes. The child re-executes _start and calls pipe() again, but
+    // should get the same FDs pointing to the shared pipe buffers.
+    if proc.fork_child && !proc.fork_pipe_replay.is_empty() {
+        let (read_fd, write_fd) = proc.fork_pipe_replay.remove(0);
+        return Ok((read_fd, write_fd));
+    }
+
     let pipe = PipeBuffer::new(DEFAULT_PIPE_CAPACITY);
 
     // Find or append a slot in the pipe table.
-    let pipe_idx = {
+    // Centralized mode: use global pipe table (shared across processes for fork).
+    // Non-centralized mode: use per-process pipe table (backward compat for tests).
+    let pipe_idx = if crate::is_centralized_mode() {
+        unsafe { crate::pipe::global_pipe_table().alloc(pipe) }
+    } else {
         let mut found = None;
         for (i, slot) in proc.pipes.iter().enumerate() {
             if slot.is_none() {
@@ -3581,7 +3633,12 @@ fn poll_check(proc: &mut Process, fds: &mut [WasmPollFd]) -> i32 {
                 } else {
                     // Kernel-internal pipe
                     let pipe_idx = (-(ofd.host_handle + 1)) as usize;
-                    if let Some(Some(pipe)) = proc.pipes.get(pipe_idx) {
+                    let pipe = if crate::is_centralized_mode() {
+                        unsafe { crate::pipe::global_pipe_table().get(pipe_idx) }
+                    } else {
+                        proc.pipes.get(pipe_idx).and_then(|p| p.as_ref())
+                    };
+                    if let Some(pipe) = pipe {
                         if pollfd.events & POLLIN != 0 && pipe.available() > 0 {
                             revents |= POLLIN;
                         }
@@ -3949,10 +4006,12 @@ pub fn sys_ioctl(proc: &mut Process, fd: i32, request: u32, buf: &mut [u8]) -> R
             FileType::Pipe => {
                 if ofd.host_handle < 0 {
                     let pipe_idx = (-(ofd.host_handle + 1)) as usize;
-                    proc.pipes.get(pipe_idx)
-                        .and_then(|p| p.as_ref())
-                        .map(|p| p.available() as i32)
-                        .unwrap_or(0)
+                    let pipe = if crate::is_centralized_mode() {
+                        unsafe { crate::pipe::global_pipe_table().get(pipe_idx) }
+                    } else {
+                        proc.pipes.get(pipe_idx).and_then(|p| p.as_ref())
+                    };
+                    pipe.map(|p| p.available() as i32).unwrap_or(0)
                 } else {
                     0
                 }

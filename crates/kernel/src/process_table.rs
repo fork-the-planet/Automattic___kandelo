@@ -18,7 +18,9 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 
 use wasm_posix_shared::Errno;
+use wasm_posix_shared::flags::O_ACCMODE;
 
+use crate::ofd::FileType;
 use crate::process::Process;
 
 /// Table of all processes managed by the centralized kernel.
@@ -50,8 +52,31 @@ impl ProcessTable {
     }
 
     /// Remove a process from the table.
+    /// Decrements pipe ref counts in the global pipe table for any pipe OFDs
+    /// the process still holds open.
     pub fn remove_process(&mut self, pid: u32) -> Option<Process> {
-        self.processes.remove(&pid)
+        let proc = self.processes.remove(&pid)?;
+
+        // Decrement pipe ref counts for any open pipe OFDs.
+        // Each OFD represents one pipe endpoint (one reader or one writer),
+        // regardless of how many FDs point to it (ofd.ref_count).
+        let pipe_table = unsafe { crate::pipe::global_pipe_table() };
+        for (_ofd_idx, ofd) in proc.ofd_table.iter() {
+            if ofd.file_type == FileType::Pipe && ofd.host_handle < 0 {
+                let pipe_idx = (-(ofd.host_handle + 1)) as usize;
+                if let Some(pipe) = pipe_table.get_mut(pipe_idx) {
+                    let access_mode = ofd.status_flags & O_ACCMODE;
+                    if access_mode == wasm_posix_shared::flags::O_RDONLY {
+                        pipe.close_read_end();
+                    } else {
+                        pipe.close_write_end();
+                    }
+                }
+                pipe_table.free_if_closed(pipe_idx);
+            }
+        }
+
+        Some(proc)
     }
 
     /// Set the current pid for syscall dispatch.
@@ -85,6 +110,48 @@ impl ProcessTable {
 
         // Deserialize as child
         let child = crate::fork::deserialize_fork_state(&buf[..written], child_pid)?;
+
+        // Increment pipe ref counts in the global pipe table for pipe OFDs
+        // that the child inherited from the parent.
+        // Also build pipe_fd_pairs for fork_pipe_replay (ordered by pipe_idx).
+        use alloc::collections::BTreeMap;
+        let pipe_table = unsafe { crate::pipe::global_pipe_table() };
+        let mut pipe_fd_pairs: BTreeMap<usize, (i32, i32)> = BTreeMap::new(); // pipe_idx → (read_fd, write_fd)
+        for (_ofd_idx, ofd) in child.ofd_table.iter() {
+            if ofd.file_type == FileType::Pipe && ofd.host_handle < 0 {
+                let pipe_idx = (-(ofd.host_handle + 1)) as usize;
+                if let Some(pipe) = pipe_table.get_mut(pipe_idx) {
+                    let access_mode = ofd.status_flags & O_ACCMODE;
+                    if access_mode == wasm_posix_shared::flags::O_RDONLY {
+                        pipe.add_reader();
+                    } else {
+                        pipe.add_writer();
+                    }
+                }
+            }
+        }
+
+        // Build fork_pipe_replay: map pipe FDs by pipe_idx
+        // Scan fd_table → ofd_table to find (read_fd, write_fd) pairs per pipe_idx
+        for fd in 0..1024i32 {
+            if let Ok(entry) = child.fd_table.get(fd) {
+                if let Some(ofd) = child.ofd_table.get(entry.ofd_ref.0) {
+                    if ofd.file_type == FileType::Pipe && ofd.host_handle < 0 {
+                        let pipe_idx = (-(ofd.host_handle + 1)) as usize;
+                        let access_mode = ofd.status_flags & O_ACCMODE;
+                        let pair = pipe_fd_pairs.entry(pipe_idx).or_insert((-1, -1));
+                        if access_mode == wasm_posix_shared::flags::O_RDONLY {
+                            pair.0 = fd;
+                        } else {
+                            pair.1 = fd;
+                        }
+                    }
+                }
+            }
+        }
+        let mut child = child;
+        child.fork_pipe_replay = pipe_fd_pairs.into_values().collect();
+
         self.processes.insert(child_pid, child);
         Ok(())
     }
