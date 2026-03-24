@@ -279,8 +279,8 @@ SIGNAL_EXPECTED_FAIL=(
 PROCESS_EXPECTED_FAIL=(
     # Cross-process setsid+setpgid with pipe synchronization (timing issue)
     "fork-setsid-setpgid-in-parent" "fork-setsid-setpgid-in-parent-move"
-    # Zombie process pgid operations
-    "zombie-getpgid" "zombie-setpgid*"
+    # Zombie: setpgid-move requires cross-process kill + pgid group validation
+    "zombie-setpgid-move"
     # waitpid with PGID matching
     "waitpid-pgid*"
     # exec not implemented in centralized mode

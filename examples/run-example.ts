@@ -203,7 +203,13 @@ async function main() {
                 if (entry) {
                     entry.resolve(exitStatus);
                 }
-                kernelWorker.unregisterProcess(pid);
+                if (pid === 1) {
+                    kernelWorker.unregisterProcess(pid);
+                } else {
+                    // Child: deactivate channels but keep in kernel process table
+                    // as zombie until reaped by wait/waitpid
+                    kernelWorker.deactivateProcess(pid);
+                }
             },
         },
     );
