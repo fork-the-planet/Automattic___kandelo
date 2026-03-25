@@ -41,11 +41,27 @@ int __lookup_name(struct address buf[static MAXADDRS], char canon[static 256],
 		return 1;
 	}
 
-	/* 2. Numeric IP literal */
+	/* 2. "localhost" → return 127.0.0.1 without network lookup */
+	if (!strcmp(name, "localhost")) {
+		if (family == AF_INET6) return EAI_FAMILY;
+		buf[0].family = AF_INET;
+		buf[0].scopeid = 0;
+		memset(buf[0].addr, 0, 16);
+		buf[0].addr[0] = 127;
+		buf[0].addr[3] = 1;
+		buf[0].sortkey = 0;
+		size_t namelen = strlen(name);
+		if (namelen >= 256) namelen = 255;
+		memcpy(canon, name, namelen);
+		canon[namelen] = 0;
+		return 1;
+	}
+
+	/* 3. Numeric IP literal */
 	int r = __lookup_ipliteral(buf, name, family);
 	if (r) return r; /* 1 = success, positive EAI_* = error, 0 = not literal */
 
-	/* 3. Hostname: delegate to host via syscall */
+	/* 4. Hostname: delegate to host via syscall */
 	if (family == AF_INET6) return EAI_FAMILY;
 
 	unsigned char result[4];

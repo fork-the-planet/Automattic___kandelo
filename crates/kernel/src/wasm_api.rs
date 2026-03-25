@@ -2839,6 +2839,20 @@ pub extern "C" fn kernel_getpgrp() -> u32 {
     result
 }
 
+/// Get the process group ID of a process. Queries the ProcessTable directly
+/// (no current-process context needed). Returns pgid on success, or negative errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_getpgid_direct(pid: u32) -> i32 {
+    if !crate::is_centralized_mode() {
+        return -(Errno::ENOSYS as i32);
+    }
+    let table = unsafe { &*PROCESS_TABLE.0.get() };
+    match table.get(pid) {
+        Some(proc) => proc.pgid as i32,
+        None => -(Errno::ESRCH as i32),
+    }
+}
+
 /// Set the process group ID. Returns 0 on success, or negative errno.
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_setpgid(pid: u32, pgid: u32) -> i32 {

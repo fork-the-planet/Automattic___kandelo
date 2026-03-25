@@ -141,7 +141,7 @@ BASIC_EXPECTED_FAIL=(
     "signal/sigaltstack"
     # -- Timers/signals that block (timeout)
     "aio/aio_error" "aio/aio_fsync" "aio/aio_read"
-    "poll/ppoll"
+    # poll/ppoll now passes
     "pthread/pthread_barrierattr_setpshared" "pthread/pthread_cancel"
     "pthread/pthread_cleanup_pop" "pthread/pthread_cleanup_push"
     "pthread/pthread_condattr_setpshared"
@@ -181,7 +181,7 @@ BASIC_EXPECTED_FAIL=(
     "sys_socket/shutdown" "sys_socket/sockatmark"
     # -- Network interface (not available in Wasm)
     "net_if/if_freenameindex" "net_if/if_indextoname" "net_if/if_nameindex" "net_if/if_nametoindex"
-    "netdb/freeaddrinfo" "netdb/getaddrinfo"
+    # netdb tests now pass with localhost resolution fix
     "arpa_inet/inet_ntop"
     # -- Filesystem-dependent tests (test opens files, needs real FS paths)
     "fcntl/open" "fcntl/openat" "fcntl/posix_fallocate"
