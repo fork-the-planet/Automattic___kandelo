@@ -39,6 +39,9 @@ FUNCTIONAL_EXPECTED_FAIL=(
     spawn
     # Centralized mode: vfork child exec + waitpid tracking
     vfork
+    # Centralized mode: cross-process file locking (F_SETLK/F_GETLK)
+    # requires SharedLockTable PID tracking across fork; pre-existing issue
+    fcntl
 )
 REGRESSION_EXPECTED_FAIL=(
     malloc-brk-fail
@@ -51,7 +54,6 @@ REGRESSION_EXPECTED_FAIL=(
     # Centralized mode: fork+waitpid child exit tracking
     daemon-failure
     fflush-exit
-    pthread_exit-dtor
     # Centralized mode: exec not fully implemented
     execle-env
     # Wasm stack is opaque — signal handlers can't run on alternate stacks

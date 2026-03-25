@@ -44,6 +44,9 @@ const SYS_PPOLL = 251;
 const SYS_PSELECT6 = 252;
 const SYS_RT_SIGTIMEDWAIT = 207;
 
+/** Syscall numbers for signals */
+const SYS_KILL = 35;
+
 /** Syscall numbers for fork/exec/clone */
 const SYS_EXECVE = 211;
 const SYS_FORK = 212;
@@ -1848,13 +1851,17 @@ export class CentralizedKernelWorker {
     }
 
     // Main thread exit or exit_group: record exit status for waitpid,
-    // then notify the host callback.
+    // queue SIGCHLD to parent, then notify the host callback.
     const exitingPid = channel.pid;
     const parentPid = this.childToParent.get(exitingPid);
     if (parentPid !== undefined) {
       // Encode wait status: exitStatus << 8 (matches WIFEXITED/WEXITSTATUS macros)
       const waitStatus = (exitStatus & 0xff) << 8;
       this.exitedChildren.set(exitingPid, waitStatus);
+
+      // Queue SIGCHLD on parent process in the kernel.
+      // kernel_kill handles cross-process signal delivery in centralized mode.
+      this.sendSignalToProcess(parentPid, SIGCHLD);
 
       // Wake any parent blocked in waitpid
       this.wakeWaitingParent(parentPid, exitingPid, waitStatus);
@@ -1874,6 +1881,7 @@ export class CentralizedKernelWorker {
     const parentPid = this.childToParent.get(exitingPid);
     if (parentPid !== undefined) {
       this.exitedChildren.set(exitingPid, waitStatus);
+      this.sendSignalToProcess(parentPid, SIGCHLD);
       this.wakeWaitingParent(parentPid, exitingPid, waitStatus);
     }
 
@@ -1938,22 +1946,42 @@ export class CentralizedKernelWorker {
     });
   }
 
+  /** Get the pgid of a process from the kernel's ProcessTable. */
+  private getProcessPgid(pid: number): number {
+    const fn_ = this.kernelInstance?.exports.kernel_getpgid_direct as
+      ((pid: number) => number) | undefined;
+    if (!fn_) return pid; // fallback: pgid = pid
+    const result = fn_(pid);
+    return result >= 0 ? result : pid;
+  }
+
+  /** Check if a child matches the waitpid pid argument. */
+  private childMatchesWaitTarget(childPid: number, targetPid: number, parentPid: number): boolean {
+    if (targetPid > 0) {
+      return childPid === targetPid;
+    }
+    if (targetPid === -1) {
+      return true; // any child
+    }
+    if (targetPid === 0) {
+      // Same process group as caller
+      const parentPgid = this.getProcessPgid(parentPid);
+      const childPgid = this.getProcessPgid(childPid);
+      return childPgid === parentPgid;
+    }
+    // targetPid < -1: process group |targetPid|
+    const targetPgid = -targetPid;
+    const childPgid = this.getProcessPgid(childPid);
+    return childPgid === targetPgid;
+  }
+
   /** Find an exited child matching the waitpid pid argument. */
   private findExitedChild(parentPid: number, targetPid: number): number | undefined {
     const children = this.parentToChildren.get(parentPid);
     if (!children) return undefined;
 
-    if (targetPid > 0) {
-      // Wait for specific child
-      if (children.has(targetPid) && this.exitedChildren.has(targetPid)) {
-        return targetPid;
-      }
-      return undefined;
-    }
-
-    // targetPid == -1 or 0: wait for any child
     for (const childPid of children) {
-      if (this.exitedChildren.has(childPid)) {
+      if (this.exitedChildren.has(childPid) && this.childMatchesWaitTarget(childPid, targetPid, parentPid)) {
         return childPid;
       }
     }
@@ -1965,13 +1993,10 @@ export class CentralizedKernelWorker {
     const children = this.parentToChildren.get(parentPid);
     if (!children) return false;
 
-    if (targetPid > 0) {
-      return children.has(targetPid) && !this.exitedChildren.has(targetPid);
-    }
-
-    // targetPid == -1 or 0: any living child
     for (const childPid of children) {
-      if (!this.exitedChildren.has(childPid)) return true;
+      if (!this.exitedChildren.has(childPid) && this.childMatchesWaitTarget(childPid, targetPid, parentPid)) {
+        return true;
+      }
     }
     return false;
   }
@@ -2007,7 +2032,7 @@ export class CentralizedKernelWorker {
   /** Wake a parent blocked in waitpid/waitid when a child exits. */
   private wakeWaitingParent(parentPid: number, childPid: number, waitStatus: number): void {
     const idx = this.waitingForChild.findIndex((w) =>
-      w.parentPid === parentPid && (w.pid <= 0 || w.pid === childPid),
+      w.parentPid === parentPid && this.childMatchesWaitTarget(childPid, w.pid, parentPid),
     );
     if (idx === -1) return;
 
@@ -2310,6 +2335,37 @@ export class CentralizedKernelWorker {
       ((pid: number, tid: number) => number) | undefined;
     if (threadExit) {
       threadExit(pid, tid);
+    }
+  }
+
+  /**
+   * Queue a signal on a target process in the kernel by invoking SYS_KILL
+   * through kernel_handle_channel. The signal is queued in the kernel's
+   * ProcessTable and will be delivered via dequeueSignalForDelivery on the
+   * target process's next syscall completion.
+   */
+  private sendSignalToProcess(targetPid: number, signum: number): void {
+    if (!this.kernelInstance || !this.kernelMemory) return;
+
+    // Verify the target process exists in the kernel
+    if (!this.processes.has(targetPid)) return;
+
+    const kernelView = new DataView(this.kernelMemory.buffer, this.scratchOffset);
+    // Write SYS_KILL into scratch: kill(targetPid, signum)
+    kernelView.setUint32(CH_SYSCALL, SYS_KILL, true);
+    kernelView.setInt32(CH_ARGS, targetPid, true);       // arg0 = pid
+    kernelView.setInt32(CH_ARGS + 4, signum, true);      // arg1 = sig
+    for (let i = 2; i < CH_ARGS_COUNT; i++) {
+      kernelView.setInt32(CH_ARGS + i * 4, 0, true);
+    }
+
+    const handleChannel = this.kernelInstance.exports.kernel_handle_channel as
+      (offset: number, pid: number) => number;
+    try {
+      handleChannel(this.scratchOffset, targetPid);
+    } catch (err) {
+      // Non-fatal — signal delivery is best-effort from the host side
+      console.error(`[sendSignalToProcess] kernel threw for pid=${targetPid} sig=${signum}: ${err}`);
     }
   }
 
