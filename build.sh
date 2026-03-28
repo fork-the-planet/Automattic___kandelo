@@ -18,6 +18,7 @@ fi
 
 echo "Building TypeScript host..."
 cd host
+npm install --prefer-offline
 npm run build
 cd ..
 
