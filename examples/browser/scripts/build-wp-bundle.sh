@@ -26,7 +26,7 @@ echo "==> Building WordPress bundle..."
 
 # Use Node.js to create the bundle (base64 encode files, skip unnecessary ones)
 node --experimental-strip-types - "$WP_DIR" "$SQLITE_DIR" "$BUNDLE_FILE" << 'BUNDLER'
-import { readFileSync, readdirSync, statSync, writeFileSync } from "fs";
+import { readFileSync, readdirSync, statSync, lstatSync, writeFileSync } from "fs";
 import { join, relative } from "path";
 
 const wpDir = process.argv[2];
@@ -76,10 +76,12 @@ function collectFiles(rootDir: string, mountPrefix: string): BundleEntry[] {
       const mountPath = mountPrefix + "/" + rel;
 
       try {
-        const stat = statSync(full);
-        if (stat.isDirectory()) {
+        const lstat = lstatSync(full);
+        // Skip symlinks to avoid infinite recursion and double-counting
+        if (lstat.isSymbolicLink()) continue;
+        if (lstat.isDirectory()) {
           walk(full);
-        } else if (stat.isFile()) {
+        } else if (lstat.isFile()) {
           if (shouldExclude(rel)) continue;
           const data = readFileSync(full);
           entries.push({
@@ -106,11 +108,30 @@ files.push(
   ...collectFiles(sqliteDir, "/var/www/html/wp-content/plugins/sqlite-database-integration")
 );
 
-const bundle = { files };
-const json = JSON.stringify(bundle);
-writeFileSync(outFile, json);
+// Stream JSON to file to avoid exceeding Node.js max string size
+import { createWriteStream } from "fs";
+const stream = createWriteStream(outFile);
+let totalBytes = 0;
 
-const sizeMB = (Buffer.byteLength(json) / (1024 * 1024)).toFixed(1);
+function write(s: string) {
+  stream.write(s);
+  totalBytes += Buffer.byteLength(s);
+}
+
+write('{"files":[');
+for (let i = 0; i < files.length; i++) {
+  if (i > 0) write(",");
+  write(JSON.stringify(files[i]));
+}
+write("]}");
+stream.end();
+
+await new Promise<void>((resolve, reject) => {
+  stream.on("finish", resolve);
+  stream.on("error", reject);
+});
+
+const sizeMB = (totalBytes / (1024 * 1024)).toFixed(1);
 console.log(`Bundle: ${files.length} files, ${sizeMB} MB`);
 BUNDLER
 
