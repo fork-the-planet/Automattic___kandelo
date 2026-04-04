@@ -328,9 +328,19 @@ build_target() {
         wordpress)  build_wordpress ;;
         wp-bundle)  build_wp_bundle ;;
         dlopen)     build_dlopen ;;
+        browser)    build_browser ;;
         all)        build_all ;;
         *)          err "Unknown build target: $target"; cmd_list; exit 1 ;;
     esac
+}
+
+# All targets needed for browser demos
+BROWSER_DEPS=(kernel sysroot programs dash coreutils grep sed nginx php php-fpm mariadb redis cpython python-bundle wordpress wp-bundle)
+
+build_browser() {
+    for t in "${BROWSER_DEPS[@]}"; do
+        build_target "$t"
+    done
 }
 
 build_all() {
@@ -440,6 +450,10 @@ clean_target() {
             rm -f "$REPO_ROOT/examples/dlopen/hello-lib.so" \
                   "$REPO_ROOT/examples/dlopen/main.wasm"
             warn "Cleaned dlopen" ;;
+        browser)
+            for t in "${BROWSER_DEPS[@]}"; do
+                clean_target "$t"
+            done ;;
         all)
             for t in kernel sysroot host programs dash coreutils grep sed nginx php php-fpm mariadb redis cpython python-bundle wordpress wp-bundle dlopen; do
                 clean_target "$t"
@@ -566,31 +580,7 @@ cmd_run() {
 cmd_browser() {
     local BROWSER_DIR="$REPO_ROOT/examples/browser"
 
-    # Build all wasm artifacts needed by browser demos:
-    #   simple: kernel + programs
-    #   shell:  kernel + dash + coreutils + grep + sed
-    #   php:    kernel + php
-    #   nginx:  kernel + nginx
-    #   nginx-php: kernel + nginx + php-fpm
-    #   mariadb: kernel + mariadb
-    #   python: kernel + cpython + python-bundle
-    #   wordpress: kernel + nginx + php-fpm + wp-bundle
-    #   redis: kernel + redis
-    #   lamp: kernel + nginx + php-fpm + mariadb + wp-bundle
-    build_kernel
-    build_sysroot
-    build_programs
-    build_dash
-    build_coreutils
-    build_grep
-    build_sed
-    build_nginx
-    build_php
-    build_php_fpm
-    build_mariadb
-    build_redis
-    build_python_bundle
-    build_wp_bundle
+    build_browser
 
     # Install browser deps if needed
     if [ ! -d "$BROWSER_DIR/node_modules" ]; then
@@ -702,8 +692,8 @@ cmd_list() {
     echo "  wordpress   WordPress + SQLite plugin             $(has_wordpress && echo "${GREEN}✓${RESET}" || echo "${YELLOW}○${RESET}")"
     echo "  wp-bundle   WordPress browser bundle              $(has_wp_bundle && echo "${GREEN}✓${RESET}" || echo "${YELLOW}○${RESET}")"
     echo "  dlopen      dlopen shared library example          $(has_dlopen && echo "${GREEN}✓${RESET}" || echo "${YELLOW}○${RESET}")"
+    echo "  browser     All browser demo dependencies"
     echo "  all         Build everything"
-    echo ""
     echo ""
     echo "${BOLD}Clean/rebuild:${RESET}"
     echo "  ./run.sh clean <target...>           Remove build artifacts"
