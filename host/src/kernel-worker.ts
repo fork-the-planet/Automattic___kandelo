@@ -22,9 +22,8 @@
  */
 
 import { WasmPosixKernel } from "./kernel";
-import { SharedIpcTable, type MsgQueueInfo, type SemSetInfo, type ShmSegInfo } from "./shared-ipc-table";
 import { SharedLockTable } from "./shared-lock-table";
-import { PosixMqueueTable, type MqNotification } from "./posix-mqueue";
+
 import type { KernelConfig, PlatformIO } from "./types";
 
 /** Channel status values */
@@ -107,26 +106,16 @@ const SYS_PWRITEV = 296;
 /** fcntl commands that take a struct flock pointer */
 const SYS_FCNTL = 10;
 
-/** SysV IPC syscall numbers */
-const SYS_MSGGET = 337;
+/** SysV IPC syscall numbers (only those still intercepted on host) */
 const SYS_MSGRCV = 338;
 const SYS_MSGSND = 339;
-const SYS_MSGCTL = 340;
-const SYS_SEMGET = 341;
 const SYS_SEMOP = 342;
 const SYS_SEMCTL = 343;
-const SYS_SHMGET = 344;
 const SYS_SHMAT = 345;
 const SYS_SHMDT = 346;
-const SYS_SHMCTL = 347;
 
 /** POSIX message queue syscall numbers */
-const SYS_MQ_OPEN = 331;
-const SYS_MQ_UNLINK = 332;
 const SYS_MQ_TIMEDSEND = 333;
-const SYS_MQ_TIMEDRECEIVE = 334;
-const SYS_MQ_NOTIFY = 335;
-const SYS_MQ_GETSETATTR = 336;
 
 const SYS_CLOSE = 2;
 
@@ -153,25 +142,6 @@ const PROFILING = typeof process !== 'undefined' && !!process.env?.WASM_POSIX_PR
 const READ_LIKE_SYSCALLS = new Set([3, 56, 63, 64, 82, 138]); // READ, RECV, RECVFROM, PREAD, READV, RECVMSG
 /** Write-like syscalls that may produce pipe/socket data */
 const WRITE_LIKE_SYSCALLS = new Set([4, 55, 62, 65, 81, 137]); // WRITE, SEND, SENDTO, PWRITE, WRITEV, SENDMSG
-/**
- * Syscalls that can change poll/select state for other processes.
- * Only these trigger wakeAllBlockedRetries — metadata syscalls like
- * stat, mmap, clock_gettime etc. cannot affect other processes' polls.
- */
-const POLL_AFFECTING_SYSCALLS = new Set([
-  3, 4, 56, 55, 63, 62, 64, 65, 81, 82, 137, 138, // read/write family
-  53, 384,                                           // accept, accept4
-  54,                                                // connect
-  6,                                                 // close (POLLHUP)
-  20,                                                // dup
-  21,                                                // dup2
-  23,                                                // dup3
-  36,                                                // shutdown
-  37,                                                // socketpair
-  212, 213, 201,                                     // fork, vfork, clone
-  34,                                                // exit/exit_group
-]);
-
 /** Channel layout offsets */
 const CH_STATUS = 0;
 const CH_SYSCALL = 4;
@@ -503,6 +473,36 @@ const SYSCALL_ARGS: Record<number, ArgDesc[]> = {
   // faccessat2/fchmodat2
   382: [{ argIndex: 1, direction: "in", size: { type: "cstring" } }],          // FACCESSAT2: path
   383: [{ argIndex: 1, direction: "in", size: { type: "cstring" } }],          // FCHMODAT2: path
+
+  // POSIX message queues
+  331: [                                                                        // MQ_OPEN: (name, flags, mode, attr)
+    { argIndex: 0, direction: "in", size: { type: "cstring" } },               //   name
+    { argIndex: 3, direction: "in", size: { type: "fixed", size: 32 } },        //   mq_attr (if O_CREAT && non-null)
+  ],
+  332: [{ argIndex: 0, direction: "in", size: { type: "cstring" } }],          // MQ_UNLINK: name
+  333: [                                                                        // MQ_TIMEDSEND: (mqd, msg_ptr, msg_len, priority, timeout)
+    { argIndex: 1, direction: "in", size: { type: "arg", argIndex: 2 } },      //   message data
+    { argIndex: 4, direction: "in", size: { type: "fixed", size: 16 } },        //   timespec (optional)
+  ],
+  334: [                                                                        // MQ_TIMEDRECEIVE: (mqd, msg_ptr, msg_len, prio_ptr, timeout)
+    { argIndex: 1, direction: "out", size: { type: "arg", argIndex: 2 } },     //   message buffer (out)
+    { argIndex: 3, direction: "out", size: { type: "fixed", size: 4 } },        //   priority (out)
+    { argIndex: 4, direction: "in", size: { type: "fixed", size: 16 } },        //   timespec (optional)
+  ],
+  335: [                                                                        // MQ_NOTIFY: (mqd, sigevent)
+    { argIndex: 1, direction: "in", size: { type: "fixed", size: 16 } },        //   sigevent (optional)
+  ],
+  336: [                                                                        // MQ_GETSETATTR: (mqd, new_attr, old_attr)
+    { argIndex: 1, direction: "in", size: { type: "fixed", size: 32 } },        //   new mq_attr (optional)
+    { argIndex: 2, direction: "out", size: { type: "fixed", size: 32 } },       //   old mq_attr (out)
+  ],
+
+  // SysV IPC
+  338: [{ argIndex: 1, direction: "out", size: { type: "arg", argIndex: 2 } }],  // MSGRCV: msgp ({mtype, mtext})
+  339: [{ argIndex: 1, direction: "in", size: { type: "arg", argIndex: 2 } }],   // MSGSND: msgp ({mtype, mtext})
+  340: [{ argIndex: 2, direction: "inout", size: { type: "fixed", size: 96 } }], // MSGCTL: msqid_ds buf
+  342: [{ argIndex: 1, direction: "in", size: { type: "arg", argIndex: 2 } }],   // SEMOP: sembuf[] (nsops * 6)
+  347: [{ argIndex: 2, direction: "inout", size: { type: "fixed", size: 88 } }], // SHMCTL: shmid_ds buf
 };
 
 // Also need a way to compute poll size: nfds * sizeof(struct pollfd) = nfds * 8
@@ -677,13 +677,10 @@ export class CentralizedKernelWorker {
    *  to convert epoll_pwait to poll without calling kernel_handle_channel
    *  (which crashes in Chrome for epoll_pwait due to a suspected V8 bug). */
   private epollInterests = new Map<string, Array<{ fd: number; events: number; data: bigint }>>();
-  /** SharedIpcTable for SysV IPC (message queues, semaphores, shared memory) */
-  private ipcTable: SharedIpcTable | null = null;
   private lockTable: SharedLockTable | null = null;
   /** Per-process shared memory mappings: pid → Map<addr, {segId, size}> */
   private shmMappings = new Map<number, Map<number, { segId: number; size: number }>>();
-  /** POSIX message queue table */
-  private mqueueTable = new PosixMqueueTable();
+
   /** PTY index → pid mapping (for draining output after syscalls) */
   private ptyIndexByPid = new Map<number, number>();
   /** Set of active PTY indices to drain after each syscall */
@@ -846,11 +843,6 @@ export class CentralizedKernelWorker {
     // (including OFD locks) within the centralized kernel.
     this.lockTable = SharedLockTable.create();
     this.kernel.registerSharedLockTable(this.lockTable.getBuffer());
-
-    // Register a SharedIpcTable so SysV IPC (msgget/msgsnd/msgrcv, semget/semop,
-    // shmget/shmat/shmdt) works across processes.
-    this.ipcTable = SharedIpcTable.create();
-    this.kernel.registerSharedIpcTable(this.ipcTable.getBuffer());
 
     this.initialized = true;
   }
@@ -1483,28 +1475,22 @@ export class CentralizedKernelWorker {
       return;
     }
 
-    // --- SysV IPC: intercept on host side ---
-    // In centralized mode, IPC syscalls pass user-space pointers that the
-    // kernel can't dereference (kernel has separate memory). Handle entirely
-    // on the host side via SharedIpcTable, reading/writing process memory.
-    if (syscallNr >= SYS_MSGGET && syscallNr <= SYS_SHMCTL) {
-      this.handleIpc(channel, syscallNr, origArgs);
+    // --- SysV IPC: shmat/shmdt need host-side process memory management ---
+    if (syscallNr === SYS_SHMAT) {
+      this.handleIpcShmat(channel, origArgs);
+      return;
+    }
+    if (syscallNr === SYS_SHMDT) {
+      this.handleIpcShmdt(channel, origArgs);
+      return;
+    }
+    // --- SysV IPC: semctl has cmd-dependent arg types (scalar vs pointer) ---
+    if (syscallNr === SYS_SEMCTL) {
+      this.handleSemctl(channel, origArgs);
       return;
     }
 
-    // --- POSIX message queues: intercept on host side ---
-    if (syscallNr >= SYS_MQ_OPEN && syscallNr <= SYS_MQ_GETSETATTR) {
-      this.handleMqueue(channel, syscallNr, origArgs);
-      return;
-    }
-
-    // --- close: intercept for mqueue descriptors ---
-    if (syscallNr === SYS_CLOSE && this.mqueueTable.isMqd(origArgs[0])) {
-      const result = this.mqueueTable.mqClose(origArgs[0]);
-      this.completeChannelRaw(channel, result, result < 0 ? -result : 0);
-      this.relistenChannel(channel);
-      return;
-    }
+    // (POSIX mqueue syscalls 331-336 now go through the normal kernel path)
 
     // --- pselect6: fd_sets (inout) + timeout/sigmask decoding ---
     if (syscallNr === SYS_PSELECT6) {
@@ -1543,8 +1529,10 @@ export class CentralizedKernelWorker {
           size = len + 1; // include null terminator
         } else if (desc.size.type === "arg") {
           size = origArgs[desc.size.argIndex];
-          // Special case: multiply by struct size
+          // Special cases: struct size multipliers and prefixes
           if (syscallNr === SYS_POLL || syscallNr === SYS_PPOLL) size *= 8;   // pollfd = 8 bytes
+          if (syscallNr === SYS_MSGSND || syscallNr === SYS_MSGRCV) size += 4; // mtype (long) prefix
+          if (syscallNr === SYS_SEMOP) size *= 6;   // struct sembuf = 6 bytes
         } else if (desc.size.type === "deref") {
           // Dereference: arg is a pointer to a u32 value (e.g. socklen_t*)
           const derefPtr = origArgs[desc.size.argIndex];
@@ -1698,6 +1686,13 @@ export class CentralizedKernelWorker {
       }
     }
 
+    // --- POSIX mqueue notification (centralized mode) ---
+    // After mq_timedsend, the kernel may have a pending notification (signal
+    // to deliver when a message arrives on a previously empty queue).
+    if (syscallNr === SYS_MQ_TIMEDSEND && retVal === 0) {
+      this.drainMqueueNotification();
+    }
+
     // --- Signal delivery (centralized mode) ---
     // After each syscall, check if the kernel has a pending Handler signal.
     // If so, dequeue it and write delivery info to the process channel.
@@ -1797,6 +1792,8 @@ export class CentralizedKernelWorker {
           size = origArgs[desc.size.argIndex];
           if (syscallNr === SYS_POLL || syscallNr === SYS_PPOLL) size *= 8;
           if (syscallNr === SYS_EPOLL_PWAIT) size *= 12;
+          if (syscallNr === SYS_MSGSND || syscallNr === SYS_MSGRCV) size += 4; // mtype prefix
+          if (syscallNr === SYS_SEMOP) size *= 6;  // struct sembuf = 6 bytes
         } else if (desc.size.type === "deref") {
           const derefPtr = origArgs[desc.size.argIndex];
           if (derefPtr === 0) continue;
@@ -1833,6 +1830,8 @@ export class CentralizedKernelWorker {
             // For read/recv-like syscalls, retVal is bytes read — limit copy to actual data
             if (retVal > 0 && retVal < size) {
               copySize = retVal;
+              // msgrcv retVal is mtext length, but scratch also has mtype (4B) prefix
+              if (syscallNr === SYS_MSGRCV) copySize += 4;
             }
           }
           processMem.set(
@@ -1870,24 +1869,8 @@ export class CentralizedKernelWorker {
     Atomics.notify(i32View, CH_STATUS / 4, 1);
 
 
-    // Event-driven pipe wakeup: if a write-like syscall succeeded, wake
-    // any readers blocked on the same pipe/socket.
-    if (retVal > 0 && WRITE_LIKE_SYSCALLS.has(syscallNr)) {
-      this.wakePendingPipeReaders(channel.pid, origArgs[0]);
-    }
-
-    // Event-driven pipe wakeup for writers: if a read-like syscall succeeded
-    // (drained data from a pipe), wake any writers blocked on the same pipe.
-    if (retVal > 0 && READ_LIKE_SYSCALLS.has(syscallNr)) {
-      this.wakePendingPipeWriters(channel.pid, origArgs[0]);
-    }
-
-    // Wake other processes' blocked poll/select retries — but only after
-    // syscalls that can actually change poll/select state (IO, close, fork).
-    // Metadata syscalls (stat, mmap, clock_gettime) cannot affect others.
-    if (POLL_AFFECTING_SYSCALLS.has(syscallNr)) {
-      this.scheduleWakeBlockedRetries();
-    }
+    // Drain kernel wakeup events and process targeted wakeups.
+    this.drainAndProcessWakeupEvents();
 
     // Re-listen for next syscall
     this.relistenChannel(channel);
@@ -2091,6 +2074,70 @@ export class CentralizedKernelWorker {
   }
 
   /**
+   * Drain kernel wakeup events and process targeted pipe wakeups.
+   * Called after each syscall completion. The kernel pushes events from
+   * PipeBuffer operations (read/write/close). Each event identifies a pipe
+   * and whether it became readable or writable.
+   */
+  private drainAndProcessWakeupEvents(): void {
+    const drainFn = this.kernelInstance!.exports.kernel_drain_wakeup_events as
+      ((outPtr: number, outLen: number, maxEvents: number) => number) | undefined;
+    if (!drainFn) return;
+
+    const MAX_EVENTS = 256;
+    const BYTES_PER_EVENT = 5;
+    const bufSize = MAX_EVENTS * BYTES_PER_EVENT;
+
+    const count = drainFn(this.scratchOffset, bufSize, MAX_EVENTS);
+    if (count === 0) return;
+
+    const kernelMem = new Uint8Array(this.kernelMemory!.buffer);
+    const WAKE_READABLE = 1;
+    const WAKE_WRITABLE = 2;
+    let needBroadWake = false;
+
+    for (let i = 0; i < count; i++) {
+      const off = this.scratchOffset + i * BYTES_PER_EVENT;
+      const pipeIdx = kernelMem[off] | (kernelMem[off + 1] << 8) |
+                      (kernelMem[off + 2] << 16) | (kernelMem[off + 3] << 24);
+      const wakeType = kernelMem[off + 4];
+
+      if (wakeType & WAKE_READABLE) {
+        // Pipe became readable — wake pending readers on this pipe
+        const readers = this.pendingPipeReaders.get(pipeIdx);
+        if (readers && readers.length > 0) {
+          this.pendingPipeReaders.delete(pipeIdx);
+          for (const reader of readers) {
+            if (this.processes.has(reader.pid)) {
+              this.retrySyscall(reader.channel);
+            }
+          }
+        }
+      }
+
+      if (wakeType & WAKE_WRITABLE) {
+        // Pipe became writable — wake pending writers on this pipe
+        const writers = this.pendingPipeWriters.get(pipeIdx);
+        if (writers && writers.length > 0) {
+          this.pendingPipeWriters.delete(pipeIdx);
+          for (const writer of writers) {
+            if (this.processes.has(writer.pid)) {
+              this.retrySyscall(writer.channel);
+            }
+          }
+        }
+      }
+
+      needBroadWake = true;
+    }
+
+    // If any pipe state changed, also wake poll/select retries
+    if (needBroadWake) {
+      this.scheduleWakeBlockedRetries();
+    }
+  }
+
+  /**
    * Schedule a microtask to wake all blocked poll/pselect6 retries.
    * Coalesced via wakeScheduled flag — multiple calls within the same
    * microtask batch result in only one wake cycle. This catches cross-process
@@ -2164,59 +2211,6 @@ export class CentralizedKernelWorker {
             this.retrySyscall(writer.channel);
           }
         }
-      }
-    }
-  }
-
-  /**
-   * Wake pending pipe readers for a pipe that was just written to.
-   * Looks up the write fd's send pipe index and wakes all readers
-   * registered on that pipe.
-   */
-  private wakePendingPipeReaders(pid: number, fd: number): void {
-    if (this.pendingPipeReaders.size === 0) return;
-
-    const getSendPipeIdx = this.kernelInstance!.exports.kernel_get_fd_send_pipe_idx as
-      ((pid: number, fd: number) => number) | undefined;
-    if (!getSendPipeIdx) return;
-
-    const pipeIdx = getSendPipeIdx(pid, fd);
-    if (pipeIdx < 0) return;
-
-    const readers = this.pendingPipeReaders.get(pipeIdx);
-    if (!readers || readers.length === 0) return;
-
-    // Remove all readers for this pipe and wake them
-    this.pendingPipeReaders.delete(pipeIdx);
-    for (const reader of readers) {
-      if (this.processes.has(reader.pid)) {
-        this.retrySyscall(reader.channel);
-      }
-    }
-  }
-
-  /**
-   * Wake pending pipe writers for a pipe that was just read from.
-   * Looks up the read fd's recv pipe index and wakes all writers
-   * registered on that pipe (they were blocked because the buffer was full).
-   */
-  private wakePendingPipeWriters(pid: number, fd: number): void {
-    if (this.pendingPipeWriters.size === 0) return;
-
-    const getFdPipeIdx = this.kernelInstance!.exports.kernel_get_fd_pipe_idx as
-      ((pid: number, fd: number) => number) | undefined;
-    if (!getFdPipeIdx) return;
-
-    const pipeIdx = getFdPipeIdx(pid, fd);
-    if (pipeIdx < 0) return;
-
-    const writers = this.pendingPipeWriters.get(pipeIdx);
-    if (!writers || writers.length === 0) return;
-
-    this.pendingPipeWriters.delete(pipeIdx);
-    for (const writer of writers) {
-      if (this.processes.has(writer.pid)) {
-        this.retrySyscall(writer.channel);
       }
     }
   }
@@ -5249,213 +5243,141 @@ export class CentralizedKernelWorker {
     }
     this.tcpConnections.delete(pid);
     this.shmMappings.delete(pid);
-    this.mqueueTable.cleanupProcess(pid);
   }
 
   // =========================================================================
-  // SysV IPC handlers — intercept in centralized mode
+  // SysV IPC handlers — shmat/shmdt/semctl need host-side interception
   //
-  // In centralized mode, IPC syscalls pass user-space pointers that reference
-  // the process's WebAssembly.Memory, not the kernel's. We handle all IPC
-  // syscalls entirely on the host side via SharedIpcTable, reading/writing
-  // process memory directly.
+  // Most IPC syscalls now go through the kernel via SYSCALL_ARGS marshalling.
+  // shmat/shmdt are intercepted because they require process memory management
+  // (mmap address allocation, data transfer between kernel and process memory).
+  // semctl is intercepted because arg[3] is cmd-dependent (scalar vs pointer).
   // =========================================================================
 
-  /** Query the kernel for a process's effective uid/gid via synthesized syscall */
-  private getProcessCredentials(pid: number): { uid: number; gid: number } {
-    const kernelView = new DataView(this.kernelMemory!.buffer, this.scratchOffset);
-    const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as (offset: number, pid: number) => number;
-
-    // Get euid (syscall 31)
-    kernelView.setUint32(CH_SYSCALL, 31, true); // SYS_GETEUID
-    for (let i = 0; i < CH_ARGS_COUNT; i++) kernelView.setInt32(CH_ARGS + i * 4, 0, true);
-    this.currentHandlePid = pid;
-    try { handleChannel(this.scratchOffset, pid); } finally { this.currentHandlePid = 0; }
-    const uid = kernelView.getInt32(CH_RETURN, true);
-
-    // Get egid (syscall 33)
-    kernelView.setUint32(CH_SYSCALL, 33, true); // SYS_GETEGID
-    for (let i = 0; i < CH_ARGS_COUNT; i++) kernelView.setInt32(CH_ARGS + i * 4, 0, true);
-    this.currentHandlePid = pid;
-    try { handleChannel(this.scratchOffset, pid); } finally { this.currentHandlePid = 0; }
-    const gid = kernelView.getInt32(CH_RETURN, true);
-
-    return { uid, gid };
-  }
-
-  private handleIpc(channel: ChannelInfo, syscallNr: number, args: number[]): void {
-    if (!this.ipcTable) {
-      this.completeChannelRaw(channel, -38, 38); // ENOSYS
-      this.relistenChannel(channel);
-      return;
-    }
-
-    let result: number;
-    // For *get operations that create IPC objects, fetch process credentials
-    let creds: { uid: number; gid: number } | null = null;
-    if (syscallNr === SYS_MSGGET || syscallNr === SYS_SEMGET || syscallNr === SYS_SHMGET) {
-      creds = this.getProcessCredentials(channel.pid);
-    }
-
-    switch (syscallNr) {
-      case SYS_MSGGET:
-        result = this.ipcTable.msgget(args[0], args[1], channel.pid, creds!.uid, creds!.gid);
-        break;
-      case SYS_MSGSND:
-        result = this.handleIpcMsgsnd(channel, args);
-        break;
-      case SYS_MSGRCV:
-        result = this.handleIpcMsgrcv(channel, args);
-        break;
-      case SYS_MSGCTL:
-        result = this.handleIpcMsgctl(channel, args);
-        break;
-      case SYS_SEMGET:
-        result = this.ipcTable.semget(args[0], args[1], args[2], channel.pid, creds!.uid, creds!.gid);
-        break;
-      case SYS_SEMOP:
-        result = this.handleIpcSemop(channel, args);
-        break;
-      case SYS_SEMCTL:
-        result = this.handleIpcSemctl(channel, args);
-        break;
-      case SYS_SHMGET:
-        result = this.ipcTable.shmget(args[0], args[1], args[2], channel.pid, creds!.uid, creds!.gid);
-        break;
-      case SYS_SHMAT:
-        result = this.handleIpcShmat(channel, args);
-        break;
-      case SYS_SHMDT:
-        result = this.handleIpcShmdt(channel, args);
-        break;
-      case SYS_SHMCTL:
-        result = this.handleIpcShmctl(channel, args);
-        break;
-      default:
-        result = -38; // ENOSYS
-    }
-
-    if (result < 0) {
-      this.completeChannelRaw(channel, result, -result);
-    } else {
-      this.completeChannelRaw(channel, result, 0);
-    }
-    this.relistenChannel(channel);
-  }
-
-  /** msgsnd: read {long mtype; char mtext[msgsz]} from process memory */
-  private handleIpcMsgsnd(channel: ChannelInfo, args: number[]): number {
-    const [qid, msgPtr, msgSz, flags] = args;
-    const processMem = new Uint8Array(channel.memory.buffer);
-    const dv = new DataView(channel.memory.buffer);
-    // long is 4 bytes on wasm32
-    const msgType = dv.getInt32(msgPtr, true);
-    const data = processMem.slice(msgPtr + 4, msgPtr + 4 + msgSz);
-    return this.ipcTable!.msgsnd(qid, msgType, data, flags, channel.pid);
-  }
-
-  /** msgrcv: write {long mtype; char mtext[]} to process memory */
-  private handleIpcMsgrcv(channel: ChannelInfo, args: number[]): number {
-    const [qid, msgPtr, msgSz, msgtyp, flags] = args;
-    const result = this.ipcTable!.msgrcv(qid, msgSz, msgtyp, flags, channel.pid);
-    if (typeof result === "number") return result; // error
-    // Write {long type; char data[]} to process memory
-    const dv = new DataView(channel.memory.buffer);
-    dv.setInt32(msgPtr, result.type, true);
-    const processMem = new Uint8Array(channel.memory.buffer);
-    processMem.set(result.data, msgPtr + 4);
-    return result.data.length;
-  }
-
-  /** msgctl: handle IPC_STAT by writing msqid_ds to process memory */
-  private handleIpcMsgctl(channel: ChannelInfo, args: number[]): number {
-    const [qid, rawCmd, bufPtr] = args;
-    const cmd = rawCmd & ~IPC_64; // musl adds IPC_64
-    const result = this.ipcTable!.msgctl(qid, cmd, channel.pid);
-    if (typeof result === "number") return result;
-    // IPC_STAT: write msqid_ds struct to process memory
-    if (bufPtr !== 0) {
-      const dv = new DataView(channel.memory.buffer);
-      SharedIpcTable.writeMsqidDs(dv, bufPtr, result as MsgQueueInfo);
-    }
-    return 0;
-  }
-
-  /** semop: read struct sembuf[] from process memory */
-  private handleIpcSemop(channel: ChannelInfo, args: number[]): number {
-    const [semid, sopsPtr, nsops] = args;
-    const dv = new DataView(channel.memory.buffer);
-    // Each sembuf: sem_num(u16) @0, sem_op(i16) @2, sem_flg(i16) @4 = 6 bytes
-    const sops: { num: number; op: number; flg: number }[] = [];
-    for (let i = 0; i < nsops; i++) {
-      const base = sopsPtr + i * 6;
-      sops.push({
-        num: dv.getUint16(base, true),
-        op: dv.getInt16(base + 2, true),
-        flg: dv.getInt16(base + 4, true),
-      });
-    }
-    return this.ipcTable!.semop(semid, sops, channel.pid);
-  }
-
-  /** semctl: handle various commands with process memory I/O */
-  private handleIpcSemctl(channel: ChannelInfo, args: number[]): number {
-    const [semid, semnum, rawCmd, arg] = args;
+  /** semctl: cmd-dependent arg handling — can't use SYSCALL_ARGS since arg[3]
+   *  is a scalar for some commands and a pointer for others. */
+  private handleSemctl(channel: ChannelInfo, origArgs: number[]): void {
+    const [semid, semnum, rawCmd, arg] = origArgs;
     const cmd = rawCmd & ~IPC_64;
     const IPC_STAT = 2;
     const GETALL = 13;
     const SETALL = 17;
 
-    if (cmd === IPC_STAT) {
-      const result = this.ipcTable!.semctl(semid, semnum, cmd, channel.pid);
-      if (typeof result === "number") return result;
-      if (arg !== 0) {
-        const dv = new DataView(channel.memory.buffer);
-        SharedIpcTable.writeSemidDs(dv, arg, result as SemSetInfo);
-      }
-      return 0;
-    }
+    const kernelView = new DataView(this.kernelMemory!.buffer, this.scratchOffset);
+    const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as (offset: number, pid: number) => number;
+    const kernelMem = this.getKernelMem();
+    const dataStart = this.scratchOffset + CH_DATA;
 
-    if (cmd === GETALL) {
-      const result = this.ipcTable!.semctl(semid, semnum, cmd, channel.pid);
-      if (typeof result === "number") return result;
-      // result is Uint8Array of u16 values; write to arg pointer
-      if (arg !== 0) {
+    if (cmd === IPC_STAT && arg !== 0) {
+      // arg is an output pointer to semid_ds (72 bytes)
+      kernelView.setUint32(CH_SYSCALL, SYS_SEMCTL, true);
+      kernelView.setInt32(CH_ARGS + 0, semid, true);
+      kernelView.setInt32(CH_ARGS + 4, semnum, true);
+      kernelView.setInt32(CH_ARGS + 8, rawCmd, true);
+      kernelView.setInt32(CH_ARGS + 12, dataStart, true); // redirect to scratch
+      kernelView.setInt32(CH_ARGS + 16, 0, true);
+      kernelView.setInt32(CH_ARGS + 20, 0, true);
+      kernelMem.fill(0, dataStart, dataStart + 72);
+
+      this.currentHandlePid = channel.pid;
+      try { handleChannel(this.scratchOffset, channel.pid); } finally { this.currentHandlePid = 0; }
+
+      const retVal = kernelView.getInt32(CH_RETURN, true);
+      if (retVal >= 0) {
+        // Copy 72-byte struct back to process memory
         const processMem = new Uint8Array(channel.memory.buffer);
-        processMem.set(result as Uint8Array, arg);
+        processMem.set(kernelMem.subarray(dataStart, dataStart + 72), arg);
       }
-      return 0;
+      this.completeChannelRaw(channel, retVal, retVal < 0 ? -retVal : 0);
+      this.relistenChannel(channel);
+      return;
     }
 
-    if (cmd === SETALL) {
-      // arg points to unsigned short[] array in process memory
-      const info = this.ipcTable!.semctl(semid, 0, IPC_STAT, channel.pid);
-      if (typeof info === "number") return info;
-      const nsems = (info as SemSetInfo).nsems;
-      const dv = new DataView(channel.memory.buffer);
-      const values: number[] = [];
-      for (let i = 0; i < nsems; i++) {
-        values.push(dv.getUint16(arg + i * 2, true));
+    if (cmd === GETALL && arg !== 0) {
+      // arg is an output pointer to u16[nsems] — allocate generous space
+      const maxBytes = 1024; // up to 512 semaphores
+      kernelView.setUint32(CH_SYSCALL, SYS_SEMCTL, true);
+      kernelView.setInt32(CH_ARGS + 0, semid, true);
+      kernelView.setInt32(CH_ARGS + 4, semnum, true);
+      kernelView.setInt32(CH_ARGS + 8, rawCmd, true);
+      kernelView.setInt32(CH_ARGS + 12, dataStart, true);
+      kernelView.setInt32(CH_ARGS + 16, 0, true);
+      kernelView.setInt32(CH_ARGS + 20, 0, true);
+      kernelMem.fill(0, dataStart, dataStart + maxBytes);
+
+      this.currentHandlePid = channel.pid;
+      try { handleChannel(this.scratchOffset, channel.pid); } finally { this.currentHandlePid = 0; }
+
+      const retVal = kernelView.getInt32(CH_RETURN, true);
+      if (retVal >= 0) {
+        // Copy written data back — kernel wrote u16[] to scratch
+        const processMem = new Uint8Array(channel.memory.buffer);
+        processMem.set(kernelMem.subarray(dataStart, dataStart + maxBytes), arg);
       }
-      return this.ipcTable!.semctlSetAll(semid, values);
+      this.completeChannelRaw(channel, retVal, retVal < 0 ? -retVal : 0);
+      this.relistenChannel(channel);
+      return;
     }
 
-    // Simple scalar commands: GETVAL, SETVAL, GETPID, GETNCNT, GETZCNT, IPC_RMID
-    const result = this.ipcTable!.semctl(semid, semnum, cmd, channel.pid, arg);
-    if (typeof result === "number") return result;
-    return 0;
+    if (cmd === SETALL && arg !== 0) {
+      // arg is an input pointer to u16[nsems] — copy generous amount to scratch
+      const maxBytes = 1024;
+      const processMem = new Uint8Array(channel.memory.buffer);
+      kernelMem.set(processMem.subarray(arg, arg + maxBytes), dataStart);
+
+      kernelView.setUint32(CH_SYSCALL, SYS_SEMCTL, true);
+      kernelView.setInt32(CH_ARGS + 0, semid, true);
+      kernelView.setInt32(CH_ARGS + 4, semnum, true);
+      kernelView.setInt32(CH_ARGS + 8, rawCmd, true);
+      kernelView.setInt32(CH_ARGS + 12, dataStart, true);
+      kernelView.setInt32(CH_ARGS + 16, 0, true);
+      kernelView.setInt32(CH_ARGS + 20, 0, true);
+
+      this.currentHandlePid = channel.pid;
+      try { handleChannel(this.scratchOffset, channel.pid); } finally { this.currentHandlePid = 0; }
+
+      const retVal = kernelView.getInt32(CH_RETURN, true);
+      this.completeChannelRaw(channel, retVal, retVal < 0 ? -retVal : 0);
+      this.relistenChannel(channel);
+      return;
+    }
+
+    // Scalar commands (SETVAL, GETVAL, GETPID, GETNCNT, GETZCNT, IPC_RMID):
+    // arg is a scalar value, pass through directly to kernel
+    kernelView.setUint32(CH_SYSCALL, SYS_SEMCTL, true);
+    kernelView.setInt32(CH_ARGS + 0, semid, true);
+    kernelView.setInt32(CH_ARGS + 4, semnum, true);
+    kernelView.setInt32(CH_ARGS + 8, rawCmd, true);
+    kernelView.setInt32(CH_ARGS + 12, arg, true);
+    kernelView.setInt32(CH_ARGS + 16, 0, true);
+    kernelView.setInt32(CH_ARGS + 20, 0, true);
+
+    this.currentHandlePid = channel.pid;
+    try { handleChannel(this.scratchOffset, channel.pid); } finally { this.currentHandlePid = 0; }
+
+    const retVal = kernelView.getInt32(CH_RETURN, true);
+    this.completeChannelRaw(channel, retVal, retVal < 0 ? -retVal : 0);
+    this.relistenChannel(channel);
   }
 
   /** shmat: allocate address via kernel mmap, copy segment data to process memory */
-  private handleIpcShmat(channel: ChannelInfo, args: number[]): number {
+  private handleIpcShmat(channel: ChannelInfo, args: number[]): void {
     const [shmid, _shmaddr, _flags] = args;
-    const result = this.ipcTable!.shmat(shmid, channel.pid);
-    if (typeof result === "number") return result;
 
-    const { data, size } = result;
+    // Set current pid for kernel_ipc_* exports
+    const setCurrentPid = this.kernelInstance!.exports.kernel_set_current_pid as ((pid: number) => void) | undefined;
+    if (setCurrentPid) setCurrentPid(channel.pid);
 
-    // Use the kernel's mmap to allocate virtual address space for this pid.
-    // Synthesize a MAP_ANONYMOUS|MAP_PRIVATE mmap syscall through kernel_handle_channel.
+    const kernelShmat = this.kernelInstance!.exports.kernel_ipc_shmat as (shmid: number, shmaddr: number, flags: number) => number;
+    const sizeOrErr = kernelShmat(shmid, _shmaddr, _flags);
+    if (sizeOrErr < 0) {
+      this.completeChannelRaw(channel, sizeOrErr, -sizeOrErr);
+      this.relistenChannel(channel);
+      return;
+    }
+    const size = sizeOrErr;
+
+    // Synthesize mmap to allocate virtual address space for this pid
     const kernelView = new DataView(this.kernelMemory!.buffer, this.scratchOffset);
     kernelView.setUint32(CH_SYSCALL, SYS_MMAP, true);
     kernelView.setInt32(CH_ARGS + 0, 0, true);          // addr hint = NULL
@@ -5471,21 +5393,38 @@ export class CentralizedKernelWorker {
       handleChannel(this.scratchOffset, channel.pid);
     } catch (err) {
       console.error(`[handleIpcShmat] mmap failed for pid=${channel.pid}:`, err);
-      return -12; // ENOMEM
+      this.completeChannelRaw(channel, -12, 12); // ENOMEM
+      this.relistenChannel(channel);
+      return;
     } finally {
       this.currentHandlePid = 0;
     }
 
     const addr = kernelView.getInt32(CH_RETURN, true);
-    const MAP_FAILED = -1;
-    if (addr === MAP_FAILED || addr < 0) return -12; // ENOMEM
+    if (addr < 0) {
+      this.completeChannelRaw(channel, -12, 12); // ENOMEM
+      this.relistenChannel(channel);
+      return;
+    }
 
     // Grow process memory to cover the allocated address
     this.ensureProcessMemoryCovers(channel.memory, SYS_MMAP, addr, [0, size, 3, 0x22, -1, 0]);
 
-    // Copy segment data into process memory at the allocated address
+    // Transfer segment data from kernel to process memory via read_chunk
+    const readChunk = this.kernelInstance!.exports.kernel_ipc_shm_read_chunk as (shmid: number, offset: number, outPtr: number, maxLen: number) => number;
     const processMem = new Uint8Array(channel.memory.buffer);
-    processMem.set(data.subarray(0, size), addr >>> 0);
+    const kernelMem = this.getKernelMem();
+    const chunkSize = CH_DATA_SIZE;
+    const chunkPtr = this.scratchOffset + CH_DATA;
+    let transferred = 0;
+    while (transferred < size) {
+      const remaining = size - transferred;
+      const toRead = Math.min(remaining, chunkSize);
+      const nRead = readChunk(shmid, transferred, chunkPtr, toRead);
+      if (nRead <= 0) break;
+      processMem.set(kernelMem.subarray(chunkPtr, chunkPtr + nRead), (addr >>> 0) + transferred);
+      transferred += nRead;
+    }
 
     // Track the mapping for shmdt
     let pidMappings = this.shmMappings.get(channel.pid);
@@ -5495,220 +5434,84 @@ export class CentralizedKernelWorker {
     }
     pidMappings.set(addr >>> 0, { segId: shmid, size });
 
-    return addr;
-  }
-
-  /** shmdt: copy process memory back to segment, untrack mapping */
-  private handleIpcShmdt(channel: ChannelInfo, args: number[]): number {
-    const addr = args[0];
-    const pidMappings = this.shmMappings.get(channel.pid);
-    if (!pidMappings) return -22; // EINVAL
-    const mapping = pidMappings.get(addr);
-    if (!mapping) return -22; // EINVAL
-
-    // Copy data back from process memory to segment SAB
-    const processMem = new Uint8Array(channel.memory.buffer);
-    const data = processMem.slice(addr, addr + mapping.size);
-    const result = this.ipcTable!.shmdt(mapping.segId, data, channel.pid);
-
-    pidMappings.delete(addr);
-    return result;
-  }
-
-  /** shmctl: handle IPC_STAT by writing shmid_ds to process memory */
-  private handleIpcShmctl(channel: ChannelInfo, args: number[]): number {
-    const [shmid, rawCmd, bufPtr] = args;
-    const cmd = rawCmd & ~IPC_64;
-    const result = this.ipcTable!.shmctl(shmid, cmd, channel.pid);
-    if (typeof result === "number") return result;
-    // IPC_STAT: write shmid_ds struct to process memory
-    if (bufPtr !== 0) {
-      const dv = new DataView(channel.memory.buffer);
-      SharedIpcTable.writeShmidDs(dv, bufPtr, result as ShmSegInfo);
-    }
-    return 0;
-  }
-
-  // =========================================================================
-  // POSIX message queue handlers — intercept in centralized mode
-  //
-  // Like SysV IPC, mq syscalls pass user-space pointers that reference
-  // the process's WebAssembly.Memory. We handle all mq syscalls on the
-  // host side via PosixMqueueTable.
-  // =========================================================================
-
-  private handleMqueue(channel: ChannelInfo, syscallNr: number, args: number[]): void {
-    let result: number;
-
-    switch (syscallNr) {
-      case SYS_MQ_OPEN:
-        result = this.handleMqOpen(channel, args);
-        break;
-      case SYS_MQ_UNLINK:
-        result = this.handleMqUnlink(channel, args);
-        break;
-      case SYS_MQ_TIMEDSEND:
-        result = this.handleMqTimedSend(channel, args);
-        break;
-      case SYS_MQ_TIMEDRECEIVE:
-        result = this.handleMqTimedReceive(channel, args);
-        break;
-      case SYS_MQ_NOTIFY:
-        result = this.handleMqNotify(channel, args);
-        break;
-      case SYS_MQ_GETSETATTR:
-        result = this.handleMqGetSetAttr(channel, args);
-        break;
-      default:
-        result = -38; // ENOSYS
-    }
-
-    this.completeChannelRaw(channel, result, result < 0 ? -result : 0);
+    this.completeChannelRaw(channel, addr, 0);
     this.relistenChannel(channel);
   }
 
-  /** Read a NUL-terminated string from process memory */
-  private readProcessString(memory: WebAssembly.Memory, ptr: number): string {
-    const mem = new Uint8Array(memory.buffer);
-    let end = ptr;
-    while (end < mem.length && mem[end] !== 0) end++;
-    return new TextDecoder().decode(mem.slice(ptr, end));
-  }
-
-  private handleMqOpen(channel: ChannelInfo, args: number[]): number {
-    const [namePtr, flags, mode, attrPtr] = args;
-    const name = this.readProcessString(channel.memory, namePtr);
-
-    let hasAttr = false;
-    let maxmsg = 0;
-    let msgsize = 0;
-
-    if (attrPtr !== 0 && (flags & 0o100) !== 0) {
-      // O_CREAT set and attr provided — read struct mq_attr from process memory
-      // struct mq_attr on wasm32: { long mq_flags, mq_maxmsg, mq_msgsize, mq_curmsgs, __unused[4] }
-      // long = 4 bytes on wasm32
-      const dv = new DataView(channel.memory.buffer);
-      // mq_flags at offset 0 (ignored by mq_open on Linux)
-      maxmsg = dv.getInt32(attrPtr + 4, true);  // mq_maxmsg
-      msgsize = dv.getInt32(attrPtr + 8, true);  // mq_msgsize
-      hasAttr = true;
+  /** shmdt: copy process memory back to segment, untrack mapping */
+  private handleIpcShmdt(channel: ChannelInfo, args: number[]): void {
+    const addr = args[0];
+    const pidMappings = this.shmMappings.get(channel.pid);
+    if (!pidMappings) {
+      this.completeChannelRaw(channel, -22, 22); // EINVAL
+      this.relistenChannel(channel);
+      return;
+    }
+    const mapping = pidMappings.get(addr);
+    if (!mapping) {
+      this.completeChannelRaw(channel, -22, 22); // EINVAL
+      this.relistenChannel(channel);
+      return;
     }
 
-    return this.mqueueTable.mqOpen(name, flags, mode, maxmsg, msgsize, hasAttr);
-  }
+    // Set current pid for kernel exports
+    const setCurrentPid = this.kernelInstance!.exports.kernel_set_current_pid as ((pid: number) => void) | undefined;
+    if (setCurrentPid) setCurrentPid(channel.pid);
 
-  private handleMqUnlink(channel: ChannelInfo, args: number[]): number {
-    const [namePtr] = args;
-    const name = this.readProcessString(channel.memory, namePtr);
-    return this.mqueueTable.mqUnlink(name);
-  }
-
-  private handleMqTimedSend(channel: ChannelInfo, args: number[]): number {
-    const [mqd, msgPtr, msgLen, priority, timeoutPtr] = args;
-
-    // Read message data from process memory
+    // Sync process memory back to kernel segment via write_chunk
+    const writeChunk = this.kernelInstance!.exports.kernel_ipc_shm_write_chunk as (shmid: number, offset: number, dataPtr: number, dataLen: number) => number;
     const processMem = new Uint8Array(channel.memory.buffer);
-    const data = processMem.slice(msgPtr, msgPtr + msgLen);
-
-    // Read timeout if provided (time64 format: {i32 sec_lo, i32 sec_hi, i32 nsec})
-    let hasTimeout = false;
-    let nsecLo = 0, nsecHi = 0, nsec = 0;
-    if (timeoutPtr !== 0) {
-      const dv = new DataView(channel.memory.buffer);
-      nsecLo = dv.getInt32(timeoutPtr, true);
-      nsecHi = dv.getInt32(timeoutPtr + 4, true);
-      nsec = dv.getInt32(timeoutPtr + 8, true);
-      hasTimeout = true;
+    const kernelMem = this.getKernelMem();
+    const chunkSize = CH_DATA_SIZE;
+    const chunkPtr = this.scratchOffset + CH_DATA;
+    let transferred = 0;
+    while (transferred < mapping.size) {
+      const remaining = mapping.size - transferred;
+      const toWrite = Math.min(remaining, chunkSize);
+      kernelMem.set(processMem.subarray(addr + transferred, addr + transferred + toWrite), chunkPtr);
+      const nWritten = writeChunk(mapping.segId, transferred, chunkPtr, toWrite);
+      if (nWritten <= 0) break;
+      transferred += nWritten;
     }
 
-    const { result, notification } = this.mqueueTable.mqTimedSend(
-      mqd, data, priority, nsecLo, nsecHi, nsec, hasTimeout
-    );
+    // Kernel-side detach bookkeeping
+    const kernelShmdt = this.kernelInstance!.exports.kernel_ipc_shmdt as (shmid: number) => number;
+    const result = kernelShmdt(mapping.segId);
 
-    // Fire notification signal if needed
-    if (notification && notification.signo > 0) {
-      this.sendSignalToProcess(notification.pid, notification.signo);
+    pidMappings.delete(addr);
+
+    if (result < 0) {
+      this.completeChannelRaw(channel, result, -result);
+    } else {
+      this.completeChannelRaw(channel, 0, 0);
     }
-
-    return result;
+    this.relistenChannel(channel);
   }
 
-  private handleMqTimedReceive(channel: ChannelInfo, args: number[]): number {
-    const [mqd, msgPtr, msgLen, prioPtr, timeoutPtr] = args;
+  // =========================================================================
+  // POSIX mqueue notification drain
+  // =========================================================================
 
-    // Read timeout if provided
-    let hasTimeout = false;
-    let nsecLo = 0, nsecHi = 0, nsec = 0;
-    if (timeoutPtr !== 0) {
-      const dv = new DataView(channel.memory.buffer);
-      nsecLo = dv.getInt32(timeoutPtr, true);
-      nsecHi = dv.getInt32(timeoutPtr + 4, true);
-      nsec = dv.getInt32(timeoutPtr + 8, true);
-      hasTimeout = true;
-    }
+  /**
+   * After mq_timedsend, check if the kernel has a pending notification
+   * (a signal to deliver when a message arrives on a previously empty queue).
+   * The notification is stored in the kernel's MqueueTable and drained here.
+   */
+  private drainMqueueNotification(): void {
+    const drain = this.kernelInstance!.exports
+      .kernel_mq_drain_notification as ((outPtr: number) => number) | undefined;
+    if (!drain) return;
 
-    const result = this.mqueueTable.mqTimedReceive(
-      mqd, msgLen, nsecLo, nsecHi, nsec, hasTimeout
-    );
-
-    if ("error" in result) return result.error;
-
-    // Write message data to process memory
-    const processMem = new Uint8Array(channel.memory.buffer);
-    processMem.set(result.data, msgPtr);
-
-    // Write priority to process memory if pointer provided
-    if (prioPtr !== 0) {
-      const dv = new DataView(channel.memory.buffer);
-      dv.setUint32(prioPtr, result.priority, true);
-    }
-
-    return result.length;
-  }
-
-  private handleMqNotify(channel: ChannelInfo, args: number[]): number {
-    const [mqd, sevPtr] = args;
-
-    if (sevPtr === 0) {
-      // NULL sigevent = unregister
-      return this.mqueueTable.mqNotify(mqd, channel.pid, null, 0);
-    }
-
-    // Read struct sigevent from process memory
-    // Layout on wasm32: { union sigval (4B), int sigev_signo (4B), int sigev_notify (4B), ... }
-    const dv = new DataView(channel.memory.buffer);
-    const signo = dv.getInt32(sevPtr + 4, true);   // sigev_signo
-    const notify = dv.getInt32(sevPtr + 8, true);   // sigev_notify
-
-    return this.mqueueTable.mqNotify(mqd, channel.pid, notify, signo);
-  }
-
-  private handleMqGetSetAttr(channel: ChannelInfo, args: number[]): number {
-    const [mqd, newAttrPtr, oldAttrPtr] = args;
-
-    // Read new flags if provided
-    let newFlags: number | null = null;
-    if (newAttrPtr !== 0) {
-      const dv = new DataView(channel.memory.buffer);
-      newFlags = dv.getInt32(newAttrPtr, true); // mq_flags at offset 0
-    }
-
-    const result = this.mqueueTable.mqGetSetAttr(mqd, newFlags);
-    if (typeof result === "number") return result;
-
-    // Write old attributes to process memory if pointer provided
-    if (oldAttrPtr !== 0) {
-      const dv = new DataView(channel.memory.buffer);
-      dv.setInt32(oldAttrPtr, result.flags, true);      // mq_flags
-      dv.setInt32(oldAttrPtr + 4, result.maxmsg, true);  // mq_maxmsg
-      dv.setInt32(oldAttrPtr + 8, result.msgsize, true);  // mq_msgsize
-      dv.setInt32(oldAttrPtr + 12, result.curmsgs, true); // mq_curmsgs
-      // Zero out __unused[4]
-      for (let i = 0; i < 4; i++) {
-        dv.setInt32(oldAttrPtr + 16 + i * 4, 0, true);
+    // Use kernel scratch as output buffer for (pid: u32, signo: u32)
+    const outOffset = this.scratchOffset;
+    const hasPending = drain(outOffset);
+    if (hasPending) {
+      const dv = new DataView(this.kernelMemory!.buffer, outOffset);
+      const pid = dv.getUint32(0, true);
+      const signo = dv.getUint32(4, true);
+      if (signo > 0) {
+        this.sendSignalToProcess(pid, signo);
       }
     }
-
-    return 0;
   }
 }
