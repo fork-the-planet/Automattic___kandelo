@@ -47,6 +47,8 @@ const xzWasm = resolve(repoRoot, "examples/libs/xz/bin/xz.wasm");
 const zstdWasm = resolve(repoRoot, "examples/libs/zstd/bin/zstd.wasm");
 const zipWasm = resolve(repoRoot, "examples/libs/zip/bin/zip.wasm");
 const unzipWasm = resolve(repoRoot, "examples/libs/unzip/bin/unzip.wasm");
+const qjsWasm = resolve(repoRoot, "examples/libs/quickjs/bin/qjs.wasm");
+const nodeWasm = resolve(repoRoot, "examples/libs/quickjs/bin/node.wasm");
 const lsofWasm = resolve(repoRoot, "examples/lsof.wasm");
 const rubyWasm = resolve(repoRoot, "examples/libs/ruby/bin/ruby.wasm");
 const vimWasm = resolve(repoRoot, "examples/libs/vim/bin/vim.wasm");
@@ -175,6 +177,15 @@ const builtinPrograms: Record<string, string> = {
     "funzip": unzipWasm,
     "/usr/bin/funzip": unzipWasm,
     "/bin/funzip": unzipWasm,
+    // QuickJS-NG JavaScript interpreter
+    "qjs": qjsWasm,
+    "/usr/bin/qjs": qjsWasm,
+    "/bin/qjs": qjsWasm,
+    // Node.js-compatible runtime (QuickJS-NG with Node.js API compat layer)
+    "node": nodeWasm,
+    "/usr/bin/node": nodeWasm,
+    "/bin/node": nodeWasm,
+    "/usr/local/bin/node": nodeWasm,
     "lsof": lsofWasm,
     "/usr/bin/lsof": lsofWasm,
     "/bin/lsof": lsofWasm,
