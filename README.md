@@ -1,6 +1,6 @@
 # wasm-posix-kernel
 
-A POSIX-compliant kernel for WebAssembly. Compile C programs against a real musl libc, run them in the browser or Node.js with syscall-level compatibility.
+A POSIX-compliant multi-process kernel for WebAssembly. Compile C programs against a real musl libc, run them in the browser or Node.js with syscall-level compatibility.
 
 **Live demo**: [brandonpayton.github.io/wasm-posix-kernel](https://brandonpayton.github.io/wasm-posix-kernel/)
 
