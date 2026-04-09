@@ -72,22 +72,30 @@ export class MemoryFileSystem implements FileSystemBackend {
   }
 
   /**
-   * Materialize a lazy file: sync XHR fetch the content and write to SharedFS.
-   * Must be called from a web worker (sync XHR is blocked on the main thread).
+   * Async-materialize a lazy file if the given path resolves to one.
+   * Call this before any synchronous read (e.g., in handleExec) to avoid
+   * sync XHR which deadlocks with the COOP/COEP service worker.
+   * Returns true if the file was materialized, false if it was already concrete.
    */
-  private materialize(ino: number, entry: { path: string; url: string; size: number }): void {
-    const xhr = new XMLHttpRequest();
-    xhr.open("GET", entry.url, false); // synchronous
-    xhr.responseType = "arraybuffer";
-    xhr.send();
-    if (xhr.status < 200 || xhr.status >= 300) {
-      throw new Error(`Failed to fetch lazy file ${entry.path}: HTTP ${xhr.status}`);
+  async ensureMaterialized(path: string): Promise<boolean> {
+    if (this.lazyFiles.size === 0) return false;
+    try {
+      const st = this.fs.stat(path); // follows symlinks
+      const entry = this.lazyFiles.get(st.ino);
+      if (!entry) return false;
+      const resp = await fetch(entry.url);
+      if (!resp.ok) {
+        throw new Error(`Failed to fetch lazy file ${entry.path}: HTTP ${resp.status}`);
+      }
+      const data = new Uint8Array(await resp.arrayBuffer());
+      const fd = this.fs.open(entry.path, 0o1101, 0o755); // O_WRONLY | O_CREAT | O_TRUNC
+      this.fs.write(fd, data);
+      this.fs.close(fd);
+      this.lazyFiles.delete(st.ino);
+      return true;
+    } catch {
+      return false;
     }
-    const data = new Uint8Array(xhr.response as ArrayBuffer);
-    const fd = this.fs.open(entry.path, 0o1101, 0o755); // O_WRONLY | O_CREAT | O_TRUNC
-    this.fs.write(fd, data);
-    this.fs.close(fd);
-    this.lazyFiles.delete(ino);
   }
 
   private adaptStat(s: SfsStatResult): StatResult {
@@ -120,15 +128,6 @@ export class MemoryFileSystem implements FileSystemBackend {
     offset: number | null,
     length: number,
   ): number {
-    // Materialize lazy files on first content read
-    if (this.lazyFiles.size > 0) {
-      const st = this.fs.fstat(handle);
-      const entry = this.lazyFiles.get(st.ino);
-      if (entry) {
-        this.materialize(st.ino, entry);
-      }
-    }
-
     if (offset !== null) {
       // pread semantics: read at offset without changing file position
       const savedPos = this.fs.lseek(handle, 0, 1); // SEEK_CUR

@@ -356,6 +356,9 @@ async function handleExec(
   argv: string[],
   envp: string[],
 ): Promise<number> {
+  // Materialize lazy file if needed (async fetch avoids sync XHR + SW deadlock)
+  await memfs.ensureMaterialized(path);
+
   // Read binary from the shared filesystem
   const bytes = readFileFromFs(path);
   if (!bytes) return -2; // ENOENT
