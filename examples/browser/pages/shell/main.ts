@@ -11,6 +11,13 @@ import dashWasmUrl from "../../../../examples/libs/dash/bin/dash.wasm?url";
 import coreutilsWasmUrl from "../../../../examples/libs/coreutils/bin/coreutils.wasm?url";
 import grepWasmUrl from "../../../../examples/libs/grep/bin/grep.wasm?url";
 import sedWasmUrl from "../../../../examples/libs/sed/bin/sed.wasm?url";
+import bcWasmUrl from "../../../../examples/libs/bc/bin/bc.wasm?url";
+import fileWasmUrl from "../../../../examples/libs/file/bin/file.wasm?url";
+import fileMagicUrl from "../../../../examples/libs/file/bin/magic.lite?url";
+import lessWasmUrl from "../../../../examples/libs/less/bin/less.wasm?url";
+import m4WasmUrl from "../../../../examples/libs/m4/bin/m4.wasm?url";
+import makeWasmUrl from "../../../../examples/libs/make/bin/make.wasm?url";
+import tarWasmUrl from "../../../../examples/libs/tar/bin/tar.wasm?url";
 import "@xterm/xterm/css/xterm.css";
 
 // --- DOM elements ---
@@ -91,6 +98,14 @@ interface LazyBinary {
 }
 let lazyBinaries: LazyBinary[] = [];
 
+/** Data files to load eagerly (small, needed at runtime by utilities). */
+interface DataFile {
+  url: string;
+  path: string;
+  data?: ArrayBuffer;
+}
+let dataFiles: DataFile[] = [];
+
 /** Fetch file size via HEAD request. Returns 0 on failure. */
 async function fetchSize(url: string): Promise<number> {
   try {
@@ -120,13 +135,37 @@ async function loadBinaries(): Promise<string> {
     { url: coreutilsWasmUrl, path: "/bin/coreutils", symlinks: [...COREUTILS_NAMES, "["].flatMap(n => [`/bin/${n}`, `/usr/bin/${n}`]) },
     { url: grepWasmUrl, path: "/bin/grep", symlinks: ["/bin/egrep", "/bin/fgrep", "/usr/bin/grep", "/usr/bin/egrep", "/usr/bin/fgrep"] },
     { url: sedWasmUrl, path: "/bin/sed", symlinks: ["/usr/bin/sed"] },
+    { url: bcWasmUrl, path: "/usr/bin/bc", symlinks: ["/bin/bc"] },
+    { url: fileWasmUrl, path: "/usr/bin/file", symlinks: ["/bin/file"] },
+    { url: lessWasmUrl, path: "/usr/bin/less", symlinks: ["/bin/less"] },
+    { url: m4WasmUrl, path: "/usr/bin/m4", symlinks: ["/bin/m4"] },
+    { url: makeWasmUrl, path: "/usr/bin/make", symlinks: ["/bin/make"] },
+    { url: tarWasmUrl, path: "/usr/bin/tar", symlinks: ["/bin/tar"] },
   ];
 
-  const sizes = await Promise.all(lazyDefs.map(d => fetchSize(d.url)));
+  // Fetch sizes for lazy binaries and data files in parallel
+  const dataFileDefs: DataFile[] = [
+    { url: fileMagicUrl, path: "/usr/share/misc/magic" },
+  ];
+  const [sizes, ...dataResults] = await Promise.all([
+    Promise.all(lazyDefs.map(d => fetchSize(d.url))),
+    ...dataFileDefs.map(async d => {
+      try {
+        const resp = await fetch(d.url);
+        return resp.ok ? await resp.arrayBuffer() : null;
+      } catch { return null; }
+    }),
+  ]);
   lazyBinaries = [];
   for (let i = 0; i < lazyDefs.length; i++) {
     if (sizes[i] > 0) {
       lazyBinaries.push({ ...lazyDefs[i], size: sizes[i] });
+    }
+  }
+  dataFiles = [];
+  for (let i = 0; i < dataFileDefs.length; i++) {
+    if (dataResults[i]) {
+      dataFiles.push({ ...dataFileDefs[i], data: dataResults[i]! });
     }
   }
 
@@ -159,7 +198,7 @@ function writeFileToFs(fs: import("../../lib/browser-kernel").BrowserKernel["fs"
  */
 function populateExecBinaries(kernel: import("../../lib/browser-kernel").BrowserKernel): void {
   const fs = kernel.fs;
-  for (const dir of ["/bin", "/usr", "/usr/bin", "/usr/local", "/usr/local/bin"]) {
+  for (const dir of ["/bin", "/usr", "/usr/bin", "/usr/local", "/usr/local/bin", "/usr/share", "/usr/share/misc", "/usr/share/file"]) {
     try { fs.mkdir(dir, 0o755); } catch { /* exists */ }
   }
 
@@ -183,6 +222,13 @@ function populateExecBinaries(kernel: import("../../lib/browser-kernel").Browser
       for (const link of lb.symlinks) {
         try { fs.symlink(lb.path, link); } catch { /* exists */ }
       }
+    }
+  }
+
+  // Write data files (magic database, etc.)
+  for (const df of dataFiles) {
+    if (df.data) {
+      writeFileToFs(fs, df.path, df.data);
     }
   }
 }
