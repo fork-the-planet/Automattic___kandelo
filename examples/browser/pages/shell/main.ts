@@ -26,6 +26,13 @@ import tarWasmUrl from "../../../../examples/libs/tar/bin/tar.wasm?url";
 import curlWasmUrl from "../../../../examples/libs/curl/bin/curl.wasm?url";
 import wgetWasmUrl from "../../../../examples/libs/wget/bin/wget.wasm?url";
 import gitWasmUrl from "../../../../examples/libs/git/bin/git.wasm?url";
+import gitRemoteHttpWasmUrl from "../../../../examples/libs/git/bin/git-remote-http.wasm?url";
+import gzipWasmUrl from "../../../../examples/libs/gzip/bin/gzip.wasm?url";
+import bzip2WasmUrl from "../../../../examples/libs/bzip2/bin/bzip2.wasm?url";
+import xzWasmUrl from "../../../../examples/libs/xz/bin/xz.wasm?url";
+import zstdWasmUrl from "../../../../examples/libs/zstd/bin/zstd.wasm?url";
+import zipWasmUrl from "../../../../examples/libs/zip/bin/zip.wasm?url";
+import unzipWasmUrl from "../../../../examples/libs/unzip/bin/unzip.wasm?url";
 import nanoWasmUrl from "../../../../examples/libs/nano/bin/nano.wasm?url";
 import lsofWasmUrl from "../../../../examples/lsof.wasm?url";
 import "@xterm/xterm/css/xterm.css";
@@ -128,6 +135,13 @@ async function loadBinaries(): Promise<string> {
     { url: curlWasmUrl, path: "/usr/bin/curl", symlinks: ["/bin/curl"] },
     { url: wgetWasmUrl, path: "/usr/bin/wget", symlinks: ["/bin/wget"] },
     { url: gitWasmUrl, path: "/usr/bin/git", symlinks: ["/bin/git"] },
+    { url: gitRemoteHttpWasmUrl, path: "/usr/bin/git-remote-http", symlinks: ["/usr/bin/git-remote-https", "/usr/bin/git-remote-ftp", "/usr/bin/git-remote-ftps"] },
+    { url: gzipWasmUrl, path: "/usr/bin/gzip", symlinks: ["/bin/gzip", "/usr/bin/gunzip", "/bin/gunzip", "/usr/bin/zcat", "/bin/zcat"] },
+    { url: bzip2WasmUrl, path: "/usr/bin/bzip2", symlinks: ["/bin/bzip2", "/usr/bin/bunzip2", "/bin/bunzip2", "/usr/bin/bzcat", "/bin/bzcat"] },
+    { url: xzWasmUrl, path: "/usr/bin/xz", symlinks: ["/bin/xz", "/usr/bin/unxz", "/bin/unxz", "/usr/bin/xzcat", "/bin/xzcat", "/usr/bin/lzma", "/bin/lzma", "/usr/bin/unlzma", "/bin/unlzma", "/usr/bin/lzcat", "/bin/lzcat"] },
+    { url: zstdWasmUrl, path: "/usr/bin/zstd", symlinks: ["/bin/zstd", "/usr/bin/unzstd", "/bin/unzstd", "/usr/bin/zstdcat", "/bin/zstdcat"] },
+    { url: zipWasmUrl, path: "/usr/bin/zip", symlinks: ["/bin/zip"] },
+    { url: unzipWasmUrl, path: "/usr/bin/unzip", symlinks: ["/bin/unzip", "/usr/bin/zipinfo", "/bin/zipinfo", "/usr/bin/funzip", "/bin/funzip"] },
     { url: lsofWasmUrl, path: "/usr/bin/lsof", symlinks: ["/bin/lsof"] },
     { url: nanoWasmUrl, path: "/usr/bin/nano", symlinks: ["/bin/nano"] },
   ];
@@ -186,6 +200,20 @@ function populateExecBinaries(kernel: BrowserKernel): void {
       .map((df) => ({ path: df.path, data: new Uint8Array(df.data!) })),
   );
 
+  // Append HTTPS→HTTP rewrite to gitconfig so libcurl doesn't attempt TLS
+  // handshakes — the browser's fetch() API handles TLS natively via CORS proxy.
+  const gitHttpConfig = [
+    '[url "http://"]',
+    "\tinsteadOf = https://",
+    "[http]",
+    "\tsslVerify = false",
+    "",
+  ].join("\n");
+  const gitHttpBytes = new TextEncoder().encode(gitHttpConfig);
+  const gfd = fs.open("/etc/gitconfig", 0x401, 0o644); // O_WRONLY | O_APPEND
+  fs.write(gfd, gitHttpBytes, null, gitHttpBytes.length);
+  fs.close(gfd);
+
   // Write shell profile: color aliases for interactive sessions.
   // dash reads the file pointed to by $ENV on interactive startup.
   const profile = "alias ls='ls --color=auto'\nalias grep='grep --color=auto'\n";
@@ -214,7 +242,9 @@ async function startInteractiveShell() {
 
     setStatus("Starting shell...", "running");
 
-    const kernel = new BrowserKernel();
+    const kernel = new BrowserKernel({
+      corsProxyUrl: "https://wordpress-playground-cors-proxy.net/?",
+    });
 
     await kernel.init(kernelBytes!);
     populateExecBinaries(kernel);
@@ -466,6 +496,7 @@ async function runBatch() {
     const kernel = new BrowserKernel({
       onStdout: (data) => appendBatchOutput(decoder.decode(data)),
       onStderr: (data) => appendBatchOutput(decoder.decode(data), "stderr"),
+      corsProxyUrl: "https://wordpress-playground-cors-proxy.net/?",
     });
 
     await kernel.init(kernelBytes!);
