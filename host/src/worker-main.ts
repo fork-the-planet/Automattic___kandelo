@@ -12,19 +12,22 @@ import type {
 } from "./worker-protocol";
 import { DynamicLinker } from "./dylink";
 import { WasiShim, WasiExit, isWasiModule, wasiModuleDefinesMemory } from "./wasi-shim";
-// Debug file logging — Node.js only; no-op in browser workers where "fs" is unavailable.
-const _fsNoop = (..._args: unknown[]) => {};
-let writeFileSync: (...args: unknown[]) => void = _fsNoop;
-let appendFileSync: (...args: unknown[]) => void = _fsNoop;
-if (typeof process !== "undefined" && process.versions?.node) {
-  try {
-    // Dynamic import with variable name to prevent Vite from resolving "fs" at build time.
-    const m = "fs";
-    const fs = await import(/* @vite-ignore */ m);
-    writeFileSync = fs.writeFileSync;
-    appendFileSync = fs.appendFileSync;
-  } catch {}
+// Debug file logging — Node.js only; silent no-op in browser workers.
+// Resolved lazily on first use to avoid static "fs" imports (break Vite builds)
+// and top-level await (unsupported in esbuild's es2020 target for workers).
+let _nodeFs: typeof import("fs") | null | undefined;
+function _debugWrite(fn: "writeFileSync" | "appendFileSync", path: string, data: string) {
+  if (_nodeFs === undefined) {
+    _nodeFs = null;
+    if (typeof process !== "undefined" && process.versions?.node) {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      try { _nodeFs = require("fs"); } catch {}
+    }
+  }
+  if (_nodeFs) try { (_nodeFs as any)[fn](path, data); } catch {}
 }
+function writeFileSync(path: string, data: string) { _debugWrite("writeFileSync", path, data); }
+function appendFileSync(path: string, data: string) { _debugWrite("appendFileSync", path, data); }
 
 export interface MessagePort {
   postMessage(msg: unknown, transferList?: unknown[]): void;
