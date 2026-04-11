@@ -64,7 +64,6 @@ async function main() {
         io,
         {
             onFork: async (parentPid, childPid, parentMemory) => {
-                console.log(`[kernel] fork: pid ${parentPid} → ${childPid}`);
                 const parentBuf = new Uint8Array(parentMemory.buffer);
                 const parentPages = Math.ceil(parentBuf.byteLength / 65536);
                 const childMemory = new WebAssembly.Memory({
@@ -111,7 +110,6 @@ async function main() {
                 // TLS is now stored inside the channel spill page, not the separate TLS page.
                 const CH_TOTAL = 65576;
                 const safeTlsAddr = alloc.channelOffset + CH_TOTAL;
-                console.log(`[kernel] clone: pid=${pid} tid=${tid} fn=${fnPtr} channelOff=${alloc.channelOffset} safeTls=0x${safeTlsAddr.toString(16)}`);
 
                 kernelWorker.addChannel(pid, alloc.channelOffset, tid);
 
@@ -136,7 +134,6 @@ async function main() {
                 threadWorker.on("message", (msg: unknown) => {
                     const m = msg as WorkerToHostMessage;
                     if (m.type === "thread_exit") {
-                        console.error(`[kernel] thread ${tid} exited`);
                         kernelWorker.notifyThreadExit(pid, tid);
                         kernelWorker.removeChannel(pid, alloc.channelOffset);
                         threadAllocator.free(alloc.basePage);
@@ -158,7 +155,6 @@ async function main() {
             onExec: async () => -38, // ENOSYS
 
             onExit: (pid, exitStatus) => {
-                console.log(`[kernel] process ${pid} exited with status ${exitStatus}`);
                 if (pid === 1) {
                     // Terminate all thread workers before unregistering
                     for (const [tid, tw] of threadWorkers) {
