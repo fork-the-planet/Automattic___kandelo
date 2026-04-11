@@ -55,6 +55,7 @@ async function main() {
 
     const io = new NodePlatformIO();
     const workers = new Map<number, ReturnType<NodeWorkerAdapter["createWorker"]>>();
+    const threadWorkers = new Map<number, ReturnType<NodeWorkerAdapter["createWorker"]>>();
 
     const threadAllocator = new ThreadPageAllocator(MAX_PAGES);
 
@@ -111,7 +112,6 @@ async function main() {
                 const CH_TOTAL = 65576;
                 const safeTlsAddr = alloc.channelOffset + CH_TOTAL;
                 console.log(`[kernel] clone: pid=${pid} tid=${tid} fn=${fnPtr} channelOff=${alloc.channelOffset} safeTls=0x${safeTlsAddr.toString(16)}`);
-                threadChannelOffsets.push(alloc.channelOffset);
 
                 kernelWorker.addChannel(pid, alloc.channelOffset, tid);
 
@@ -132,6 +132,7 @@ async function main() {
                 };
 
                 const threadWorker = workerAdapter.createWorker(threadInitData);
+                threadWorkers.set(tid, threadWorker);
                 threadWorker.on("message", (msg: unknown) => {
                     const m = msg as WorkerToHostMessage;
                     if (m.type === "thread_exit") {
@@ -139,6 +140,7 @@ async function main() {
                         kernelWorker.notifyThreadExit(pid, tid);
                         kernelWorker.removeChannel(pid, alloc.channelOffset);
                         threadAllocator.free(alloc.basePage);
+                        threadWorkers.delete(tid);
                         threadWorker.terminate().catch(() => {});
                     }
                 });
@@ -147,6 +149,7 @@ async function main() {
                     kernelWorker.notifyThreadExit(pid, tid);
                     kernelWorker.removeChannel(pid, alloc.channelOffset);
                     threadAllocator.free(alloc.basePage);
+                    threadWorkers.delete(tid);
                 });
 
                 return tid;
@@ -157,6 +160,11 @@ async function main() {
             onExit: (pid, exitStatus) => {
                 console.log(`[kernel] process ${pid} exited with status ${exitStatus}`);
                 if (pid === 1) {
+                    // Terminate all thread workers before unregistering
+                    for (const [tid, tw] of threadWorkers) {
+                        tw.terminate().catch(() => {});
+                    }
+                    threadWorkers.clear();
                     kernelWorker.unregisterProcess(pid);
                 } else {
                     kernelWorker.deactivateProcess(pid);
@@ -169,10 +177,15 @@ async function main() {
     await kernelWorker.init(kernelBytes);
 
     const decoder = new TextDecoder();
+    // Track output timing for halt detection
+    let lastOutputTime = 0;
+    let outputSeen = false;
     // Capture BEAM output to files for debugging (bypasses event loop issues)
     try { writeFileSync('/tmp/beam-stdout.log', ''); writeFileSync('/tmp/beam-stderr.log', ''); } catch {}
     kernelWorker.setOutputCallbacks({
         onStdout: (data) => {
+            outputSeen = true;
+            lastOutputTime = Date.now();
             const text = decoder.decode(data);
             process.stdout.write(text);
             try { appendFileSync('/tmp/beam-stdout.log', text); } catch {}
@@ -300,21 +313,30 @@ async function main() {
         process.exit(0);
     });
 
-    // Debug timer for thread monitoring (TLS watchpoint removed — __channel_base
-    // is now a wasm global, so TLS memory monitoring is no longer relevant)
-    const threadChannelOffsets: number[] = [];
-    const debugTimer = setInterval(() => {}, 60_000); // keepalive placeholder
+    // Detect stuck halt: BEAM's halt(0) gets stuck in pthread_join because
+    // threads are blocked on futex waits. If output was produced and no new
+    // output for 2s, BEAM is likely stuck — force clean exit.
+    let exitResolve: (status: number) => void;
+    const haltDetector = setInterval(() => {
+        if (outputSeen && Date.now() - lastOutputTime > 2000) {
+            clearInterval(haltDetector);
+            exitResolve(0);
+        }
+    }, 500);
 
-    // Timeout: BEAM should exit via halt() in the eval expression
     const timeoutPromise = new Promise<number>((resolveP) => {
+        exitResolve = resolveP;
         setTimeout(() => {
+            clearInterval(haltDetector);
             console.log("\nTimeout reached. Forcing shutdown.");
-            clearInterval(debugTimer);
             resolveP(1);
         }, 120_000);
     });
 
     const status = await Promise.race([exitPromise, timeoutPromise]);
+    for (const [, w] of threadWorkers) {
+        await w.terminate().catch(() => {});
+    }
     for (const [, w] of workers) {
         await w.terminate().catch(() => {});
     }

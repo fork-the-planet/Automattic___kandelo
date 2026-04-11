@@ -4,8 +4,8 @@
 %% Demonstrates Erlang's lightweight process model running on
 %% a single wasm32 thread via the BEAM scheduler.
 %%
-%% Usage from erl:
-%%   ring:run(1000, 100).   % 1000 processes, 100 rounds
+%% Usage:
+%%   npx tsx examples/erlang/serve.ts -eval "ring:start()."
 
 -module(ring).
 -export([run/2, start/0]).
@@ -15,48 +15,42 @@ start() ->
     N = 1000,
     M = 100,
     io:format("Ring benchmark: ~p processes, ~p rounds~n", [N, M]),
-    {Time, _} = timer:tc(fun() -> run(N, M) end),
-    io:format("Completed in ~.3f seconds~n", [Time / 1_000_000]),
+    T1 = erlang:monotonic_time(microsecond),
+    run(N, M),
+    T2 = erlang:monotonic_time(microsecond),
+    Elapsed = T2 - T1,
+    Secs = erlang:float_to_list(Elapsed / 1.0e6, [{decimals, 3}]),
+    io:format("Completed in ~s seconds (~p us)~n", [Secs, Elapsed]),
     io:format("Total messages: ~p~n", [N * M]),
-    halt(0).
+    erlang:halt(0, [{flush, false}]).
 
-%% Spawn N processes in a ring, send a message around M times
+%% Spawn N processes in a ring, send a token around M times.
+%% Ring topology: self -> Last -> ... -> proc2 -> self
+%% Self acts as the counter, sending tokens and waiting for them
+%% to come back around the ring.
 run(N, M) ->
-    %% Create the ring: each process knows its successor
     First = self(),
     Last = lists:foldl(
-        fun(_, Prev) ->
-            spawn(fun() -> ring_node(Prev) end)
+        fun(_, Next) ->
+            spawn(fun() -> forwarder(Next) end)
         end,
         First,
         lists:seq(2, N)
     ),
-    %% Close the ring: last node sends to first
-    Last ! {set_next, First},
-    %% Send M tokens around the ring
-    Last ! {token, M},
-    %% Wait for completion
-    receive
-        done -> ok
-    end.
+    %% Send M tokens around the ring, each traverses N processes
+    counter_loop(Last, M).
 
-ring_node(Next) ->
-    receive
-        {set_next, NewNext} ->
-            ring_node_loop(NewNext);
-        {token, _} = Msg ->
-            %% Haven't received set_next yet, forward with self as next
-            Next ! Msg,
-            ring_node(Next)
-    end.
+counter_loop(_, 0) -> ok;
+counter_loop(Next, M) ->
+    Next ! token,
+    receive token -> ok end,
+    counter_loop(Next, M - 1).
 
-ring_node_loop(Next) ->
+forwarder(Next) ->
     receive
-        {token, 1} ->
-            Next ! done;
-        {token, N} ->
-            Next ! {token, N - 1},
-            ring_node_loop(Next);
-        done ->
-            Next ! done
+        token ->
+            Next ! token,
+            forwarder(Next);
+        stop ->
+            ok
     end.
