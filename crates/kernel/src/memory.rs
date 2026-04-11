@@ -573,12 +573,12 @@ mod tests {
         mm.munmap(a, 0x200000);
         let a2 = mm.mmap_anonymous(0, 0x3f0000, rw, anon);
         mm.munmap(a2, 0x1f0000);
-        let a3 = mm.mmap_anonymous(0, 0x200000, rw, anon);
+        let _a3 = mm.mmap_anonymous(0, 0x200000, rw, anon);
         assert_no_overlaps(&mm);
 
         // WPS:133
-        let a4 = mm.mmap_anonymous(0, 0x40000, rw, anon);
-        let a5 = mm.mmap_anonymous(0, 0x40000, rw, anon);
+        let _a4 = mm.mmap_anonymous(0, 0x40000, rw, anon);
+        let _a5 = mm.mmap_anonymous(0, 0x40000, rw, anon);
         assert_no_overlaps(&mm);
 
         // After SHORTINIT — another musl pattern
