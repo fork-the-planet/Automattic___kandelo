@@ -1958,12 +1958,6 @@ export class CentralizedKernelWorker {
       // Layout: signum(4) + handler(4) + flags(4) + si_value(4) + old_mask(8)
       //       + si_code(4) + si_pid(4) + si_uid(4) + alt_sp(4) + alt_size(4) = 44 bytes
       const kernelMem = this.getKernelMem();
-      // DEBUG: Log signal delivery details
-      const kView = new DataView(kernelMem.buffer, sigOutOffset);
-      const signum = kView.getUint32(0, true);
-      const handler = kView.getUint32(4, true);
-      const flags = kView.getUint32(8, true);
-      console.error(`[signal] pid=${channel.pid} signum=${signum} handler=${handler} flags=0x${flags.toString(16)}`);
       const processMem = new Uint8Array(channel.memory.buffer);
       processMem.set(
         kernelMem.subarray(sigOutOffset, sigOutOffset + 44),

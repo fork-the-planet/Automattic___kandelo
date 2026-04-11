@@ -1034,10 +1034,7 @@ export function patchWasmForThread(bytes: ArrayBuffer): ArrayBuffer {
 
   const ctorCodeEntry = ctorFuncIndex >= 0 ? ctorFuncIndex - numFuncImports : -1;
   if (ctorFuncIndex < 0) {
-    console.error(`[patchWasmForThread] could not find ctor function; exports=${exportedFuncIndices}`);
-    console.error(`[patchWasmForThread] will still strip start section`);
-  } else {
-    console.error(`[patchWasmForThread] ctor=func ${ctorFuncIndex} (code entry ${ctorCodeEntry}), numFuncImports=${numFuncImports}`);
+    // No ctor found — still strip start section but can't neuter the ctor body
   }
 
   // Build output: always skip Start section; optionally neuter constructor function
