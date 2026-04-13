@@ -21,8 +21,11 @@ const DEFAULT_MAX_PAGES = 16384;
 export interface BrowserKernelOptions {
   /** Maximum concurrent workers (default: 4) */
   maxWorkers?: number;
-  /** SharedArrayBuffer size for MemoryFileSystem (default: 16MB) */
+  /** Initial SharedArrayBuffer size for MemoryFileSystem (default: 16MB).
+   *  The VFS grows automatically on demand up to maxFsSize. */
   fsSize?: number;
+  /** Maximum VFS size the SharedArrayBuffer can grow to (default: 4x fsSize). */
+  maxFsSize?: number;
   /** Maximum wasm memory pages per process (default: 16384 = 1GB). Reduce for
    *  multi-process demos to avoid exhausting browser memory limits. */
   maxMemoryPages?: number;
@@ -75,9 +78,11 @@ export class BrowserKernel {
       ...options,
     };
 
-    this.fsSab = new SharedArrayBuffer(this.options.fsSize);
+    const fsSize = this.options.fsSize;
+    const maxFsSize = this.options.maxFsSize ?? fsSize * 4;
+    this.fsSab = new SharedArrayBuffer(fsSize, { maxByteLength: maxFsSize });
     this.shmSab = new SharedArrayBuffer(1024 * 1024);
-    this.memfs = MemoryFileSystem.create(this.fsSab);
+    this.memfs = MemoryFileSystem.create(this.fsSab, maxFsSize);
     MemoryFileSystem.create(this.shmSab); // format shm SAB for kernel worker
 
     // Create standard directories

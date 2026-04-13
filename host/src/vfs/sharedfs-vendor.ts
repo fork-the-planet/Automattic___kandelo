@@ -186,17 +186,20 @@ export class SharedFS {
 
   // ── Factory methods ──────────────────────────────────────────────
 
-  static mkfs(buffer: SharedArrayBuffer): SharedFS {
+  static mkfs(buffer: SharedArrayBuffer, maxSizeBytes?: number): SharedFS {
     const sizeBytes = buffer.byteLength;
     if (sizeBytes < BLOCK_SIZE * 16) throw new SFSError(EINVAL);
 
     const totalBlocks = Math.floor(sizeBytes / BLOCK_SIZE);
-    let totalInodes = Math.floor(totalBlocks / 4);
+    const maxBlocks = maxSizeBytes
+      ? Math.floor(maxSizeBytes / BLOCK_SIZE)
+      : totalBlocks * 4;
+
+    // Size inodes for max capacity so we don't run out after growth
+    let totalInodes = Math.floor(maxBlocks / 4);
     if (totalInodes < 32) totalInodes = 32;
     totalInodes =
       Math.ceil(totalInodes / INODES_PER_BLOCK) * INODES_PER_BLOCK;
-
-    const maxBlocks = totalBlocks * 4;
 
     const inodeBitmapBlocks = Math.ceil(totalInodes / (BLOCK_SIZE * 8));
     const blockBitmapBlocks = Math.ceil(maxBlocks / (BLOCK_SIZE * 8));

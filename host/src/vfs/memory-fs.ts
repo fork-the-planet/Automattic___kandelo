@@ -22,8 +22,8 @@ export class MemoryFileSystem implements FileSystemBackend {
     this.fs = fs;
   }
 
-  static create(sab: SharedArrayBuffer): MemoryFileSystem {
-    return new MemoryFileSystem(SharedFS.mkfs(sab));
+  static create(sab: SharedArrayBuffer, maxSizeBytes?: number): MemoryFileSystem {
+    return new MemoryFileSystem(SharedFS.mkfs(sab, maxSizeBytes));
   }
 
   static fromExisting(sab: SharedArrayBuffer): MemoryFileSystem {
