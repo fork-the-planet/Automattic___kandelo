@@ -230,6 +230,57 @@ export interface ListenTcpMessage {
   port: number;
 }
 
+/**
+ * Forwarded /dev/fb0 binding. Fired when a process mmaps the
+ * framebuffer; the main thread builds a typed-array view over
+ * `memory.buffer` at `[addr, addr+len)` and presents it on a canvas.
+ *
+ * `memory` is the process's WebAssembly.Memory — a SharedArrayBuffer
+ * shared with the kernel worker. Sending the Memory across postMessage
+ * is fine; both threads see the same SAB.
+ */
+export interface FbBindMessage {
+  type: "fb_bind";
+  pid: number;
+  addr: number;
+  len: number;
+  w: number;
+  h: number;
+  stride: number;
+  fmt: "BGRA32";
+  memory: WebAssembly.Memory;
+}
+
+export interface FbUnbindMessage {
+  type: "fb_unbind";
+  pid: number;
+}
+
+/**
+ * Fired when a process's WebAssembly.Memory is replaced (memory.grow,
+ * exec). The main-thread renderer must invalidate any cached view; the
+ * `memory` reference is the new (post-grow) Memory.
+ */
+export interface FbRebindMemoryMessage {
+  type: "fb_rebind_memory";
+  pid: number;
+  memory: WebAssembly.Memory;
+}
+
+/**
+ * Forwarded write-based pixel push. Used by software (e.g. fbDOOM)
+ * that does `write(fd_fb, …)` rather than mmap. Bytes are copied out
+ * of kernel scratch in the worker — `bytes` here is a transferable
+ * Uint8Array (non-shared); the main thread copies it into the
+ * registry's per-pid hostBuffer.
+ */
+export interface FbWriteMessage {
+  type: "fb_write";
+  pid: number;
+  offset: number;
+  bytes: Uint8Array;
+}
+
 export type KernelToMainMessage =
   | ReadyMessage
   | ResponseMessage
@@ -237,4 +288,8 @@ export type KernelToMainMessage =
   | StdoutMessage
   | StderrMessage
   | PtyOutputMessage
-  | ListenTcpMessage;
+  | ListenTcpMessage
+  | FbBindMessage
+  | FbUnbindMessage
+  | FbRebindMemoryMessage
+  | FbWriteMessage;

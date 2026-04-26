@@ -8,6 +8,7 @@
  */
 
 import { MemoryFileSystem, type LazyFileEntry } from "../../../host/src/vfs/memory-fs";
+import { FramebufferRegistry } from "../../../host/src/framebuffer/registry";
 import type {
   MainToKernelMessage,
   KernelToMainMessage,
@@ -53,8 +54,10 @@ export class BrowserKernel {
   private fsSab: SharedArrayBuffer;
   private shmSab: SharedArrayBuffer;
   private maxPages: number;
-  /** @internal exposed for PtyTerminal pid tracking */
-  nextPid = 1;
+  /** @internal exposed for PtyTerminal pid tracking.
+   * pid 1 is reserved for the kernel's virtual init (see
+   * `process_table::ensure_init`); spawn allocations start at 2. */
+  nextPid = 2;
   private options: Required<
     Pick<BrowserKernelOptions, "maxWorkers" | "fsSize" | "env">
   > &
@@ -63,6 +66,13 @@ export class BrowserKernel {
   private pendingRequests = new Map<number, { resolve: (val: any) => void; reject: (err: Error) => void }>();
   private nextRequestId = 1;
   private ptyOutputCallbacks = new Map<number, (data: Uint8Array) => void>();
+  /**
+   * Mirror of the kernel-worker's FramebufferRegistry, populated by
+   * forwarded fb_bind / fb_unbind messages. The renderer
+   * (host/src/framebuffer/canvas-renderer.ts) reads from here.
+   */
+  readonly framebuffers = new FramebufferRegistry();
+  private fbMemoryByPid = new Map<number, WebAssembly.Memory>();
 
   constructor(options: BrowserKernelOptions = {}) {
     this.maxPages = options.maxMemoryPages ?? DEFAULT_MAX_PAGES;
@@ -347,6 +357,18 @@ export class BrowserKernel {
     this.sendToKernel({ type: "register_lazy_files", entries: lazyEntries });
   }
 
+  /**
+   * Async-materialize a lazy file (or archive-backed file). Useful for
+   * data files (not exec targets) the program will open via the VFS —
+   * exec paths get auto-materialized by the kernel worker, but
+   * arbitrary opens go through the kernel's synchronous read path.
+   * Returns true if a fetch happened, false if already materialized
+   * or not lazy.
+   */
+  async ensureMaterialized(path: string): Promise<boolean> {
+    return this.memfs.ensureMaterialized(path);
+  }
+
   /** Append data to a process's stdin buffer. */
   appendStdinData(pid: number, data: Uint8Array): void {
     this.sendToKernel({ type: "append_stdin_data", pid, data });
@@ -477,6 +499,38 @@ export class BrowserKernel {
       case "listen_tcp":
         this.options.onListenTcp?.(msg.pid, msg.fd, msg.port);
         break;
+      case "fb_bind":
+        this.fbMemoryByPid.set(msg.pid, msg.memory);
+        this.framebuffers.bind({
+          pid: msg.pid,
+          addr: msg.addr,
+          len: msg.len,
+          w: msg.w,
+          h: msg.h,
+          stride: msg.stride,
+          fmt: msg.fmt,
+        });
+        break;
+      case "fb_unbind":
+        this.fbMemoryByPid.delete(msg.pid);
+        this.framebuffers.unbind(msg.pid);
+        break;
+      case "fb_rebind_memory":
+        this.fbMemoryByPid.set(msg.pid, msg.memory);
+        this.framebuffers.rebindMemory(msg.pid);
+        break;
+      case "fb_write":
+        this.framebuffers.fbWrite(msg.pid, msg.offset, msg.bytes);
+        break;
     }
+  }
+
+  /**
+   * Return the wasm `Memory` for the framebuffer-bound process. Used by
+   * the canvas renderer to build typed-array views over the bound
+   * region.
+   */
+  getProcessMemory(pid: number): WebAssembly.Memory | undefined {
+    return this.fbMemoryByPid.get(pid);
   }
 }

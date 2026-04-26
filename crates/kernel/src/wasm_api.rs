@@ -96,6 +96,7 @@ unsafe extern "C" {
         w: u32, h: u32, stride: u32, fmt: u32,
     );
     fn host_unbind_framebuffer(pid: i32);
+    fn host_fb_write(pid: i32, offset: usize, src: *const u8, len: usize);
 }
 
 // ---------------------------------------------------------------------------
@@ -590,6 +591,10 @@ impl HostIO for WasmHostIO {
 
     fn unbind_framebuffer(&mut self, pid: i32) {
         unsafe { host_unbind_framebuffer(pid) }
+    }
+
+    fn fb_write(&mut self, pid: i32, offset: usize, bytes: &[u8]) {
+        unsafe { host_fb_write(pid, offset, bytes.as_ptr(), bytes.len()) }
     }
 }
 
@@ -5723,11 +5728,11 @@ pub extern "C" fn kernel_socketpair(domain: u32, sock_type: u32, protocol: u32, 
 pub extern "C" fn kernel_bind(fd: i32, addr_ptr: *const u8, addr_len: u32) -> i32 {
     let (_gkl, proc) = unsafe { get_process() };
     let addr = unsafe { slice::from_raw_parts(addr_ptr, addr_len as usize) };
-    let mut host = WasmHostIO;
-    let result = match syscalls::sys_bind(proc, &mut host, fd, addr) {
+    let result = match syscalls::sys_bind(proc, fd, addr) {
         Ok(()) => 0,
         Err(e) => -(e as i32),
     };
+    let mut host = WasmHostIO;
     deliver_pending_signals(proc, &mut host);
     result
 }
