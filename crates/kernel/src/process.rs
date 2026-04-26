@@ -94,6 +94,19 @@ pub trait HostIO {
     fn host_futex_wake(&mut self, addr: usize, count: u32) -> Result<i32, Errno>;
     /// Clone: spawn a new thread worker. Returns child TID on success.
     fn host_clone(&mut self, fn_ptr: usize, arg: usize, stack_ptr: usize, tls_ptr: usize, ctid_ptr: usize) -> Result<i32, Errno>;
+    /// Notify the host that process `pid` has mapped its `/dev/fb0`
+    /// framebuffer at `[addr, addr+len)` within its wasm `Memory`. The host
+    /// should mirror that byte range to whatever display surface it owns.
+    /// `fmt` is reserved for future format negotiation; currently always
+    /// BGRA32 (0).
+    fn bind_framebuffer(
+        &mut self, pid: i32, addr: usize, len: usize,
+        w: u32, h: u32, stride: u32, fmt: u32,
+    );
+    /// Notify the host that the framebuffer for `pid` is gone (`munmap`,
+    /// process exit, or exec). Idempotent: calling unbind on a pid with no
+    /// binding is a no-op.
+    fn unbind_framebuffer(&mut self, pid: i32);
 }
 
 /// Process lifecycle state.
@@ -101,6 +114,24 @@ pub trait HostIO {
 pub enum ProcessState {
     Running,
     Exited,
+}
+
+/// Per-process binding tracking the live mmap of `/dev/fb0`.
+///
+/// The pixel buffer lives inside the process's wasm `Memory`. The host
+/// reads it directly via a typed-array view over the same SharedArrayBuffer.
+#[derive(Debug, Clone, Copy)]
+pub struct FbBinding {
+    /// Offset within the process's wasm `Memory` where the pixel buffer
+    /// starts. Address-style usize so it survives wasm32 / wasm64.
+    pub addr: usize,
+    /// Length in bytes (`smem_len`).
+    pub len: usize,
+    pub w: u32,
+    pub h: u32,
+    pub stride: u32,
+    /// Pixel format tag (reserved; currently always 0 = BGRA32).
+    pub fmt: u32,
 }
 
 /// Per-thread state within a process.
@@ -285,6 +316,9 @@ pub struct Process {
     pub procfs_bufs: Vec<Option<Vec<u8>>>,
     /// True if this process has called exec (for POSIX setpgid EACCES check).
     pub has_exec: bool,
+    /// Live mmap of `/dev/fb0`, if any. `Some` between successful
+    /// `mmap` and the matching `munmap`/process-exit/exec.
+    pub fb_binding: Option<FbBinding>,
 }
 
 impl Process {
@@ -363,6 +397,7 @@ impl Process {
             memfds: Vec::new(),
             procfs_bufs: Vec::new(),
             has_exec: false,
+            fb_binding: None,
         }
     }
 

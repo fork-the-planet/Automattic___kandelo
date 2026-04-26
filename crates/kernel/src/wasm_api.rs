@@ -91,6 +91,11 @@ unsafe extern "C" {
     fn host_futex_wake(addr: usize, count: u32) -> i32;
     fn host_clone(fn_ptr: usize, arg: usize, stack_ptr: usize, tls_ptr: usize, ctid_ptr: usize) -> i32;
     fn host_is_thread_worker() -> i32;
+    fn host_bind_framebuffer(
+        pid: i32, addr: usize, len: usize,
+        w: u32, h: u32, stride: u32, fmt: u32,
+    );
+    fn host_unbind_framebuffer(pid: i32);
 }
 
 // ---------------------------------------------------------------------------
@@ -575,6 +580,17 @@ impl HostIO for WasmHostIO {
             Ok(result)
         }
     }
+
+    fn bind_framebuffer(
+        &mut self, pid: i32, addr: usize, len: usize,
+        w: u32, h: u32, stride: u32, fmt: u32,
+    ) {
+        unsafe { host_bind_framebuffer(pid, addr, len, w, h, stride, fmt) }
+    }
+
+    fn unbind_framebuffer(&mut self, pid: i32) {
+        unsafe { host_unbind_framebuffer(pid) }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1007,9 +1023,21 @@ pub extern "C" fn kernel_set_stdin_pipe(pid: u32) -> i32 {
 /// Returns 0 on success, -ESRCH if pid not found.
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_remove_process(pid: u32) -> i32 {
+    use core::sync::atomic::Ordering;
     let table = unsafe { &mut *PROCESS_TABLE.0.get() };
     match table.remove_process(pid) {
-        Some(_) => 0,
+        Some(removed) => {
+            // /dev/fb0 cleanup: if the exiting process held a live mmap,
+            // tell the host to drop the canvas binding before the
+            // process Memory disappears. Then release the global owner
+            // claim — best-effort CAS makes this idempotent.
+            if removed.fb_binding.is_some() {
+                unsafe { host_unbind_framebuffer(pid as i32) };
+            }
+            let _ = crate::process_table::FB0_OWNER
+                .compare_exchange(pid as i32, -1, Ordering::SeqCst, Ordering::SeqCst);
+            0
+        }
         None => -(Errno::ESRCH as i32),
     }
 }
@@ -5563,7 +5591,8 @@ pub extern "C" fn kernel_getrandom(buf_ptr: *mut u8, buf_len: u32, _flags: u32) 
 pub extern "C" fn kernel_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset_lo: u32, offset_hi: i32) -> usize {
     let (_gkl, proc) = unsafe { get_process() };
     let offset = ((offset_hi as i64) << 32) | (offset_lo as u64 as i64);
-    let result = match syscalls::sys_mmap(proc, addr, len, prot, flags, fd, offset) {
+    let mut host = WasmHostIO;
+    let result = match syscalls::sys_mmap(proc, &mut host, addr, len, prot, flags, fd, offset) {
         Ok(a) => a,
         Err(_) => wasm_posix_shared::mmap::MAP_FAILED,
     };
@@ -5575,7 +5604,6 @@ pub extern "C" fn kernel_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd
         ensure_memory_covers(end);
     }
 
-    let mut host = WasmHostIO;
     deliver_pending_signals(proc, &mut host);
     result
 }
@@ -5584,11 +5612,11 @@ pub extern "C" fn kernel_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_munmap(addr: usize, len: usize) -> i32 {
     let (_gkl, proc) = unsafe { get_process() };
-    let result = match syscalls::sys_munmap(proc, addr, len) {
+    let mut host = WasmHostIO;
+    let result = match syscalls::sys_munmap(proc, &mut host, addr, len) {
         Ok(()) => 0,
         Err(e) => -(e as i32),
     };
-    let mut host = WasmHostIO;
     deliver_pending_signals(proc, &mut host);
     result
 }
