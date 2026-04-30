@@ -20,6 +20,11 @@
 #                 the current manifest.
 #   --offline     Fail if an object isn't already in objects/ rather
 #                 than hitting the network.
+#   --pr <N>      Force PR overlay from pr-<N>-staging. Without this
+#                 flag, the script auto-detects the PR via the public
+#                 api.github.com /commits/{sha}/pulls endpoint when the
+#                 current HEAD belongs to an open PR. Skipped when
+#                 binaries.lock.pr already exists locally.
 #
 # Exit codes:
 #   0  success
@@ -34,13 +39,15 @@ cd "$REPO_ROOT"
 FORCE=0
 PRUNE=0
 OFFLINE=0
+PR_NUMBER=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --force)   FORCE=1; shift ;;
         --prune)   PRUNE=1; shift ;;
         --offline) OFFLINE=1; shift ;;
+        --pr)      PR_NUMBER="$2"; shift 2 ;;
         -h|--help)
-            sed -n '3,30p' "$0"
+            sed -n '3,32p' "$0"
             exit 0
             ;;
         *) echo "unknown arg $1" >&2; exit 2 ;;
@@ -70,6 +77,106 @@ OBJ_DIR="$BIN_DIR/objects"
 mkdir -p "$OBJ_DIR"
 
 echo "fetch-binaries: release=$LOCK_TAG abi=$LOCK_ABI"
+
+# --- Optional overlay (PR staging) ---------------------------------------
+# When binaries.lock.pr exists at the repo root, fetch-binaries splits
+# archive installation into two passes: durable entries minus overrides,
+# and staging-release entries for overrides only. See
+# docs/plans/2026-04-29-pr-package-builds-design.md §3.
+OVERLAY_FILE="$REPO_ROOT/binaries.lock.pr"
+OVERLAY_TAG=""
+OVERLAY_MANIFEST_SHA=""
+OVERLAY_OVERRIDES_JSON="[]"
+OVERLAY_REL_BASE=""
+OVERLAY_MANIFEST_OBJ=""
+
+# --- PR auto-detect + overlay download -----------------------------------
+# When --pr <N> is not given and no binaries.lock.pr is on disk, query
+# the public GitHub API to find the PR (if any) for the current HEAD.
+OWNER_REPO=""
+auto_detect_pr() {
+    # Echoes PR number on stdout, or empty if not found.
+    # Sets OWNER_REPO as a side effect.
+    local origin head_sha pulls_json pr_num
+    origin=$(git -C "$REPO_ROOT" config --get remote.origin.url 2>/dev/null) || return 0
+    head_sha=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null) || return 0
+    case "$origin" in
+        git@github.com:*)        OWNER_REPO="${origin#git@github.com:}";   OWNER_REPO="${OWNER_REPO%.git}" ;;
+        https://github.com/*)    OWNER_REPO="${origin#https://github.com/}"; OWNER_REPO="${OWNER_REPO%.git}" ;;
+        *) return 0 ;;
+    esac
+    [ -z "$OWNER_REPO" ] && return 0
+    case "$OWNER_REPO" in */*) ;; *) OWNER_REPO=""; return 0 ;; esac
+
+    if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+        pulls_json=$(gh api "repos/$OWNER_REPO/commits/$head_sha/pulls" 2>/dev/null) || return 0
+    else
+        pulls_json=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$OWNER_REPO/commits/$head_sha/pulls" 2>/dev/null) || return 0
+    fi
+    pr_num=$(echo "$pulls_json" | jq -r '[.[] | select(.state=="open")][0].number // empty' 2>/dev/null)
+    echo "$pr_num"
+}
+
+if [ -z "$PR_NUMBER" ] && [ ! -f "$OVERLAY_FILE" ]; then
+    PR_NUMBER=$(auto_detect_pr || true)
+    [ -n "$PR_NUMBER" ] && echo "fetch-binaries: detected PR #$PR_NUMBER"
+fi
+
+if [ -n "$PR_NUMBER" ] && [ ! -f "$OVERLAY_FILE" ]; then
+    # Need OWNER_REPO populated. If --pr was passed explicitly without
+    # going through auto_detect_pr, derive it now from origin.
+    if [ -z "$OWNER_REPO" ]; then
+        origin_url=$(git -C "$REPO_ROOT" config --get remote.origin.url 2>/dev/null || true)
+        case "$origin_url" in
+            git@github.com:*)     OWNER_REPO="${origin_url#git@github.com:}";   OWNER_REPO="${OWNER_REPO%.git}" ;;
+            https://github.com/*) OWNER_REPO="${origin_url#https://github.com/}"; OWNER_REPO="${OWNER_REPO%.git}" ;;
+        esac
+    fi
+    if [ -n "$OWNER_REPO" ]; then
+        STAGING_TAG_GUESS="pr-${PR_NUMBER}-staging"
+        STAGING_BASE="https://github.com/$OWNER_REPO/releases/download/$STAGING_TAG_GUESS"
+        echo "fetch-binaries: downloading overlay from $STAGING_TAG_GUESS..."
+        # Prefer `gh release download` over curl for the overlay file:
+        # the release-asset CDN aggressively caches by URL path, so a
+        # maintainer-side re-publish (or a freshly-rebuilt staging
+        # release on a PR push) can be silently masked by curl. The
+        # GitHub API call that gh uses bypasses the CDN.
+        downloaded=0
+        if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+            if gh release download "$STAGING_TAG_GUESS" \
+                    --repo "$OWNER_REPO" \
+                    --pattern binaries.lock.pr \
+                    --output "$OVERLAY_FILE.partial" \
+                    --clobber >/dev/null 2>&1; then
+                mv "$OVERLAY_FILE.partial" "$OVERLAY_FILE"
+                downloaded=1
+            else
+                rm -f "$OVERLAY_FILE.partial"
+            fi
+        fi
+        if [ "$downloaded" = "0" ]; then
+            if curl -fsSL --retry 2 -o "$OVERLAY_FILE.partial" "$STAGING_BASE/binaries.lock.pr"; then
+                mv "$OVERLAY_FILE.partial" "$OVERLAY_FILE"
+            else
+                rm -f "$OVERLAY_FILE.partial"
+                echo "fetch-binaries: no overlay at $STAGING_TAG_GUESS (PR may not have a staging release yet); falling back to durable release"
+            fi
+        fi
+    fi
+fi
+
+if [ -f "$OVERLAY_FILE" ]; then
+    OVERLAY_TAG=$(jq -r .staging_tag "$OVERLAY_FILE")
+    OVERLAY_MANIFEST_SHA=$(jq -r .staging_manifest_sha256 "$OVERLAY_FILE")
+    OVERLAY_OVERRIDES_JSON=$(jq -c .overrides "$OVERLAY_FILE")
+    [ "$OVERLAY_TAG" = "null" ] && { echo "ERROR: overlay missing staging_tag" >&2; exit 1; }
+    [ "$OVERLAY_MANIFEST_SHA" = "null" ] && { echo "ERROR: overlay missing staging_manifest_sha256" >&2; exit 1; }
+    [ "$OVERLAY_OVERRIDES_JSON" = "null" ] && { echo "ERROR: overlay missing overrides" >&2; exit 1; }
+    OVERLAY_REL_BASE="https://github.com/brandonpayton/wasm-posix-kernel/releases/download/$OVERLAY_TAG"
+    echo "fetch-binaries: overlay tag=$OVERLAY_TAG ($(echo "$OVERLAY_OVERRIDES_JSON" | jq 'length') overrides)"
+fi
 
 # --- Helper: verify a file's sha256 ---------------------------------------
 verify_sha() {
@@ -189,6 +296,22 @@ fi
 # Cached alias for consumer introspection.
 place "$MANIFEST_OBJ" "manifest.json"
 
+# --- Step 1.25: overlay manifest (if any) --------------------------------
+# Fetch + verify the staging manifest the same way as the durable one.
+# Reuse ensure_object by temporarily swapping REL_BASE.
+if [ -n "$OVERLAY_TAG" ]; then
+    OVERLAY_MANIFEST_OBJ="$OBJ_DIR/$OVERLAY_MANIFEST_SHA.json"
+    REL_BASE_SAVE="$REL_BASE"
+    REL_BASE="$OVERLAY_REL_BASE"
+    ensure_object "manifest.json" "$OVERLAY_MANIFEST_SHA"
+    REL_BASE="$REL_BASE_SAVE"
+    overlay_abi=$(jq -r .abi_version "$OVERLAY_MANIFEST_OBJ")
+    if [ "$overlay_abi" != "$LOCK_ABI" ]; then
+        echo "ERROR: overlay manifest abi=$overlay_abi != lock abi=$LOCK_ABI" >&2
+        exit 1
+    fi
+fi
+
 # --- Step 1.5: install package-archive entries via xtask -----------
 # Each archive-style entry has archive_name + archive_sha256 +
 # compatibility; remote_fetch in xtask handles fetch + verify + install
@@ -212,11 +335,45 @@ if jq -e '.entries[] | select(.archive_name != null)' "$MANIFEST_OBJ" > /dev/nul
         echo "fetch-binaries: skipping archive install (offline mode)"
     else
         HOST_TARGET="$(rustc -vV | awk '/^host/ {print $2}')"
+
+        # Compute filtered manifests when an overlay is in play.
+        # Filter unit is (.program, .arch) — derived from the overlay
+        # manifest's actual entries. A staging build that produced
+        # only wasm32 archives for a given program leaves the wasm64
+        # archive coming from the durable release, rather than
+        # silently dropping it (which happened when overrides was a
+        # flat program-name list and we filtered both arches out).
+        DURABLE_MANIFEST="$MANIFEST_OBJ"
+        DURABLE_FILTERED=""
+        if [ -n "$OVERLAY_TAG" ]; then
+            DURABLE_FILTERED=$(mktemp -t fetch-binaries-durable.XXXXXX).json
+            # Build [{program, arch}, ...] set from overlay manifest.
+            OVERLAY_SET=$(jq -c '[.entries[] | {program, arch}]' "$OVERLAY_MANIFEST_OBJ")
+            jq --argjson set "$OVERLAY_SET" '
+                .entries |= map(select(
+                    . as $e
+                    | $set
+                    | any(.program == $e.program and .arch == $e.arch)
+                    | not
+                ))
+            ' "$MANIFEST_OBJ" > "$DURABLE_FILTERED"
+            DURABLE_MANIFEST="$DURABLE_FILTERED"
+        fi
+
         echo "fetch-binaries: installing archives via xtask install-release..."
         cargo run -p xtask --target "$HOST_TARGET" --quiet -- install-release \
-            --manifest "$MANIFEST_OBJ" \
+            --manifest "$DURABLE_MANIFEST" \
             --archive-base "$REL_BASE" \
             --binaries-dir "$BIN_DIR"
+
+        if [ -n "$OVERLAY_TAG" ]; then
+            echo "fetch-binaries: installing overlay archives from $OVERLAY_TAG..."
+            cargo run -p xtask --target "$HOST_TARGET" --quiet -- install-release \
+                --manifest "$OVERLAY_MANIFEST_OBJ" \
+                --archive-base "$OVERLAY_REL_BASE" \
+                --binaries-dir "$BIN_DIR"
+            rm -f "$DURABLE_FILTERED"
+        fi
     fi
 fi
 

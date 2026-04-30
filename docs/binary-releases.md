@@ -247,6 +247,18 @@ verification chain is documented in
 [`docs/package-management.md`](package-management.md)
 under "Release archives".
 
+### PR-staging overlay (`binaries.lock.pr`)
+
+When a PR's CI publishes per-PR archives to `pr-<NNN>-staging`, it
+also uploads a `binaries.lock.pr` overlay listing which packages
+were rebuilt. `scripts/fetch-binaries.sh` reads this file
+(gitignored, never committed) and merges it over `binaries.lock`:
+override entries are fetched from the staging release, the rest
+from the durable release. The overlay schema is
+`{ staging_tag, staging_manifest_sha256, overrides }` — see
+`docs/plans/2026-04-29-pr-package-builds-design.md` §3 for the
+full schema.
+
 ## Producing a release
 
 For now, manual. Eventually a GitHub Actions workflow
@@ -256,8 +268,12 @@ For now, manual. Eventually a GitHub Actions workflow
    (kernel via `bash build.sh`, programs via
    `scripts/build-programs.sh`, ported software via each
    `examples/libs/*/build-*.sh`).
-2. Run `bash scripts/stage-release.sh --out release-staging`. The
-   script handles both halves:
+2. Run `bash scripts/stage-release.sh --out release-staging --tag
+   binaries-abi-v<N>-YYYY-MM-DD`. The `--tag` is mandatory and must
+   match the GitHub release tag you intend to publish under — it is
+   baked into the manifest's `release_tag` field, which
+   `scripts/fetch-binaries.sh` compares to `binaries.lock` on the
+   consumer side. The script handles both halves:
    - legacy entries (kernel, userspace, hand-bundled test programs)
      are staged via `xtask bundle-program --plain-wasm`.
    - the system entries (every `kind=library` and `kind=program`
@@ -267,12 +283,144 @@ For now, manual. Eventually a GitHub Actions workflow
      needed, packs each cache tree into a `.tar.zst` archive
      under `release-staging/{libs,programs}/`, and emits the
      combined `manifest.json`.
-3. Run `bash scripts/publish-release.sh <DATE>` (or equivalent) to
-   create the GitHub release and upload every staged asset (flat
-   wasm, legacy zip bundles, and the system `.tar.zst` archives).
+3. Run `bash scripts/publish-release.sh --tag
+   binaries-abi-v<N>-YYYY-MM-DD --staging release-staging` to create
+   the GitHub release and upload every staged asset (flat wasm,
+   legacy zip bundles, and the system `.tar.zst` archives). The
+   script asserts the staged manifest's `release_tag` matches `--tag`
+   before uploading, so a stage/publish tag drift fails fast.
 4. Commit the generated manifest into `abi/manifest.json` as the
    repo's reference copy. Follow-up changes to `binaries.lock` pin
    consumers to this release.
 
 See `scripts/stage-release.sh` and `scripts/publish-release.sh`
 for the current scripts.
+
+## PR package builds
+
+Replaces the previous manual two-PR release flow (PR bumps a
+package + merges → maintainer manually runs stage/publish-release →
+second PR bumps `binaries.lock`) with a single-PR flow driven by
+three GitHub Actions workflows. Full design in
+[`docs/plans/2026-04-29-pr-package-builds-design.md`](plans/2026-04-29-pr-package-builds-design.md).
+
+### Workflows at a glance
+
+| Workflow | Trigger | What it does |
+|---|---|---|
+| `staging-build.yml` | Every push to a same-repo PR | Stages packages whose `cache_key_sha` differs from the durable release; uploads to `pr-<NNN>-staging` pre-release; posts sticky comment. |
+| `prepare-merge.yml` | `ready-to-ship` label applied | Builds against PR HEAD merged with tip-of-main; publishes a fresh `binaries-abi-v<N>-YYYY-MM-DD[-<seq>]` durable release; pushes lockfile bump to PR branch; enables squash auto-merge. |
+| `staging-cleanup.yml` | PR closed + daily 08:00 UTC cron + manual dispatch | Deletes `pr-<NNN>-staging` releases when their PR closes; daily sweep catches orphans. |
+
+### Author flow
+
+1. Edit `examples/libs/<name>/deps.toml` (bump version, swap source
+   URL/sha) and any associated build script. Other code/test changes
+   may go in the same PR.
+2. Locally: `cargo xtask build-deps build <name>` — resolver
+   source-builds the new version into the local cache. Tests pass.
+3. **Do not** touch `binaries.lock` or `binaries.lock.pr`.
+4. Open the PR. CI publishes the staging release automatically.
+
+### Reviewer flow
+
+1. Read PR diff: `deps.toml` + code/test changes only. No lockfile
+   churn.
+2. Read the sticky `pr-staging-build` comment for the list of
+   archives that were rebuilt.
+3. Optional, to exercise locally:
+   ```
+   gh pr checkout <N>
+   scripts/fetch-binaries.sh
+   ```
+   `fetch-binaries.sh` auto-detects the PR via the public GitHub API
+   and downloads `binaries.lock.pr` from the staging release;
+   override entries fetched from staging, the rest from the durable
+   release.
+4. Approve. Apply the `ready-to-ship` label.
+
+### After auto-merge
+
+`prepare-merge.yml` publishes the durable release, pushes a single
+`chore(binaries): bump lockfile to <new-tag>` commit to the PR
+branch, and enables squash auto-merge. The squash merge collapses
+code + `deps.toml` + lockfile bump into one main commit — main is
+never in a state where the lockfile disagrees with the `deps.toml`.
+
+### Overlay file lifecycle (`binaries.lock.pr`)
+
+Gitignored. Created by `staging-build.yml` and uploaded as an asset
+on the staging release. Downloaded on demand by `fetch-binaries.sh`
+when the local clone is checked out on a PR branch. Never committed.
+Schema is `{staging_tag, staging_manifest_sha256, overrides}` —
+overrides are package names, not archive filenames, so a version-
+string bump in a same-PR push doesn't invalidate the overlay.
+
+### Branch protection setup (one-time)
+
+When deploying these workflows for the first time, the maintainer
+must:
+
+- Create the `ready-to-ship` label:
+  ```
+  gh label create ready-to-ship --color 0E8A16 \
+    --description "Trigger prepare-merge.yml: build, publish durable release, push lockfile bump, auto-merge."
+  ```
+- Allow `github-actions[bot]` to push to PR branches via repository
+  permissions. The lockfile bump pushes to PR branches, not main.
+- **Require the `merge-gate` status check on `main`** in branch
+  protection. `prepare-merge.yml` posts `merge-gate=success` on the
+  lockfile-bump commit only after a fresh durable release has been
+  published. Without this required check, PRs could be merged
+  without ever cutting a fresh durable release — the lockfile on
+  main would be a step behind whatever `deps.toml` says. Admins
+  retain bypass via the standard branch-protection override (or
+  "Allow specified actors to bypass required pull requests").
+
+  To configure via the GitHub UI: Settings → Branches → branch
+  protection rule for `main` → "Require status checks to pass" →
+  add `merge-gate`.
+
+  To configure via the API (idempotent):
+  ```
+  gh api --method PUT \
+    -H "Accept: application/vnd.github+json" \
+    "/repos/<owner>/<repo>/branches/main/protection/required_status_checks" \
+    -f strict=true \
+    -F 'contexts[]=merge-gate'
+  ```
+
+### Fork PRs
+
+Not supported in v1 — they fall back to the resolver's source-build
+path locally. Two-stage `workflow_run` support is documented as
+future work in §9.1 of the design doc.
+
+### Post-upload integrity check
+
+Both `scripts/publish-release.sh` and `scripts/publish-pr-staging.sh`
+run `scripts/verify-release.sh --tag <tag>` after the upload step. The
+check downloads every archive listed in `manifest.json` and confirms
+its bytes hash to the manifest's `archive_sha256`. Catches drift
+between manifest entries and the actual asset bytes — the kind of
+inconsistency that bit `binaries-abi-v6-2026-04-29` (manifest
+re-uploaded with new shas while archive bytes stayed old, surfaced as
+`./run.sh browser` failures days later).
+
+`verify-release.sh` is also runnable standalone for diagnosing an
+existing release:
+
+```
+scripts/verify-release.sh --tag binaries-abi-v6-2026-04-29
+```
+
+### Reproducible toolchain via Nix
+
+`staging-build.yml` and `prepare-merge.yml` install Nix on the
+runner and execute every build/stage step via `nix develop --command`
+against the repo's `flake.nix`. The flake pins LLVM 21, the Rust
+toolchain (per `rust-toolchain.toml`), Node 22, and Erlang 28, so
+runner-host drift can't leak into archive bytes — the same
+`cache_key_sha` reproduces across CI and contributor laptops that
+also use `nix develop`. Cache hits across workflow runs come from
+`DeterminateSystems/magic-nix-cache-action`.
