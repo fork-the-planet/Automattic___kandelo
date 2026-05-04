@@ -118,7 +118,7 @@ has_zip()    { has_resolvable programs/zip.wasm || [ -f "$REPO_ROOT/examples/lib
 has_unzip()    { has_resolvable programs/unzip.wasm || [ -f "$REPO_ROOT/examples/libs/unzip/bin/unzip.wasm" ]; }
 has_nano()    { has_resolvable programs/nano.wasm || [ -f "$REPO_ROOT/examples/libs/nano/bin/nano.wasm" ]; }
 has_nethack()    { has_resolvable programs/nethack.wasm || [ -f "$REPO_ROOT/examples/libs/nethack/bin/nethack.wasm" ]; }
-has_fbdoom()    { has_resolvable programs/fbdoom.wasm || [ -f "$REPO_ROOT/examples/libs/fbdoom/fbdoom.wasm" ]; }
+has_fbdoom()    { has_resolvable programs/fbdoom/fbdoom.wasm || { [ -f "$REPO_ROOT/examples/libs/fbdoom/fbdoom.wasm" ] && [ -f "$REPO_ROOT/examples/libs/fbdoom/doom1.wad" ]; }; }
 has_ncurses()   { [ -f "$REPO_ROOT/sysroot/lib/libncursesw.a" ]; }
 has_zlib()      { [ -f "$REPO_ROOT/sysroot/lib/libz.a" ]; }
 has_openssl()   { [ -f "$REPO_ROOT/sysroot/lib/libssl.a" ] && [ -f "$REPO_ROOT/sysroot/lib/libcrypto.a" ]; }
@@ -167,6 +167,10 @@ need_sysroot() {
         bash "$REPO_ROOT/scripts/build-musl.sh"
         info "Sysroot built"
     else
+        # Re-sync overlay headers into the existing sysroot. Cheap (just a
+        # few cp) and ensures newly-added musl-overlay/include/ files reach
+        # an existing sysroot without forcing a full musl rebuild.
+        bash "$REPO_ROOT/scripts/install-overlay-headers.sh" "$REPO_ROOT/sysroot"
         info "Sysroot"
     fi
 }
@@ -177,6 +181,7 @@ need_sysroot64() {
         bash "$REPO_ROOT/scripts/build-musl.sh" --arch wasm64posix
         info "Sysroot64 built"
     else
+        bash "$REPO_ROOT/scripts/install-overlay-headers.sh" "$REPO_ROOT/sysroot64"
         info "Sysroot64"
     fi
 }
@@ -1528,9 +1533,13 @@ clean_target() {
                   "$REPO_ROOT/examples/browser/public/shell.vfs"
             warn "Cleaned NetHack (also invalidated nethack.zip and shell.vfs; run '$0 build shell-vfs' to regenerate for browser demo)" ;;
         fbdoom)
-            rm -rf "$REPO_ROOT/examples/libs/fbdoom/fbdoom-src"
+            rm -rf "$REPO_ROOT/examples/libs/fbdoom/fbdoom-src" \
+                   "$REPO_ROOT/local-binaries/programs/wasm32/fbdoom"
             rm -f "$REPO_ROOT/examples/libs/fbdoom/fbdoom.wasm" \
-                  "$REPO_ROOT/local-binaries/programs/fbdoom.wasm"
+                  "$REPO_ROOT/examples/libs/fbdoom/doom1.wad" \
+                  "$REPO_ROOT/examples/libs/fbdoom/COPYING.txt" \
+                  "$REPO_ROOT/examples/libs/fbdoom/CREDITS.txt" \
+                  "$REPO_ROOT/examples/libs/fbdoom/CREDITS-MUSIC.txt"
             warn "Cleaned fbDOOM" ;;
         ncurses)
             rm -rf "$REPO_ROOT/examples/libs/ncurses/ncurses-src"
