@@ -1990,6 +1990,31 @@ export class CentralizedKernelWorker {
     const handleChannel = this.kernelInstance!.exports.kernel_handle_channel as (offset: bigint, pid: number) => number;
     this.currentHandlePid = channel.pid;
     this.bindKernelTidForChannel(channel);
+    // DIAGNOSTIC: globalThis.__sysprof aggregates per-(pid,syscall_nr)
+    // timing across kernel_handle_channel calls so we can dump a profile
+    // afterward (via globalThis.__sysprofDump()). Off by default — flip on
+    // from the demo page right before the slow operation, off after.
+    // Also tracks wall-clock gap since *this* pid's previous syscall — that
+    // gap is the time the pid spent in user wasm code, the actual perf
+    // bottleneck when kernel-side handling itself is fast.
+    const sysprof = (globalThis as { __sysprof?: boolean }).__sysprof;
+    const sysprofStart = sysprof ? performance.now() : 0;
+    if (sysprof) {
+      type GapRow = { count: number; gapTotalMs: number; gapMaxMs: number };
+      const g = globalThis as { __sysprofGap?: Map<number, GapRow>; __sysprofLastSeen?: Map<number, number> };
+      if (!g.__sysprofGap) g.__sysprofGap = new Map();
+      if (!g.__sysprofLastSeen) g.__sysprofLastSeen = new Map();
+      const last = g.__sysprofLastSeen.get(channel.pid);
+      if (last !== undefined) {
+        const gap = sysprofStart - last;
+        let row = g.__sysprofGap.get(channel.pid);
+        if (!row) { row = { count: 0, gapTotalMs: 0, gapMaxMs: 0 }; g.__sysprofGap.set(channel.pid, row); }
+        row.count++;
+        row.gapTotalMs += gap;
+        if (gap > row.gapMaxMs) row.gapMaxMs = gap;
+      }
+      g.__sysprofLastSeen.set(channel.pid, sysprofStart);
+    }
     try {
       handleChannel(BigInt(this.scratchOffset), channel.pid);
     } catch (err) {
@@ -2002,6 +2027,21 @@ export class CentralizedKernelWorker {
       return;
     } finally {
       this.currentHandlePid = 0;
+      if (sysprof) {
+        const elapsed = performance.now() - sysprofStart;
+        type ProfRow = { count: number; totalMs: number; maxMs: number };
+        const g = globalThis as { __sysprofTable?: Map<string, ProfRow> };
+        if (!g.__sysprofTable) g.__sysprofTable = new Map();
+        const key = `${channel.pid}:${syscallNr}`;
+        let row = g.__sysprofTable.get(key);
+        if (!row) { row = { count: 0, totalMs: 0, maxMs: 0 }; g.__sysprofTable.set(key, row); }
+        row.count++;
+        row.totalMs += elapsed;
+        if (elapsed > row.maxMs) row.maxMs = elapsed;
+        if (elapsed > 50) {
+          console.warn(`[sysprof] slow pid=${channel.pid} nr=${syscallNr} ${elapsed.toFixed(1)}ms args=[${origArgs.join(',')}]`);
+        }
+      }
     }
 
     // Read return value and errno from kernel scratch
@@ -2507,6 +2547,70 @@ export class CentralizedKernelWorker {
         this.retrySyscall(entry.channel);
       }
     }
+  }
+
+  /**
+   * Public wake helper for host-side pipe writes (TCP bridges, HTTP
+   * bridges, etc.). Call this AFTER directly writing into a pipe via
+   * `kernel_pipe_write` or `kernel_inject_connection`.
+   *
+   * In order:
+   *   1. Wake any process blocked in read/recv on this pipe
+   *      (`pendingPipeReaders`).
+   *   2. Wake any process blocked in poll/ppoll/pselect6 whose
+   *      `pipeIndices` includes this pipe (`pendingPollRetries`).
+   *      Pass `pidFilter` to restrict the wake to a single owning
+   *      pid — used by the Node TCP bridge when dispatching an
+   *      inbound connection to a specific listener.
+   *   3. Schedule a broad wake (`scheduleWakeBlockedRetries`) for
+   *      everything else.
+   *
+   * Without step 2, blocked pollers wait for the fallback timer in
+   * `handleBlockingRetry` to fire, which is the bug behind PR fixing
+   * the WordPress LAMP demo's slow install.php (see commit history).
+   */
+  public notifyPipeReadable(pipeIdx: number, pidFilter?: number): void {
+    // 1. Blocked readers
+    const readers = this.pendingPipeReaders.get(pipeIdx);
+    if (readers && readers.length > 0) {
+      this.pendingPipeReaders.delete(pipeIdx);
+      for (const reader of readers) {
+        if (this.processes.has(reader.pid)) {
+          this.retrySyscall(reader.channel);
+        }
+      }
+    }
+    // 2. Blocked pollers watching this pipe
+    for (const [key, entry] of this.pendingPollRetries) {
+      if (pidFilter !== undefined && entry.channel.pid !== pidFilter) continue;
+      if (!entry.pipeIndices.includes(pipeIdx)) continue;
+      if (entry.timer !== null) clearTimeout(entry.timer);
+      this.pendingPollRetries.delete(key);
+      if (this.processes.has(entry.channel.pid)) {
+        this.retrySyscall(entry.channel);
+      }
+    }
+    // 3. Broad wake for any other pending retries
+    this.scheduleWakeBlockedRetries();
+  }
+
+  /**
+   * Public wake helper for host-side pipe reads (response pump in
+   * the TCP/HTTP bridges). Call this AFTER directly reading data
+   * from a pipe so any process blocked writing because the pipe was
+   * full can resume, plus a broad wake.
+   */
+  public notifyPipeWritable(pipeIdx: number): void {
+    const writers = this.pendingPipeWriters.get(pipeIdx);
+    if (writers && writers.length > 0) {
+      this.pendingPipeWriters.delete(pipeIdx);
+      for (const writer of writers) {
+        if (this.processes.has(writer.pid)) {
+          this.retrySyscall(writer.channel);
+        }
+      }
+    }
+    this.scheduleWakeBlockedRetries();
   }
 
   /** Cancel all pending poll retries for a given pid (used during cleanup) */
@@ -3070,8 +3174,21 @@ export class CentralizedKernelWorker {
       // use moderate fallback for cases where the targeted wake misses
       // (e.g., listener socket backlogs which lack pipe indices for
       // wakeBlockedPoll). Without pipe indices, use short retry.
+      // The intended wakeup path is event-driven:
+      // drainAndProcessWakeupEvents → scheduleWakeBlockedRetries
+      // (setImmediate) retries the poll when any of its watched pipes
+      // changes state. The timer is a fallback. Empirically the
+      // 200 ms safety net was sleeping past wakeups in the browser
+      // worker (WordPress install.php measured 28 s with 200 ms,
+      // 1.9 s with 10 ms — a 14× difference far in excess of what
+      // 5 fallback fires can explain, suggesting setImmediate-based
+      // broad wakes occasionally lose against the timer in the
+      // browser's MessageChannel polyfill). 10 ms matches the default
+      // for read-like / write-like blocking retries (lines ~3320,
+      // ~3827, ~3953). Listener-socket cases without pipe indices
+      // continue to use 50 ms.
       const retryMs = pipeIndices.length > 0
-        ? (deadline > 0 ? Math.min(deadline - Date.now(), 200) : 200)
+        ? (deadline > 0 ? Math.min(deadline - Date.now(), 10) : 10)
         : (deadline > 0 ? Math.min(deadline - Date.now(), 50) : 50);
       const timer = setTimeout(retryFn, Math.max(retryMs, 1));
       this.pendingPollRetries.set(channel.channelOffset, { timer, channel, pipeIndices, needsSignalSafeWake });
@@ -6586,19 +6703,11 @@ export class CentralizedKernelWorker {
       inboundQueue.push(chunk);
       if (!this.processes.has(pid)) { cleanup(); return; }
       drainInbound();
-      // Wake any process blocked on poll/pselect6 watching this recv pipe
-      this.wakeBlockedPoll(pid, recvPipeIdx);
-      // Wake any process blocked on read/recv for this pipe
-      const readers = this.pendingPipeReaders.get(recvPipeIdx);
-      if (readers && readers.length > 0) {
-        this.pendingPipeReaders.delete(recvPipeIdx);
-        for (const reader of readers) {
-          if (this.processes.has(reader.pid)) {
-            this.retrySyscall(reader.channel);
-          }
-        }
-      }
-      this.scheduleWakeBlockedRetries();
+      // Wake readers + pollers watching this recv pipe + broad wake.
+      // The pid filter limits the targeted poll wake to this listener
+      // pid (the recvPipeIdx is per-connection so any matching poller
+      // is necessarily owned by this pid; the filter is defensive).
+      this.notifyPipeReadable(recvPipeIdx, pid);
       // Schedule pump to handle outbound + close detection
       schedulePump();
     });
