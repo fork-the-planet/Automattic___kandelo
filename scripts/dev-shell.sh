@@ -61,6 +61,19 @@ exec nix develop \
     --keep GITHUB_SHA \
     --keep GITHUB_RUN_ID \
     --keep GITHUB_ACTIONS \
+    --keep GITHUB_OUTPUT \
+    --keep GITHUB_ENV \
+    --keep GITHUB_PATH \
+    --keep GITHUB_STEP_SUMMARY \
+    --keep GITHUB_WORKSPACE \
+    --keep GITHUB_EVENT_NAME \
+    --keep GITHUB_EVENT_PATH \
+    --keep RUNNER_TEMP \
+    --keep RUNNER_OS \
+    --keep RUNNER_ARCH \
+    --keep RUNNER_TOOL_CACHE \
+    --keep RUNNER_NAME \
+    --keep RUNNER_DEBUG \
     --keep WASM_POSIX_DEP_TARGET_ARCH \
     --keep WASM_POSIX_DEP_OUT_DIR \
     --keep WASM_POSIX_DEP_NAME \

@@ -381,3 +381,823 @@ jobs:
             -f context=merge-gate \
             -f description="Tests green. Apply the ready-to-ship label to build the durable release and merge." \
             -f target_url="https://github.com/${{ github.repository }}/blob/main/docs/plans/2026-04-29-pr-package-builds-design.md"
+
+  # ---------------------------------------------------------------------
+  # Phase B-1 — decoupled package builds (additive)
+  #
+  # The two jobs below run in parallel with the legacy `build` job
+  # above. They implement the new per-package matrix flow described in
+  # docs/plans/2026-05-05-decoupled-package-builds-design.md. Phase
+  # B-1 is intentionally additive — the legacy job stays in place
+  # until Phase B-2 / C retires it after the new flow is proven.
+  #
+  # Task 2 ships the SCAFFOLDING (preflight + matrix-build stub).
+  # Task 3 (this commit) adds the `toolchain-cache` job: a one-shot
+  # build of the wasm32 + wasm64 musl sysroot + libc++ headers, cached
+  # under the same content-addressed key the legacy `build` job above
+  # uses. The new key is shared, so a hit on either side warms both;
+  # `matrix-build` now restores from this layer instead of rebuilding
+  # the toolchain N times across matrix entries.
+  #
+  # Tasks 4-7 fill in the real build, test gate, per-file uploads, and
+  # index.toml generation.
+  # ---------------------------------------------------------------------
+
+  preflight:
+    # Fork-PR support is deferred (design doc §9.1). Same gate as the
+    # legacy `build` job above keeps fork PRs from hitting a no-token
+    # `gh release view` failure inside the matrix-compute step.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read           # gh release view (target tag probe)
+    outputs:
+      matrix: ${{ steps.compute.outputs.matrix }}
+      abi: ${{ steps.compute.outputs.abi }}
+      target_tag: ${{ steps.compute.outputs.target_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Fetch musl submodule
+        # compute-cache-key-sha walks the package's source/build inputs
+        # to derive a deterministic hash. It does NOT need libc-test or
+        # os-test (those are test inputs, not build inputs). musl is
+        # pulled in case any package's [build] dependency chain reaches
+        # into the sysroot recipe.
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git submodule update --init --depth 1 musl
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v18
+
+      - name: Cache Nix store + flake eval
+        uses: DeterminateSystems/magic-nix-cache-action@v13
+
+      - name: Warm Nix dev shell
+        run: bash scripts/dev-shell.sh true
+
+      - name: Cache xtask build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: preflight-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'xtask/**') }}
+          restore-keys: |
+            preflight-${{ runner.os }}-
+
+      - name: Build xtask
+        run: |
+          bash scripts/dev-shell.sh bash -c '
+            HOST_TARGET=$(rustc -vV | awk "/^host/ {print \$2}")
+            cargo build --release -p xtask --target "$HOST_TARGET"
+          '
+
+      - name: Compute matrix
+        id: compute
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash scripts/dev-shell.sh bash -c '
+            set -euo pipefail
+
+            ABI=$(grep -oE "ABI_VERSION: u32 = [0-9]+" crates/shared/src/lib.rs | awk "{print \$4}")
+            echo "abi=$ABI" >> "$GITHUB_OUTPUT"
+
+            # Target tag: pr-<NNN>-staging on PR runs, binaries-abi-v<N>
+            # otherwise. Phase B-2 Task 10 formally flips the active
+            # publish target to the undated tag; the new matrix flow can
+            # already target it because it runs in parallel with the
+            # legacy job and any duplicate work is idempotent (D3
+            # content-hash gating below).
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              TARGET_TAG="pr-${{ github.event.pull_request.number }}-staging"
+            else
+              TARGET_TAG="binaries-abi-v${ABI}"
+            fi
+            echo "target_tag=$TARGET_TAG" >> "$GITHUB_OUTPUT"
+
+            # One-shot fetch of existing release assets for fast lookup.
+            # Falls back to empty list if the release doesn'"'"'t exist
+            # yet (new ABI, new PR) — that just means everything in the
+            # matrix needs to build.
+            existing_assets=$(gh release view "$TARGET_TAG" --repo "${{ github.repository }}" --json assets --jq "[.assets[].name]" 2>/dev/null || echo "[]")
+            echo "existing-assets:"
+            echo "$existing_assets" | jq -r ".[]" | head -20
+            echo "..."
+
+            HOST_TARGET=$(rustc -vV | awk "/^host/ {print \$2}")
+            matrix="[]"
+
+            for pkg_dir in examples/libs/*/; do
+              pkg=$(basename "$pkg_dir")
+              # Filter: package must have a [build] block. Today this
+              # selects the 10 first-party recipes that own a build
+              # script (dinit, lamp, mariadb-test, mariadb-vfs, nginx,
+              # erlang-vfs, perl-vfs, python-vfs, shell, wordpress) and
+              # naturally excludes kernel/userspace/examples/node and
+              # *-source packages. The decoupled-package-builds design
+              # plans to make [build] required for first-party programs
+              # in a follow-up; this loop will then expand to the full
+              # set without a workflow change.
+              if ! grep -q "^\[build\]" "$pkg_dir/package.toml"; then
+                continue
+              fi
+
+              # Per-package arches from package.toml'"'"'s top-level
+              # `arches = [...]` field (default `["wasm32"]` when
+              # absent). Mirrors the filter in
+              # xtask/src/stage_release.rs:216, which skips archives
+              # whose arch isn'"'"'t in the manifest'"'"'s target_arches
+              # (parsed in xtask/src/pkg_manifest.rs around line 540).
+              # Iterating only declared arches here avoids spawning
+              # matrix entries the staging step would silently drop.
+              # Assumes the single-line form `arches = ["a", "b"]`;
+              # all current package.toml files use that shape.
+              arches=$(awk -F'"'"'[][]'"'"' '"'"'/^arches *=/ {print $2}'"'"' "$pkg_dir/package.toml" | tr -d '"'"' "'"'"' | tr '"'"','"'"' '"'"' '"'"')
+              arches=${arches:-wasm32}
+              for arch in $arches; do
+                sha=$(cargo run --release -p xtask --target "$HOST_TARGET" --quiet -- \
+                  compute-cache-key-sha --package "$pkg_dir" --arch "$arch" 2>/dev/null) || {
+                  echo "preflight: skipping $pkg/$arch (compute-cache-key-sha failed)" >&2
+                  continue
+                }
+                short=${sha:0:8}
+                # Archive filename: <name>-<version>-rev<N>-abi<N>-<arch>-<short8>.tar.zst.
+                # Version + revision live in package.toml and we donʼt
+                # need them here — startswith($prefix) + endswith($suffix)
+                # uniquely identifies the (pkg, arch, sha) triple in the
+                # release assets.
+                prefix="${pkg}-"
+                suffix="-abi${ABI}-${arch}-${short}.tar.zst"
+                if echo "$existing_assets" | jq -e --arg pre "$prefix" --arg suf "$suffix" \
+                    "any(.[]; startswith(\$pre) and endswith(\$suf))" >/dev/null; then
+                  echo "preflight: skip $pkg/$arch (sha $short already published)"
+                else
+                  matrix=$(echo "$matrix" | jq -c --arg pkg "$pkg" --arg arch "$arch" --arg sha "$sha" \
+                    ". + [{\"package\": \$pkg, \"arch\": \$arch, \"sha\": \$sha}]")
+                fi
+              done
+            done
+
+            echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+            echo "preflight: $(echo "$matrix" | jq "length") entries to build"
+            echo "$matrix" | jq .
+          '
+
+  toolchain-cache:
+    # Same fork-PR gate as preflight + the legacy `build` job. Fork PRs
+    # see this job as Skipped, consistent with current behavior.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    outputs:
+      # Exposed so matrix-build can restore the same cache layer. Using
+      # the same `musl-sysroot-v3-...` key shape as the legacy `build`
+      # job means a cache populated by either job warms the other.
+      cache-key: ${{ steps.key.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Fetch musl submodule
+        # build-musl.sh + build-libcxx.sh consume musl/ directly. The
+        # other submodules (libc-test, os-test) are test inputs and not
+        # needed here.
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git submodule update --init --depth 1 musl
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v18
+
+      - name: Cache Nix store + flake eval
+        uses: DeterminateSystems/magic-nix-cache-action@v13
+
+      - name: Compute cache key
+        # Mirrors the key in the legacy `build` job (and prepare-merge)
+        # exactly so all three caches alias. hashFiles() over the inputs
+        # that affect the produced sysroot:
+        #   - scripts/build-musl.sh, scripts/build-libcxx.sh: the build
+        #     recipes themselves
+        #   - musl-overlay/**: source patches/overrides applied on top of
+        #     the musl submodule
+        #   - glue/**: channel_syscall.c + headers compiled into libc.a
+        # The libc++ __config_site sed patch lives inline in this
+        # workflow file's Build step — any change to it forces a fresh
+        # workflow file SHA, which means the matrix re-evaluates from
+        # scratch and the cache miss is observed naturally.
+        id: key
+        run: |
+          KEY="musl-sysroot-v3-${{ runner.os }}-${{ hashFiles('scripts/build-musl.sh', 'scripts/build-libcxx.sh', 'musl-overlay/**', 'glue/**') }}"
+          echo "value=$KEY" >> "$GITHUB_OUTPUT"
+          echo "toolchain-cache key: $KEY"
+
+      - name: Cache musl sysroot + libc++
+        uses: actions/cache@v4
+        id: cache
+        with:
+          path: |
+            sysroot
+            sysroot64
+          key: ${{ steps.key.outputs.value }}
+
+      - name: Build sysroots if cache miss
+        if: steps.cache.outputs.cache-hit != 'true'
+        # Verbatim from the legacy `build` job (and prepare-merge.yml)
+        # so a cache populated here is byte-identical to what the
+        # legacy path would produce. See those files for the rationale
+        # behind the libc++ header copy + __config_site sed patch.
+        run: |
+          bash scripts/dev-shell.sh bash scripts/build-musl.sh
+          bash scripts/dev-shell.sh bash scripts/build-musl.sh --arch wasm64posix
+          bash scripts/dev-shell.sh bash -c '
+            src=""
+            for cand in "$LLVM_PREFIX/include/c++/v1" "$LLVM_PREFIX/share/libc++/v1"; do
+              if [ -f "$cand/__config" ] || [ -f "$cand/iostream" ]; then
+                src="$cand"; break
+              fi
+            done
+            if [ -z "$src" ]; then
+              echo "ERROR: cant locate libc++ headers under $LLVM_PREFIX" >&2
+              exit 1
+            fi
+            echo "installing libc++ headers from $src"
+            for arch_dir in sysroot sysroot64; do
+              if [ ! -f "$arch_dir/include/c++/v1/__config" ]; then
+                mkdir -p "$arch_dir/include/c++/v1"
+                cp -RL "$src"/* "$arch_dir/include/c++/v1/"
+                chmod -R u+w "$arch_dir/include/c++/v1/"
+                cs="$arch_dir/include/c++/v1/__config_site"
+                if [ -f "$cs" ]; then
+                  sed -i "s/_LIBCPP_HAS_MUSL_LIBC 0/_LIBCPP_HAS_MUSL_LIBC 1/" "$cs"
+                  sed -i "s/_LIBCPP_HAS_THREAD_API_PTHREAD 0/_LIBCPP_HAS_THREAD_API_PTHREAD 1/" "$cs"
+                fi
+              fi
+            done
+          '
+          bash scripts/dev-shell.sh bash scripts/build-libcxx.sh
+          bash scripts/dev-shell.sh bash scripts/build-libcxx.sh --arch wasm64
+
+  matrix-build:
+    needs: [preflight, toolchain-cache]
+    if: needs.preflight.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # max-parallel curbs cache-restore rate-limit pressure: ~60 matrix
+      # entries × ~80 MB toolchain cache pulls hit GitHub Actions Cache's
+      # GetCacheEntryDownloadURL throughput limit (429 ResourceExhausted)
+      # when run with default parallelism. 10 keeps wall-clock reasonable
+      # while staying under the rate-limit threshold observed on
+      # 2026-05-06's first matrix CI run.
+      max-parallel: 10
+      matrix:
+        include: ${{ fromJSON(needs.preflight.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Compute commit-bound build provenance
+        # Use the commit author timestamp (%aI) — stable for a given SHA
+        # across all wall-clock re-runs of this workflow. github.event.
+        # repository.updated_at is NOT stable: it advances on every push
+        # to any branch, so a re-run after an unrelated push would change
+        # the embedded [compatibility].build_timestamp and shift archive
+        # bytes. %aI (author date) survives rebases that don't change
+        # content; %cI (committer date) does not. ISO-8601 with offset.
+        id: provenance
+        run: |
+          ts=$(git log -1 --format=%aI HEAD)
+          echo "build-timestamp=$ts" >> "$GITHUB_OUTPUT"
+          echo "build-host=${{ github.repository }}@${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          echo "provenance: build-timestamp=$ts" >&2
+
+      - name: Fetch musl submodule
+        # Even though sysroot/ + sysroot64/ are restored from cache,
+        # downstream package builds (Task 4) reach into musl/ for
+        # headers/sources during their configure steps. Initialize it
+        # here so the cache restore that follows can layer on top.
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git submodule update --init --depth 1 musl
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v18
+
+      - name: Cache Nix store + flake eval
+        uses: DeterminateSystems/magic-nix-cache-action@v13
+
+      - name: Restore toolchain cache
+        # fail-on-cache-miss: true is intentional. toolchain-cache is a
+        # `needs:` dependency of this job, so by the time we reach this
+        # step the cache MUST have been populated by the upstream job
+        # (or by an earlier identical key from a prior run / the legacy
+        # `build` job — the keys alias). A miss here means the cache
+        # got evicted between the upstream populate and this restore,
+        # or the upstream populate silently failed — both are real bugs
+        # worth surfacing as a hard fail rather than triggering a
+        # surprise rebuild inside every matrix entry.
+        uses: actions/cache@v4
+        with:
+          path: |
+            sysroot
+            sysroot64
+          key: ${{ needs.toolchain-cache.outputs.cache-key }}
+          fail-on-cache-miss: true
+
+      - name: Fetch durable binaries (so source-build fallbacks have prereqs)
+        # Mirrors the legacy `build` job's prerequisite fetch (see the
+        # comment up there): a matrix entry whose target package
+        # transitively pulls a not-yet-published archive (e.g.
+        # mariadb-test → mariadbd.wasm) needs the durable release
+        # materialized into binaries/ so the resolver finds it. Without
+        # this, source-build fallbacks fail mid-matrix on a missing
+        # prereq with no useful error.
+        #
+        # --allow-stale matches the legacy job's setting: this PR may
+        # ship a compute_sha formula change that invalidates existing
+        # entries' compatibility.cache_key_sha. Stale entries are
+        # skipped; the resolver source-builds them.
+        run: |
+          bash scripts/dev-shell.sh bash scripts/fetch-binaries.sh --allow-stale
+
+      - name: Install host npm deps (build prereq)
+        # Mirrors the legacy `build` job: some package builds invoke
+        # tsx scripts that import from host/src/ (e.g. shell's
+        # build-shell-vfs-image.ts → fflate). Done before the
+        # archive-stage step so a node_modules-related miss doesn't
+        # surface as a confusing build-script failure.
+        run: |
+          bash scripts/dev-shell.sh bash -c '
+            npm install --no-audit --no-fund
+            cd host && npm install --no-audit --no-fund
+          '
+
+      - name: Build ${{ matrix.package }} (${{ matrix.arch }})
+        # Per-package wrapper around the existing build-deps +
+        # archive_stage internals. Equivalent to one (package, arch)
+        # slice of `xtask stage-release`, but without walking the
+        # registry or emitting a manifest.json — exactly what each
+        # matrix entry needs.
+        #
+        # build-timestamp + build-host are pinned to commit-bound values
+        # computed in the "Compute commit-bound build provenance" step
+        # above, so re-running the same SHA at any wall-clock time
+        # produces byte-identical archives — load-bearing for Task 5's
+        # test-gate that re-installs from artifacts. Both values are a
+        # function of the commit alone; neither depends on workflow run
+        # number, repository.updated_at, or any other mutable field.
+        #   * build-timestamp: commit author date (%aI), ISO-8601.
+        #   * build-host: <repo>@<sha> identifies the producing CI run
+        #     in the embedded manifest.toml so consumers can correlate
+        #     archive contents back to the workflow that emitted them.
+        run: |
+          bash scripts/dev-shell.sh bash -c '
+            HOST_TARGET=$(rustc -vV | awk "/^host/ {print \$2}")
+            cargo run --release -p xtask --target "$HOST_TARGET" --quiet -- \
+              archive-stage \
+                --package "examples/libs/${{ matrix.package }}" \
+                --arch "${{ matrix.arch }}" \
+                --out "$RUNNER_TEMP/staged" \
+                --build-timestamp "${{ steps.provenance.outputs.build-timestamp }}" \
+                --build-host "${{ steps.provenance.outputs.build-host }}"
+          '
+
+      - name: Upload archive as workflow artifact
+        # if-no-files-found: error so a silent build that produced no
+        # archive surfaces as a CI failure rather than a quiet upload
+        # of nothing. Consumed by Task 5 (post-matrix test gate) and
+        # Task 6 (per-file uploads to the release tag).
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.package }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/staged/*.tar.zst
+          retention-days: 7
+          if-no-files-found: error
+
+  test-gate:
+    # Runs the 5 test suites against the union of (matrix-built archives
+    # + durable release fallback). This is the test-before-publish
+    # safety property the legacy `build` job preserves today, hoisted up
+    # to the matrix level: a green test-gate is what blesses the
+    # subsequent publish (Task 6) of the matrix archives.
+    #
+    # if: always() — test even when some matrix entries failed. Per the
+    # design doc, partial-matrix-failure is a real scenario the consumer
+    # side handles via last-green fallback, so the green packages should
+    # still be tested for the union they form with the durable release.
+    # The empty-matrix case (preflight produced []) is short-circuited:
+    # nothing was built, nothing to test.
+    needs: [preflight, toolchain-cache, matrix-build]
+    if: always() && needs.preflight.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Fetch submodules (musl, libc-test, os-test)
+        # musl       — sysroot rebuild fallback (cache restore should
+        #               succeed; this is defense-in-depth for any
+        #               build-script that reaches into musl/ for headers).
+        # libc-test  — scripts/run-libc-tests.sh
+        # os-test    — scripts/run-sortix-tests.sh
+        # Same SSH→HTTPS rewrite as the legacy build job for libc-test.
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git submodule update --init --depth 1 musl libc-test os-test
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v18
+
+      - name: Cache Nix store + flake eval
+        uses: DeterminateSystems/magic-nix-cache-action@v13
+
+      - name: Restore toolchain cache
+        # fail-on-cache-miss: true — the upstream toolchain-cache job is
+        # in our `needs:` set, so by the time we reach this step the
+        # cache MUST be populated. A miss means a real bug (eviction
+        # between populate + restore, or upstream silent failure) we
+        # want to surface rather than mask with a multi-minute rebuild
+        # inside this gate.
+        uses: actions/cache@v4
+        with:
+          path: |
+            sysroot
+            sysroot64
+          key: ${{ needs.toolchain-cache.outputs.cache-key }}
+          fail-on-cache-miss: true
+
+      - name: Download matrix artifacts
+        # Each matrix entry uploaded one artifact named "<pkg>-<arch>"
+        # containing one .tar.zst. With no `name:` filter this downloads
+        # every artifact produced by this run, landing them at
+        # `<path>/<artifact-name>/<archive>.tar.zst`. We re-flatten in
+        # the next step.
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/staged-archives
+
+      - name: Materialize binaries (synth manifest + install-release overlay)
+        # The matrix produced a flat set of per-package archives whose
+        # filenames encode (program, version, revision, abi, arch,
+        # short_sha). install-release wants a manifest.json describing
+        # the set, plus archives laid out under {libs,programs}/. We:
+        #
+        #   1. Run scripts/fetch-binaries.sh first to populate
+        #      binaries/ from the durable release. This is the
+        #      "everything not built by the matrix" baseline.
+        #
+        #   2. Sort the matrix .tar.zst files into <staging>/libs/ or
+        #      <staging>/programs/ based on each package's `kind` from
+        #      examples/libs/<pkg>/package.toml.
+        #
+        #   3. Run `xtask build-manifest --in <staging>` to synthesize
+        #      a manifest.json from the sorted archives. build-manifest
+        #      walks the registry to compute each (pkg, arch)'s
+        #      cache_key_sha, finds the matching .tar.zst on disk, and
+        #      emits a archive entry with the right `compatibility`
+        #      block — the same shape `xtask stage-release` produces.
+        #
+        #   4. Run `xtask install-release` to overlay those archives
+        #      onto the binaries/ tree populated by fetch-binaries.
+        #      install-release replaces symlinks under
+        #      binaries/programs/<arch>/ with ones pointing at the
+        #      matrix-built canonical cache entries. Tests then see
+        #      the matrix-built bytes for changed packages and the
+        #      durable bytes for everything else.
+        #
+        # `--allow-stale` mirrors the matrix-build step: a PR shipping a
+        # compute_sha formula change will fail the strict pre-flight on
+        # the durable side, but `fetch-binaries.sh --allow-stale` falls
+        # back to source builds. The overlay (matrix archives produced
+        # by THIS workflow) was just stamped by Task 4 with the live
+        # formula, so it always passes the strict check there.
+        run: |
+          bash scripts/dev-shell.sh bash -c '
+            set -euo pipefail
+            bash scripts/fetch-binaries.sh --allow-stale
+
+            STAGE="$RUNNER_TEMP/staged-overlay"
+            mkdir -p "$STAGE/libs" "$STAGE/programs"
+
+            # Flatten <name>-<arch>/<x>.tar.zst → libs/ or programs/
+            # based on the source package'"'"'s kind. The package name
+            # is the artifact-name prefix before the trailing -wasm32 or
+            # -wasm64; we strip the arch suffix to get the directory
+            # under examples/libs/.
+            shopt -s nullglob
+            for adir in "$RUNNER_TEMP/staged-archives"/*/; do
+              aname=$(basename "$adir")
+              pkg="${aname%-wasm32}"
+              pkg="${pkg%-wasm64}"
+              ptoml="examples/libs/$pkg/package.toml"
+              if [ ! -f "$ptoml" ]; then
+                echo "test-gate: no package.toml for $pkg (artifact $aname); skipping" >&2
+                continue
+              fi
+              kind=$(awk -F\" "/^kind *=/ {print \$2; exit}" "$ptoml")
+              case "$kind" in
+                library) sub=libs ;;
+                program) sub=programs ;;
+                *) echo "test-gate: unknown kind=$kind for $pkg" >&2; exit 1 ;;
+              esac
+              for f in "$adir"*.tar.zst; do
+                cp -v "$f" "$STAGE/$sub/"
+              done
+            done
+
+            HOST_TARGET=$(rustc -vV | awk "/^host/ {print \$2}")
+
+            # Synthesize manifest.json. --tag is a synthetic value; we
+            # reuse the pr-<NNN>-staging shape (accepted by
+            # verify_tag_matches_abi without ABI coupling) so this works
+            # regardless of the kernel ABI in this branch.
+            cargo run --release -p xtask --target "$HOST_TARGET" --quiet -- \
+              build-manifest \
+                --in "$STAGE" \
+                --out "$STAGE/manifest.json" \
+                --tag "pr-${{ github.event.pull_request.number }}-test-gate-staging"
+
+            # Overlay onto binaries/. install-release replaces program
+            # symlinks under binaries/programs/<arch>/ with ones into
+            # the matrix-built cache entries.
+            cargo run --release -p xtask --target "$HOST_TARGET" --quiet -- \
+              install-release \
+                --manifest "$STAGE/manifest.json" \
+                --archive-base "file://$STAGE" \
+                --binaries-dir binaries
+          '
+
+      - name: Build kernel + test programs + install host deps
+        # Test prereqs not shipped in the release archives: kernel.wasm
+        # is built fresh (and copied into local-binaries/ where the
+        # resolver finds it ahead of binaries/), as are programs/*.wasm
+        # fixtures consumed by vitest. Two npm installs: host/ for
+        # vitest, repo root for tsx (used by the libc-test/POSIX/sortix
+        # runners).
+        run: |
+          bash scripts/dev-shell.sh bash -c '
+            cargo build --release -p wasm-posix-kernel \
+              -Z build-std=core,alloc \
+              -Z build-std-features=panic_immediate_abort
+            mkdir -p local-binaries
+            cp target/wasm64-unknown-unknown/release/wasm_posix_kernel.wasm \
+              local-binaries/kernel.wasm
+            bash scripts/build-programs.sh
+            npm install --no-audit --no-fund
+            cd host && npm install --no-audit --no-fund
+          '
+
+      - name: Run cargo tests (kernel unit tests)
+        run: |
+          bash scripts/dev-shell.sh bash -c '
+            HOST_TARGET=$(rustc -vV | awk "/^host/ {print \$2}")
+            cargo test -p wasm-posix-kernel --target "$HOST_TARGET" --lib
+          '
+
+      - name: Run vitest (host integration tests)
+        run: |
+          bash scripts/dev-shell.sh bash -c '
+            cd host && npx vitest run
+          '
+
+      - name: Run libc-test conformance suite
+        run: |
+          bash scripts/dev-shell.sh bash scripts/run-libc-tests.sh
+
+      - name: Run Open POSIX Test Suite
+        run: |
+          bash scripts/dev-shell.sh bash scripts/run-posix-tests.sh
+
+      - name: Run Sortix os-test suite
+        run: |
+          bash scripts/dev-shell.sh bash scripts/run-sortix-tests.sh --all
+
+  publish:
+    # Per-file uploads to the release tag (Phase B-1 Task 6).
+    #
+    # Gating:
+    #   * needs test-gate so partial-matrix-failure doesn't ship
+    #     untested archives. test-gate itself runs with `if: always()`
+    #     against the union of (matrix-built + durable fallback), so a
+    #     green test-gate blesses the matrix archives even when the
+    #     durable side filled in some packages.
+    #   * preflight.outputs.matrix != '[]' short-circuits the empty-
+    #     matrix case (every package's sha already published; nothing
+    #     new to upload).
+    #
+    # Tag selection mirrors the preflight: `pr-<NNN>-staging` for PR
+    # runs (same tag the legacy publish-pr-staging.sh job writes to),
+    # `binaries-abi-v<N>` for non-PR runs. Same `target_tag` flows
+    # through preflight → matrix → publish so a single workflow run
+    # can't disagree with itself.
+    #
+    # Concurrency group serializes publishes to the same tag —
+    # `gh release upload --clobber` races on overlapping asset
+    # overwrites (two runs uploading different bytes for the same
+    # asset name within the same second can interleave HTTP requests
+    # and end up with one client's body and the other's metadata).
+    # Different cache_key_sha → different filename (sha is in the
+    # filename), so cross-run conflicts only happen when re-running
+    # the same SHA, where --clobber is byte-identical and a no-op.
+    # Don't cancel in-progress: an interrupted upload leaves a
+    # partial asset on the release.
+    needs: [preflight, matrix-build, test-gate]
+    if: needs.test-gate.result == 'success' && needs.preflight.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # gh release create/upload
+    concurrency:
+      group: phase-b-1-publish-${{ needs.preflight.outputs.target_tag }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+
+      - name: Download matrix artifacts
+        # No `name:` filter → downloads every artifact produced by this
+        # run, landing them at `<path>/<artifact-name>/<archive>.tar.zst`.
+        # We flatten with `find` in the upload step.
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/staged-archives
+
+      - name: Ensure release tag exists
+        # Mirrors the create-vs-upload split in
+        # scripts/publish-pr-staging.sh: if the tag exists, skip create
+        # (the upload step uses --clobber and is idempotent); if it
+        # doesn't, create with the right shape:
+        #   * `pr-<N>-staging` → --prerelease, PR-linked notes
+        #   * `binaries-abi-v<N>` → durable, no --prerelease flag
+        # --target pins the release to the PR head SHA so the release
+        # page links back at the producing commit (matches the legacy
+        # publish-pr-staging.sh behavior).
+        run: |
+          TAG="${{ needs.preflight.outputs.target_tag }}"
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "release $TAG exists; will upload assets with --clobber"
+          else
+            echo "release $TAG does not exist; creating"
+            if [[ "$TAG" == pr-*-staging ]]; then
+              gh release create "$TAG" \
+                --repo "${{ github.repository }}" \
+                --title "PR #${{ github.event.pull_request.number }} staging build" \
+                --notes "Per-PR staging build. Generated by Phase B-1 publish job from PR #${{ github.event.pull_request.number }}. See docs/plans/2026-05-05-decoupled-package-builds-design.md §5.3." \
+                --prerelease \
+                --target "${{ github.event.pull_request.head.sha }}"
+            else
+              gh release create "$TAG" \
+                --repo "${{ github.repository }}" \
+                --title "Binaries for ABI v${{ needs.preflight.outputs.abi }}" \
+                --notes "Phase B-1 per-file release. See docs/plans/2026-05-05-decoupled-package-builds-design.md §5.3." \
+                --target "${{ github.sha }}"
+            fi
+          fi
+
+      - name: Upload archives
+        # Each matrix artifact lives in its own directory under
+        # $RUNNER_TEMP/staged-archives/<pkg>-<arch>/<archive>.tar.zst.
+        # Flatten with `find` and upload each .tar.zst individually
+        # — the addressable unit is the per-file archive, not a
+        # combined tarball (design §5.3).
+        #
+        # --clobber is intentional: re-runs with byte-identical bytes
+        # are no-ops (same cache_key_sha → same filename → same bytes
+        # under the deterministic build pipeline). Re-runs with
+        # different bytes for the same filename only happen if the
+        # upstream build broke determinism; --clobber correctly
+        # replaces the old asset in that case.
+        run: |
+          TAG="${{ needs.preflight.outputs.target_tag }}"
+          count=0
+          while IFS= read -r f; do
+            echo "uploading $(basename "$f") to $TAG"
+            gh release upload "$TAG" "$f" --clobber --repo "${{ github.repository }}"
+            count=$((count + 1))
+          done < <(find "$RUNNER_TEMP/staged-archives" -name '*.tar.zst' -print | sort)
+          echo "publish: uploaded $count archive(s) to $TAG"
+
+  generate-index:
+    # Phase B-1 Task 7 — index.toml generation + upload.
+    #
+    # Runs after `publish` so every per-file archive has landed on the
+    # release tag before we enumerate it. Lives in its own job (rather
+    # than appended to `publish` as a final step) to keep the publish
+    # job focused on archive uploads — index.toml generation reads back
+    # from the tag, so it's a logically distinct concern.
+    #
+    # Concurrency group: same as `publish` so a re-run racing against
+    # a still-uploading earlier run waits its turn. Without this, two
+    # back-to-back pushes could both download the release assets at
+    # different points in the publish sequence and emit
+    # mutually-inconsistent index.tomls.
+    #
+    # Future consumers of the source-manifest format (resolver,
+    # third-party catalog browsers per the design's software-source
+    # concept in §4) read this file for discovery without enumerating
+    # release assets via the GitHub API.
+    needs: [preflight, publish]
+    if: needs.publish.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # gh release upload index.toml
+    concurrency:
+      group: phase-b-1-publish-${{ needs.preflight.outputs.target_tag }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v18
+
+      - name: Cache Nix store + flake eval
+        uses: DeterminateSystems/magic-nix-cache-action@v13
+
+      - name: Cache xtask build
+        # Aliases the preflight job's xtask cache key so the build
+        # below is a fast cache hit when nothing in xtask/ changed.
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: preflight-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'xtask/**') }}
+          restore-keys: |
+            preflight-${{ runner.os }}-
+
+      - name: Build xtask
+        run: |
+          bash scripts/dev-shell.sh bash -c '
+            HOST_TARGET=$(rustc -vV | awk "/^host/ {print \$2}")
+            cargo build --release -p xtask --target "$HOST_TARGET"
+          '
+
+      - name: Compute commit-bound generated_at
+        # Use the commit author timestamp (%aI) — same provenance source
+        # the matrix-build step uses for `[compatibility].build_timestamp`.
+        # Pinning to a commit-bound value keeps `index.toml` byte-stable
+        # across wall-clock re-runs of this workflow on the same SHA;
+        # otherwise re-running generate-index would produce a different
+        # index.toml byte-for-byte (mostly harmless, but wasteful).
+        id: provenance
+        run: |
+          ts=$(git log -1 --format=%aI HEAD)
+          echo "generated-at=$ts" >> "$GITHUB_OUTPUT"
+          echo "generated_at: $ts" >&2
+
+      - name: Download all archives from release
+        # Restricted to `*.tar.zst` so a previous run's index.toml (if
+        # any) doesn't get pulled into the input set. The current run's
+        # index.toml hasn't been uploaded yet — defensive filter for
+        # the re-run / partial-publish case.
+        run: |
+          TAG="${{ needs.preflight.outputs.target_tag }}"
+          mkdir -p "$RUNNER_TEMP/index-archives"
+          gh release download "$TAG" --repo "${{ github.repository }}" --pattern '*.tar.zst' --dir "$RUNNER_TEMP/index-archives"
+          echo "downloaded $(find "$RUNNER_TEMP/index-archives" -name '*.tar.zst' | wc -l) archive(s) for indexing"
+
+      - name: Generate index.toml
+        run: |
+          TAG="${{ needs.preflight.outputs.target_tag }}"
+          ABI="${{ needs.preflight.outputs.abi }}"
+          bash scripts/dev-shell.sh bash -c '
+            HOST_TARGET=$(rustc -vV | awk "/^host/ {print \$2}")
+            cargo run --release -p xtask --target "$HOST_TARGET" --quiet -- \
+              build-index \
+                --abi "'"$ABI"'" \
+                --generator "wasm-posix-kernel CI @ ${{ github.sha }}" \
+                --archives-dir "'"$RUNNER_TEMP"'/index-archives" \
+                --out "'"$RUNNER_TEMP"'/index.toml" \
+                --generated-at "${{ steps.provenance.outputs.generated-at }}"
+          '
+          echo "--- index.toml head ---"
+          head -30 "$RUNNER_TEMP/index.toml"
+
+      - name: Upload index.toml to release
+        # --clobber: re-runs with a deterministic generated_at +
+        # identical archive set produce byte-identical index.toml,
+        # so re-uploading is a no-op. A re-run with a changed archive
+        # set legitimately replaces the old index.toml with the new
+        # one, which is the correct behavior — consumers always read
+        # the latest index.toml on the tag.
+        run: |
+          TAG="${{ needs.preflight.outputs.target_tag }}"
+          gh release upload "$TAG" "$RUNNER_TEMP/index.toml" --clobber --repo "${{ github.repository }}"
+          echo "uploaded index.toml to $TAG"
