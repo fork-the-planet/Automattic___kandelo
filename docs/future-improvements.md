@@ -95,6 +95,21 @@ PR #383 (`fix(kernel): share AF_INET accept queue across fork — nginx multi-wo
 
 ## Host runtime
 
+### Use a tracked dlopen memory arena instead of one mmap per side module
+`host/src/worker-main.ts` currently allocates each dlopen side module's
+linear-memory data with a synchronous anonymous `mmap` through the syscall
+channel. That is intentionally correct for address-space accounting: the
+kernel's mmap allocator records the range, so later guest mmaps cannot overlap
+and zero side-module data/GOT by accident.
+
+The cleaner version is a small per-process dlopen arena: reserve one tracked
+anonymous mmap region on first `dlopen`, then suballocate side-module data from
+that arena with the dylink alignment requirements. This would reduce syscall
+traffic, avoid page-sized waste for many tiny side modules, and give `dlclose`
+a clearer place to reclaim or recycle side-module data later.
+
+**Files:** `host/src/worker-main.ts` (`buildDlopenImports`),
+`host/src/dylink.ts` (`LoadSharedLibraryOptions.allocateMemory`).
 ### Clarify and encapsulate dlopen side-module memory allocation
 `host/src/dylink.ts` exposes the lower-level `DynamicLinker` machinery used
 to parse `dylink.0`, lay out side-module data, apply relocations, and resolve
