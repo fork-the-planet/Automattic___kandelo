@@ -96,15 +96,23 @@
       <strong>Controls</strong>
       <dl>
         <dt>WASD / arrows</dt><dd>Move forward / back / strafe</dd>
+        <dt>Mouse</dt><dd>Aim (turn left / right)</dd>
+        <dt>Left click</dt><dd>Fire</dd>
         <dt>Space</dt><dd>Use / open door</dd>
-        <dt>Ctrl</dt><dd>Fire</dd>
+        <dt>Ctrl</dt><dd>Fire (keyboard)</dd>
         <dt>Enter</dt><dd>Confirm menu</dd>
-        <dt>Esc</dt><dd>Menu</dd>
+        <dt>Esc</dt><dd>Menu (also releases pointer lock)</dd>
       </dl>
       <p style="margin-top: 8px;">
-        Click the canvas to give it keyboard focus. The browser sends
-        AT-set-1 scancodes (Linux MEDIUMRAW) through stdin; fbDOOM
-        decodes them via its own scancode → DOOM-key table.
+        Click the canvas to capture keyboard + mouse. The page requests
+        Pointer Lock so the browser delivers unbounded relative motion
+        instead of clamping at the canvas edges. Keyboard goes through
+        stdin as AT-set-1 scancodes (Linux MEDIUMRAW); mouse motion is
+        injected as PS/2 packets that fbDOOM reads from
+        <code>/dev/input/mice</code>; sound effects and music (MUS/MIDI
+        synthesized in-process by an OPL2 emulator) are mixed together
+        and flow through <code>/dev/dsp</code> (OSS) into a Web Audio
+        AudioContext.
       </p>
     </div>
   </div>

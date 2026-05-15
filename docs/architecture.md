@@ -501,6 +501,55 @@ Cleanup paths (`munmap`, last `close` once unmapped, process exit, `exec`) clear
 
 ABI version bumped 5 → 6 to capture the new `repr(C)` structs `FbBitfield`, `FbVarScreenInfo`, `FbFixScreenInfo`. See `crates/shared/src/lib.rs::fbdev` and `abi/snapshot.json`.
 
+## Mouse input (`/dev/input/mice`)
+
+The kernel exposes a Linux `mousedev` PS/2 surface so unmodified fbdev software (fbDOOM, etc.) gets mouse input from the browser canvas. Direction is reversed vs. fbdev: events flow **host → kernel → process**.
+
+```
+   browser main thread                kernel-worker / kernel              user process
+   ─────────────────────              ──────────────────────             ─────────────────
+   canvas mousemove   ────►  postMessage("mouse_inject")
+                             kernel_inject_mouse_event(dx,dy,btn)
+                                                   ─────►  mouse::inject_event
+                                                           encode 3-byte PS/2 frame
+                                                           push to global VecDeque (4096 cap)
+                                                                                   ◄────  open("/dev/input/mice", O_RDONLY|O_NONBLOCK)
+                                                                                          single-owner via MICE_OWNER (second open from another pid → EBUSY)
+                                                                                   ◄────  read(fd, pkt, 3)
+                                                           drain bytes from queue
+                                                                                   ─────►  decode + apply (e.g. ev_mouse for fbDOOM)
+```
+
+The kernel buffers raw 3-byte packets — there is no userspace queue until the process allocates one and tells us about it, and a kernel-side queue lets `read()` complete synchronously without a host round-trip. The buffer is bounded at 4096 packets with whole-packet drop on overflow (≈10s at 400Hz). `poll()` returns `POLLIN` only when bytes are queued; `O_NONBLOCK` reads return `EAGAIN` when empty.
+
+Single-open semantics match real Linux mousedev exclusive-grab. The host inverts browser `deltaY` (browser positive-down → PS/2 positive-up) before injecting, so the kernel queue holds canonical PS/2 sign convention. ABI version bumped 6 → 7 to register the new `kernel_inject_mouse_event(i32, i32, u32) -> ()` export.
+
+## Audio output (`/dev/dsp`)
+
+The kernel exposes an OSS-style `/dev/dsp` character device so unmodified Linux audio software (fbDOOM, etc.) can play sound through a browser `AudioContext`. Direction is reversed vs. mouse: PCM samples flow **process → kernel → host**.
+
+```
+   user process                       kernel-worker / kernel                browser main thread
+   ────────────                       ──────────────────────                ───────────────────────
+   open("/dev/dsp", O_WRONLY)
+   ioctl SNDCTL_DSP_SPEED          ──►  audio::set_sample_rate
+   ioctl SNDCTL_DSP_STEREO         ──►  audio::set_channels
+   ioctl SNDCTL_DSP_SETFMT          ──►  audio::set_format (must be S16_LE)
+   write(fd, pcm, len)             ──►  audio::write_pcm
+                                       push bytes to 256 KiB ring
+                                       (drop oldest whole frames on overflow)
+                                                                ◄────────────  setInterval(50ms): drainAudio(maxBytes)
+                                       kernel_drain_audio(out_ptr, out_len)
+                                       drain whole-frame bytes from ring
+                                                                ─────────────►  decode S16 → Float32
+                                                                                schedule AudioBufferSourceNode
+                                                                                on AudioContext clock
+```
+
+The kernel does **not** mix or synthesize audio. The user program (DOOM's mixer in `i_kernel_sound.c` plus the OPL2 software synth in `i_oplmusic.c` + `opl/opl3.c` for music) does that work and writes interleaved S16_LE frames; the kernel ring is just transport. fbDOOM's mixer produces 1280 stereo frames per ~28 ms game tic — slightly more than the 1260 frames the AudioContext consumes per tic — so the ring stays full enough to hide drain jitter, and the drop-oldest-on-overflow policy keeps memory bounded.
+
+Single-open semantics match the typical OSS exclusive-grab model. Owner ownership is released on `close` of the last `/dev/dsp` fd, on `execve`, and on process exit; the ring is flushed at the same time so a successor open hears silence rather than the tail of the previous program. ABI version bumped 7 → 8 to register the new `kernel_drain_audio(i64, i32) -> i32` export plus the three readouts `kernel_audio_sample_rate / channels / pending`. The OSS ioctl encodings live in `crates/shared/src/lib.rs::oss`.
+
 ## Signal Subsystem
 
 Signals are delivered at syscall boundaries. When a process has a pending signal:

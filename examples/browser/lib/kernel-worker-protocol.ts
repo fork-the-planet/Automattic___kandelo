@@ -182,6 +182,34 @@ export interface RegisterLazyFilesMessage {
   entries: Array<{ ino: number; path: string; url: string; size: number }>;
 }
 
+/**
+ * Main-thread → kernel-worker mouse injection. The main thread captures
+ * canvas mouse events and forwards them here; the worker calls
+ * `CentralizedKernelWorker.injectMouseEvent` which appends a 3-byte PS/2
+ * frame to the kernel queue and wakes any blocked reader of
+ * `/dev/input/mice`.
+ */
+export interface MouseInjectMessage {
+  type: "mouse_inject";
+  dx: number;
+  dy: number;
+  buttons: number;
+}
+
+/**
+ * Main-thread → kernel-worker audio drain request. The main thread's
+ * AudioContext scheduler ticks every ~50 ms, asks the kernel ring for
+ * up to `maxBytes` of PCM samples, and feeds them to a chained
+ * `AudioBufferSourceNode`. The worker responds with the bytes plus the
+ * configured (rate, channels) so the main thread can size its
+ * AudioBuffer correctly.
+ */
+export interface AudioDrainMessage {
+  type: "audio_drain";
+  requestId: number;
+  maxBytes: number;
+}
+
 export interface RegisterLazyArchivesMessage {
   type: "register_lazy_archives";
   entries: Array<{
@@ -231,7 +259,9 @@ export type MainToKernelMessage =
   | RegisterPtyOutputMessage
   | RegisterLazyFilesMessage
   | RegisterLazyArchivesMessage
-  | GetForkCountRequestMessage;
+  | GetForkCountRequestMessage
+  | MouseInjectMessage
+  | AudioDrainMessage;
 
 // ── Kernel Worker → Main Thread ──
 

@@ -31,6 +31,8 @@ pub enum DevfsEntry {
     MqueueDir,
     /// /dev/fd
     FdDir,
+    /// /dev/input
+    InputDir,
 }
 
 /// Match a resolved path to a devfs directory entry.
@@ -41,6 +43,7 @@ pub fn match_devfs_dir(path: &[u8]) -> Option<DevfsEntry> {
         b"/dev/shm" => Some(DevfsEntry::ShmDir),
         b"/dev/mqueue" => Some(DevfsEntry::MqueueDir),
         b"/dev/fd" => Some(DevfsEntry::FdDir),
+        b"/dev/input" => Some(DevfsEntry::InputDir),
         _ => None,
     }
 }
@@ -159,6 +162,7 @@ fn dir_entries(
             entries.push((b"console".into(), DT_CHR, devfs_ino(b"/dev/console")));
             entries.push((b"ptmx".into(), DT_CHR, devfs_ino(b"/dev/ptmx")));
             entries.push((b"fb0".into(), DT_CHR, devfs_ino(b"/dev/fb0")));
+            entries.push((b"dsp".into(), DT_CHR, devfs_ino(b"/dev/dsp")));
 
             // Symlinks
             entries.push((b"stdin".into(), DT_LNK, devfs_ino(b"/dev/stdin")));
@@ -170,6 +174,12 @@ fn dir_entries(
             entries.push((b"pts".into(), DT_DIR, devfs_ino(b"/dev/pts")));
             entries.push((b"shm".into(), DT_DIR, devfs_ino(b"/dev/shm")));
             entries.push((b"mqueue".into(), DT_DIR, devfs_ino(b"/dev/mqueue")));
+            entries.push((b"input".into(), DT_DIR, devfs_ino(b"/dev/input")));
+        }
+        DevfsEntry::InputDir => {
+            // /dev/input/mice — Linux-compatible PS/2 mouse stream.
+            // No /dev/input/eventN evdev nodes yet (mousedev surface only).
+            entries.push((b"mice".into(), DT_CHR, devfs_ino(b"/dev/input/mice")));
         }
         DevfsEntry::PtsDir => {
             // List active PTY slaves
@@ -260,5 +270,50 @@ mod tests {
                 assert_eq!(*dtype, DT_CHR);
             }
         }
+    }
+
+    #[test]
+    fn input_dir_is_listed_under_dev() {
+        let proc = crate::process::Process::new(1);
+        let entries = dir_entries(&proc, &DevfsEntry::Root);
+        let mut found = false;
+        for (name, dtype, _) in entries.iter() {
+            if name.as_slice() == b"input" {
+                assert_eq!(*dtype, DT_DIR);
+                found = true;
+            }
+        }
+        assert!(found, "input subdir missing from /dev listing");
+    }
+
+    #[test]
+    fn dsp_is_listed_in_dev_dir() {
+        let proc = crate::process::Process::new(1);
+        let entries = dir_entries(&proc, &DevfsEntry::Root);
+        let mut found = false;
+        for (name, dtype, _) in entries.iter() {
+            if name.as_slice() == b"dsp" {
+                assert_eq!(*dtype, DT_CHR);
+                found = true;
+            }
+        }
+        assert!(found, "dsp missing from /dev listing");
+    }
+
+    #[test]
+    fn mice_is_listed_in_dev_input_dir() {
+        let proc = crate::process::Process::new(1);
+        let entries = dir_entries(&proc, &DevfsEntry::InputDir);
+        let mut found = false;
+        for (name, dtype, _) in entries.iter() {
+            if name.as_slice() == b"mice" {
+                assert_eq!(*dtype, DT_CHR);
+                found = true;
+            }
+        }
+        assert!(found, "mice missing from /dev/input listing");
+        // /dev/input itself stats as a directory.
+        let st = match_devfs_stat(b"/dev/input", 0, 0).unwrap();
+        assert_eq!(st.st_mode & 0o170000, S_IFDIR);
     }
 }

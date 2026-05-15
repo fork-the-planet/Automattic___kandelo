@@ -46,11 +46,13 @@ fn parse_ascii_usize(bytes: &[u8]) -> Option<usize> {
 /// Virtual character devices handled entirely in-kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VirtualDevice {
-    Null,     // /dev/null     host_handle = -1
-    Zero,     // /dev/zero     host_handle = -2
-    Urandom,  // /dev/urandom  host_handle = -3
-    Full,     // /dev/full     host_handle = -4
-    Fb0,      // /dev/fb0      host_handle = -5
+    Null,     // /dev/null         host_handle = -1
+    Zero,     // /dev/zero         host_handle = -2
+    Urandom,  // /dev/urandom      host_handle = -3
+    Full,     // /dev/full         host_handle = -4
+    Fb0,      // /dev/fb0          host_handle = -5
+    Mice,     // /dev/input/mice   host_handle = -6
+    Dsp,      // /dev/dsp          host_handle = -7
 }
 
 impl VirtualDevice {
@@ -62,6 +64,8 @@ impl VirtualDevice {
             VirtualDevice::Urandom => -3,
             VirtualDevice::Full => -4,
             VirtualDevice::Fb0 => -5,
+            VirtualDevice::Mice => -6,
+            VirtualDevice::Dsp => -7,
         }
     }
 
@@ -73,6 +77,8 @@ impl VirtualDevice {
             -3 => Some(VirtualDevice::Urandom),
             -4 => Some(VirtualDevice::Full),
             -5 => Some(VirtualDevice::Fb0),
+            -6 => Some(VirtualDevice::Mice),
+            -7 => Some(VirtualDevice::Dsp),
             _ => None,
         }
     }
@@ -85,6 +91,8 @@ impl VirtualDevice {
             VirtualDevice::Urandom => 3,
             VirtualDevice::Full => 4,
             VirtualDevice::Fb0 => 5,
+            VirtualDevice::Mice => 6,
+            VirtualDevice::Dsp => 7,
         }
     }
 }
@@ -102,6 +110,8 @@ fn match_virtual_device(path: &[u8]) -> Option<VirtualDevice> {
         b"/dev/urandom" | b"/dev/random" => Some(VirtualDevice::Urandom),
         b"/dev/full" => Some(VirtualDevice::Full),
         b"/dev/fb0" => Some(VirtualDevice::Fb0),
+        b"/dev/input/mice" => Some(VirtualDevice::Mice),
+        b"/dev/dsp" => Some(VirtualDevice::Dsp),
         _ => None,
     }
 }
@@ -168,6 +178,177 @@ fn proc_has_fb0_fd(proc: &Process) -> bool {
         }
     }
     false
+}
+
+/// Try to claim `/dev/input/mice` for the calling process.
+///
+/// Single-owner like `/dev/fb0` — second open from a different pid is
+/// `EBUSY`. Re-opens by the current owner are accepted.
+fn acquire_mice_or_busy(pid: u32) -> Result<(), Errno> {
+    let pid = pid as i32;
+    let owner = crate::mouse::MICE_OWNER.load(core::sync::atomic::Ordering::SeqCst);
+    if owner != -1 && owner != pid {
+        return Err(Errno::EBUSY);
+    }
+    let _ = crate::mouse::MICE_OWNER.compare_exchange(
+        -1, pid,
+        core::sync::atomic::Ordering::SeqCst,
+        core::sync::atomic::Ordering::SeqCst,
+    );
+    Ok(())
+}
+
+/// Release `/dev/input/mice` ownership held by `pid`, if any. Drops any
+/// pending packets so the next opener starts from a clean slate.
+/// Idempotent.
+pub(crate) fn maybe_release_mice(pid: u32) {
+    let prev = crate::mouse::MICE_OWNER.compare_exchange(
+        pid as i32, -1,
+        core::sync::atomic::Ordering::SeqCst,
+        core::sync::atomic::Ordering::SeqCst,
+    );
+    if prev.is_ok() {
+        crate::mouse::reset();
+    }
+}
+
+/// True iff `proc` still has an open fd referencing `/dev/input/mice`.
+fn proc_has_mice_fd(proc: &Process) -> bool {
+    use crate::ofd::FileType;
+    for fd_i in 0..1024i32 {
+        if let Ok(entry) = proc.fd_table.get(fd_i) {
+            if let Some(ofd) = proc.ofd_table.get(entry.ofd_ref.0) {
+                if ofd.file_type == FileType::CharDevice
+                    && VirtualDevice::from_host_handle(ofd.host_handle)
+                        == Some(VirtualDevice::Mice)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Try to claim `/dev/dsp` for the calling process.
+///
+/// Single-owner like `/dev/fb0` and `/dev/input/mice` — second open from
+/// a different pid is `EBUSY`. Re-opens by the current owner are
+/// accepted (matches the typical OSS exclusive-grab model).
+fn acquire_dsp_or_busy(pid: u32) -> Result<(), Errno> {
+    let pid = pid as i32;
+    let owner = crate::audio::DSP_OWNER.load(core::sync::atomic::Ordering::SeqCst);
+    if owner != -1 && owner != pid {
+        return Err(Errno::EBUSY);
+    }
+    let _ = crate::audio::DSP_OWNER.compare_exchange(
+        -1, pid,
+        core::sync::atomic::Ordering::SeqCst,
+        core::sync::atomic::Ordering::SeqCst,
+    );
+    Ok(())
+}
+
+/// Release `/dev/dsp` ownership held by `pid`, if any. Drops any
+/// pending samples so the next opener starts from silence. Idempotent.
+pub(crate) fn maybe_release_dsp(pid: u32) {
+    let prev = crate::audio::DSP_OWNER.compare_exchange(
+        pid as i32, -1,
+        core::sync::atomic::Ordering::SeqCst,
+        core::sync::atomic::Ordering::SeqCst,
+    );
+    if prev.is_ok() {
+        crate::audio::reset();
+    }
+}
+
+/// True iff `proc` still has an open fd referencing `/dev/dsp`.
+fn proc_has_dsp_fd(proc: &Process) -> bool {
+    use crate::ofd::FileType;
+    for fd_i in 0..1024i32 {
+        if let Ok(entry) = proc.fd_table.get(fd_i) {
+            if let Some(ofd) = proc.ofd_table.get(entry.ofd_ref.0) {
+                if ofd.file_type == FileType::CharDevice
+                    && VirtualDevice::from_host_handle(ofd.host_handle)
+                        == Some(VirtualDevice::Dsp)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Handle ioctl on `/dev/dsp`.
+///
+/// Implements the OSS commands fbDOOM (and most OSS clients) actually
+/// emit during init:
+/// - `SNDCTL_DSP_RESET` — clear the ring (no-op besides side effect).
+/// - `SNDCTL_DSP_SPEED` — set sample rate; in/out: i32 hz.
+/// - `SNDCTL_DSP_STEREO` — set channel count; in/out: i32 (0=mono, 1=stereo).
+/// - `SNDCTL_DSP_SETFMT` — set sample format; only `AFMT_S16_LE`.
+/// - `SNDCTL_DSP_GETFMTS` — bitmask of supported formats; we report only `AFMT_S16_LE`.
+/// - `SNDCTL_DSP_SETFRAGMENT` — accept and ignore (host buffering is RAF-paced).
+/// - `SNDCTL_DSP_SYNC` — accept; the kernel ring is the boundary.
+///
+/// Anything else returns `ENOTTY`.
+fn handle_dsp_ioctl(request: u32, buf: &mut [u8]) -> Result<(), Errno> {
+    use wasm_posix_shared::oss::*;
+    match request {
+        SNDCTL_DSP_RESET => {
+            crate::audio::reset();
+            Ok(())
+        }
+        SNDCTL_DSP_SYNC => Ok(()),
+        SNDCTL_DSP_SPEED => {
+            if buf.len() < 4 { return Err(Errno::EINVAL); }
+            let req = i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]).max(0) as u32;
+            let actual = crate::audio::set_sample_rate(req);
+            buf[0..4].copy_from_slice(&(actual as i32).to_le_bytes());
+            Ok(())
+        }
+        SNDCTL_DSP_STEREO => {
+            if buf.len() < 4 { return Err(Errno::EINVAL); }
+            let req = i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+            // OSS: arg = 0 means mono, anything else = stereo.
+            let chans = if req == 0 { 1 } else { 2 };
+            let actual = crate::audio::set_channels(chans);
+            // Report back the boolean (1 = stereo, 0 = mono).
+            let report: i32 = if actual == 2 { 1 } else { 0 };
+            buf[0..4].copy_from_slice(&report.to_le_bytes());
+            Ok(())
+        }
+        SNDCTL_DSP_CHANNELS => {
+            if buf.len() < 4 { return Err(Errno::EINVAL); }
+            let req = i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]).max(0) as u32;
+            let actual = crate::audio::set_channels(req);
+            buf[0..4].copy_from_slice(&(actual as i32).to_le_bytes());
+            Ok(())
+        }
+        SNDCTL_DSP_SETFMT => {
+            if buf.len() < 4 { return Err(Errno::EINVAL); }
+            let req = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+            if !crate::audio::set_format(req) {
+                return Err(Errno::EINVAL);
+            }
+            // Echo the format back.
+            buf[0..4].copy_from_slice(&req.to_le_bytes());
+            Ok(())
+        }
+        SNDCTL_DSP_GETFMTS => {
+            if buf.len() < 4 { return Err(Errno::EINVAL); }
+            buf[0..4].copy_from_slice(&crate::audio::AFMT_S16_LE.to_le_bytes());
+            Ok(())
+        }
+        SNDCTL_DSP_SETFRAGMENT => {
+            // Accept silently — fragment hints don't apply to the
+            // host-side AudioContext path. Echo the value the caller
+            // provided so it doesn't second-guess us.
+            Ok(())
+        }
+        _ => Err(Errno::ENOTTY),
+    }
 }
 
 /// Fixed framebuffer geometry. fbDOOM is happy with whatever the device
@@ -293,6 +474,12 @@ pub fn sys_open(
     if let Some(dev) = match_virtual_device(&resolved) {
         if dev == VirtualDevice::Fb0 {
             acquire_fb0_or_busy(proc.pid)?;
+        }
+        if dev == VirtualDevice::Mice {
+            acquire_mice_or_busy(proc.pid)?;
+        }
+        if dev == VirtualDevice::Dsp {
+            acquire_dsp_or_busy(proc.pid)?;
         }
         let status_flags = oflags & !CREATION_FLAGS;
         let ofd_idx = proc.ofd_table.create(
@@ -605,6 +792,25 @@ pub fn sys_close(
         && !proc_has_fb0_fd(proc)
     {
         maybe_release_fb0(proc.pid);
+    }
+
+    // /dev/input/mice ownership: release once the process has dropped
+    // its last Mice fd. No mmap relationship to consider (unlike fb0).
+    if file_type == FileType::CharDevice
+        && VirtualDevice::from_host_handle(host_handle) == Some(VirtualDevice::Mice)
+        && !proc_has_mice_fd(proc)
+    {
+        maybe_release_mice(proc.pid);
+    }
+
+    // /dev/dsp ownership: same pattern — release once the last Dsp fd
+    // is gone and drop any unflushed PCM bytes so a successor open
+    // starts from silence.
+    if file_type == FileType::CharDevice
+        && VirtualDevice::from_host_handle(host_handle) == Some(VirtualDevice::Dsp)
+        && !proc_has_dsp_fd(proc)
+    {
+        maybe_release_dsp(proc.pid);
     }
 
     Ok(())
@@ -924,14 +1130,23 @@ pub fn sys_read(
                         // /dev/fb0 doesn't support direct read — software is
                         // expected to mmap. Return 0 (EOF-like) rather than
                         // making up pixel bytes, matching the existing
-                        // "no-op for unsupported access" pattern.
-                        VirtualDevice::Null | VirtualDevice::Fb0 => 0,
+                        // "no-op for unsupported access" pattern. /dev/dsp
+                        // is write-only too: the host drains via the
+                        // dedicated wasm export, not via user-space read().
+                        VirtualDevice::Null | VirtualDevice::Fb0 | VirtualDevice::Dsp => 0,
                         VirtualDevice::Zero | VirtualDevice::Full => {
                             for b in buf.iter_mut() { *b = 0; }
                             buf.len()
                         }
                         VirtualDevice::Urandom => {
                             host.host_getrandom(buf)?
+                        }
+                        VirtualDevice::Mice => {
+                            let n = crate::mouse::read_into(buf);
+                            if n == 0 {
+                                return Err(Errno::EAGAIN);
+                            }
+                            n
                         }
                     };
                     return Ok(n);
@@ -1309,7 +1524,17 @@ pub fn sys_write(
                             // when capping at smem_len; we mirror that.
                             Ok(buf.len())
                         }
-                        _ => Ok(buf.len()), // Null, Zero, Urandom: discard
+                        VirtualDevice::Dsp => {
+                            // OSS write semantics: append PCM to the device
+                            // queue. The kernel ring drops oldest whole
+                            // frames on overflow (matches what real OSS
+                            // drivers do under hardware overrun) but always
+                            // reports `buf.len()` to the caller — same as
+                            // /dev/null/zero/urandom: we never short-write.
+                            crate::audio::write_pcm(buf);
+                            Ok(buf.len())
+                        }
+                        _ => Ok(buf.len()), // Null, Zero, Urandom, Mice: discard
                     };
                 }
             }
@@ -3167,6 +3392,13 @@ pub fn sys_execve(proc: &mut Process, host: &mut dyn HostIO, path: &[u8]) -> Res
         proc.fb_binding = None;
         maybe_release_fb0(proc.pid);
     }
+    // /dev/input/mice cleanup: exec also drops mouse ownership. The
+    // post-exec image starts with a clean queue — no stale packets from
+    // the parent program survive across exec.
+    maybe_release_mice(proc.pid);
+    // /dev/dsp cleanup: same — drop ownership and flush any queued PCM
+    // so a post-exec program doesn't hear the tail of its predecessor.
+    maybe_release_dsp(proc.pid);
     // Resolve relative paths against process CWD so the host sees absolute paths.
     // This is critical for posix_spawn with chdir file actions — the child's CWD
     // may differ from the initial data directory the host knows about.
@@ -5365,12 +5597,36 @@ fn poll_check(proc: &mut Process, fds: &mut [WasmPollFd]) -> i32 {
                 }
             }
             FileType::Regular | FileType::CharDevice | FileType::Directory | FileType::MemFd => {
-                // Regular files and char devices are always ready
-                if pollfd.events & POLLIN != 0 {
-                    revents |= POLLIN;
-                }
-                if pollfd.events & POLLOUT != 0 {
-                    revents |= POLLOUT;
+                // /dev/input/mice gates POLLIN on the actual queue state
+                // — readiness here mirrors what sys_read returns. Without
+                // this special case, poll() would spin because the
+                // generic char-device branch reports always-ready.
+                if ofd.file_type == FileType::CharDevice
+                    && VirtualDevice::from_host_handle(ofd.host_handle)
+                        == Some(VirtualDevice::Mice)
+                {
+                    if pollfd.events & POLLIN != 0 && crate::mouse::has_data() {
+                        revents |= POLLIN;
+                    }
+                    // Mice doesn't accept writes — never report POLLOUT.
+                } else if ofd.file_type == FileType::CharDevice
+                    && VirtualDevice::from_host_handle(ofd.host_handle)
+                        == Some(VirtualDevice::Dsp)
+                {
+                    // /dev/dsp is write-only. POLLOUT is always ready —
+                    // the ring drops oldest frames on overflow rather
+                    // than blocking — and POLLIN never fires.
+                    if pollfd.events & POLLOUT != 0 {
+                        revents |= POLLOUT;
+                    }
+                } else {
+                    // Regular files and char devices are always ready
+                    if pollfd.events & POLLIN != 0 {
+                        revents |= POLLIN;
+                    }
+                    if pollfd.events & POLLOUT != 0 {
+                        revents |= POLLOUT;
+                    }
                 }
             }
             FileType::PtyMaster => {
@@ -5609,6 +5865,12 @@ pub fn sys_openat(
     if let Some(dev) = match_virtual_device(&resolved) {
         if dev == VirtualDevice::Fb0 {
             acquire_fb0_or_busy(proc.pid)?;
+        }
+        if dev == VirtualDevice::Mice {
+            acquire_mice_or_busy(proc.pid)?;
+        }
+        if dev == VirtualDevice::Dsp {
+            acquire_dsp_or_busy(proc.pid)?;
         }
         let status_flags = oflags & !CREATION_FLAGS;
         let ofd_idx = proc.ofd_table.create(
@@ -6085,6 +6347,16 @@ pub fn sys_ioctl(proc: &mut Process, fd: i32, request: u32, buf: &mut [u8]) -> R
             && VirtualDevice::from_host_handle(ofd.host_handle) == Some(VirtualDevice::Fb0)
         {
             return handle_fb_ioctl(request, buf);
+        }
+    }
+
+    // --- /dev/dsp ioctls — OSS surface ---
+    {
+        let ofd = proc.ofd_table.get(ofd_idx).ok_or(Errno::EBADF)?;
+        if ofd.file_type == FileType::CharDevice
+            && VirtualDevice::from_host_handle(ofd.host_handle) == Some(VirtualDevice::Dsp)
+        {
+            return handle_dsp_ioctl(request, buf);
         }
     }
 
@@ -13359,11 +13631,12 @@ mod tests {
 
     #[test]
     fn test_virtual_device_roundtrip() {
-        for dev in [VirtualDevice::Null, VirtualDevice::Zero, VirtualDevice::Urandom, VirtualDevice::Full, VirtualDevice::Fb0] {
+        for dev in [VirtualDevice::Null, VirtualDevice::Zero, VirtualDevice::Urandom, VirtualDevice::Full, VirtualDevice::Fb0, VirtualDevice::Mice, VirtualDevice::Dsp] {
             assert_eq!(VirtualDevice::from_host_handle(dev.host_handle()), Some(dev));
         }
         assert_eq!(VirtualDevice::from_host_handle(0), None);
-        assert_eq!(VirtualDevice::from_host_handle(-6), None);
+        // First sentinel past the allocated range — must not roundtrip.
+        assert_eq!(VirtualDevice::from_host_handle(-8), None);
     }
 
     // ===== Loopback socket tests =====
@@ -15604,5 +15877,363 @@ mod tests {
         let fd2 = sys_open(&mut proc2, &mut host, b"/dev/fb0", O_RDWR, 0).unwrap();
         sys_close(&mut proc2, &mut host, fd2).unwrap();
         assert_eq!(crate::process_table::FB0_OWNER.load(Ordering::SeqCst), -1);
+    }
+
+    // -----------------------------------------------------------------
+    // /dev/input/mice tests — mirror the fb0 surface.
+    // -----------------------------------------------------------------
+
+    /// Serializes tests that touch MICE_OWNER + the global mouse queue.
+    /// Both pieces of state are process-global, so concurrent tests would
+    /// interfere. Same pattern as `FB0_OWNER_LOCK` above.
+    static MICE_OWNER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn reset_mice_state() {
+        use core::sync::atomic::Ordering;
+        crate::mouse::MICE_OWNER.store(-1, Ordering::SeqCst);
+        crate::mouse::reset();
+    }
+
+    #[test]
+    fn match_virtual_device_recognizes_mice() {
+        assert_eq!(match_virtual_device(b"/dev/input/mice"), Some(VirtualDevice::Mice));
+        // No /dev/input/event0 — evdev is out of scope for v1.
+        assert_eq!(match_virtual_device(b"/dev/input/event0"), None);
+    }
+
+    #[test]
+    fn mice_stat_is_chr() {
+        let st = virtual_device_stat(VirtualDevice::Mice, 0, 0);
+        assert_eq!(st.st_mode & wasm_posix_shared::mode::S_IFMT,
+                   wasm_posix_shared::mode::S_IFCHR);
+        assert_eq!(st.st_ino, VirtualDevice::Mice.ino());
+    }
+
+    #[test]
+    fn open_mice_acquires_ownership_and_second_open_from_other_pid_is_ebusy() {
+        use core::sync::atomic::Ordering;
+        let _g = MICE_OWNER_LOCK.lock().unwrap();
+        reset_mice_state();
+
+        let mut proc1 = Process::new(1);
+        let mut proc2 = Process::new(2);
+        let mut host = MockHostIO::new();
+
+        let fd1 = sys_open(&mut proc1, &mut host, b"/dev/input/mice",
+                           O_RDONLY, 0).unwrap();
+        assert_eq!(crate::mouse::MICE_OWNER.load(Ordering::SeqCst),
+                   proc1.pid as i32);
+
+        let err = sys_open(&mut proc2, &mut host, b"/dev/input/mice",
+                           O_RDONLY, 0).unwrap_err();
+        assert_eq!(err, Errno::EBUSY);
+
+        // Re-open by the SAME process is allowed.
+        let fd1b = sys_open(&mut proc1, &mut host, b"/dev/input/mice",
+                            O_RDONLY, 0).unwrap();
+        assert_ne!(fd1, fd1b);
+        sys_close(&mut proc1, &mut host, fd1).unwrap();
+        sys_close(&mut proc1, &mut host, fd1b).unwrap();
+    }
+
+    #[test]
+    fn read_mice_drains_injected_packets() {
+        let _g = MICE_OWNER_LOCK.lock().unwrap();
+        reset_mice_state();
+
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_open(&mut proc, &mut host, b"/dev/input/mice",
+                          O_RDONLY, 0).unwrap();
+
+        crate::mouse::inject_event(7, -3, 0b001);
+
+        let mut buf = [0u8; 3];
+        let n = sys_read(&mut proc, &mut host, fd, &mut buf).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(buf[1] as i8, 7);
+        assert_eq!(buf[2] as i8, -3);
+        // bit3 (frame sync) + left button (bit0) + dy negative (bit5)
+        assert_eq!(buf[0], 0x08 | 0x01 | 0x20);
+
+        sys_close(&mut proc, &mut host, fd).unwrap();
+    }
+
+    #[test]
+    fn read_mice_returns_eagain_when_empty() {
+        let _g = MICE_OWNER_LOCK.lock().unwrap();
+        reset_mice_state();
+
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_open(&mut proc, &mut host, b"/dev/input/mice",
+                          O_RDONLY, 0).unwrap();
+
+        let mut buf = [0u8; 3];
+        let err = sys_read(&mut proc, &mut host, fd, &mut buf).unwrap_err();
+        assert_eq!(err, Errno::EAGAIN);
+
+        sys_close(&mut proc, &mut host, fd).unwrap();
+    }
+
+    #[test]
+    fn close_mice_releases_owner() {
+        use core::sync::atomic::Ordering;
+        let _g = MICE_OWNER_LOCK.lock().unwrap();
+        reset_mice_state();
+
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_open(&mut proc, &mut host, b"/dev/input/mice",
+                          O_RDONLY, 0).unwrap();
+        assert_eq!(crate::mouse::MICE_OWNER.load(Ordering::SeqCst),
+                   proc.pid as i32);
+
+        // Buffered packet should be discarded on close.
+        crate::mouse::inject_event(1, 1, 0);
+        sys_close(&mut proc, &mut host, fd).unwrap();
+        assert_eq!(crate::mouse::MICE_OWNER.load(Ordering::SeqCst), -1);
+        assert!(!crate::mouse::has_data(),
+                "close should reset the queue when releasing ownership");
+    }
+
+    #[test]
+    fn exec_clears_mice_owner() {
+        use core::sync::atomic::Ordering;
+        let _g = MICE_OWNER_LOCK.lock().unwrap();
+        reset_mice_state();
+
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let _fd = sys_open(&mut proc, &mut host, b"/dev/input/mice",
+                           O_RDONLY, 0).unwrap();
+        assert_eq!(crate::mouse::MICE_OWNER.load(Ordering::SeqCst),
+                   proc.pid as i32);
+
+        crate::mouse::inject_event(2, 2, 0);
+        sys_execve(&mut proc, &mut host, b"/bin/sh").unwrap();
+        assert_eq!(crate::mouse::MICE_OWNER.load(Ordering::SeqCst), -1);
+        assert!(!crate::mouse::has_data(),
+                "exec should reset the queue when releasing ownership");
+    }
+
+    // -----------------------------------------------------------------
+    // /dev/dsp tests — mirror the fb0 / mice surface for OSS audio.
+    // -----------------------------------------------------------------
+
+    /// Serializes tests that touch DSP_OWNER + the audio ring + the
+    /// audio config atomics. Shares the lock with `audio::tests` so
+    /// concurrent runs across the two modules don't race on the global
+    /// ring (single mutex, two test modules).
+    use crate::audio::TEST_RING_LOCK as DSP_OWNER_LOCK;
+
+    fn reset_dsp_state() {
+        use core::sync::atomic::Ordering;
+        crate::audio::DSP_OWNER.store(-1, Ordering::SeqCst);
+        crate::audio::reset();
+        crate::audio::SAMPLE_RATE.store(11025, Ordering::Relaxed);
+        crate::audio::CHANNELS.store(2, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn match_virtual_device_recognizes_dsp() {
+        assert_eq!(match_virtual_device(b"/dev/dsp"), Some(VirtualDevice::Dsp));
+        assert_eq!(match_virtual_device(b"/dev/dsp1"), None);
+    }
+
+    #[test]
+    fn dsp_stat_is_chr() {
+        let st = virtual_device_stat(VirtualDevice::Dsp, 0, 0);
+        assert_eq!(st.st_mode & wasm_posix_shared::mode::S_IFMT,
+                   wasm_posix_shared::mode::S_IFCHR);
+        assert_eq!(st.st_ino, VirtualDevice::Dsp.ino());
+    }
+
+    #[test]
+    fn open_dsp_acquires_ownership_and_second_open_from_other_pid_is_ebusy() {
+        use core::sync::atomic::Ordering;
+        let _g = DSP_OWNER_LOCK.lock().unwrap();
+        reset_dsp_state();
+
+        let mut proc1 = Process::new(1);
+        let mut proc2 = Process::new(2);
+        let mut host = MockHostIO::new();
+
+        let fd1 = sys_open(&mut proc1, &mut host, b"/dev/dsp",
+                           O_WRONLY, 0).unwrap();
+        assert_eq!(crate::audio::DSP_OWNER.load(Ordering::SeqCst),
+                   proc1.pid as i32);
+
+        let err = sys_open(&mut proc2, &mut host, b"/dev/dsp",
+                           O_WRONLY, 0).unwrap_err();
+        assert_eq!(err, Errno::EBUSY);
+
+        // Re-open by SAME process is allowed.
+        let fd1b = sys_open(&mut proc1, &mut host, b"/dev/dsp",
+                            O_WRONLY, 0).unwrap();
+        assert_ne!(fd1, fd1b);
+        sys_close(&mut proc1, &mut host, fd1).unwrap();
+        sys_close(&mut proc1, &mut host, fd1b).unwrap();
+    }
+
+    #[test]
+    fn write_dsp_buffers_pcm_into_ring() {
+        let _g = DSP_OWNER_LOCK.lock().unwrap();
+        reset_dsp_state();
+
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_open(&mut proc, &mut host, b"/dev/dsp",
+                          O_WRONLY, 0).unwrap();
+
+        let pcm: [u8; 8] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        let n = sys_write(&mut proc, &mut host, fd, &pcm).unwrap();
+        assert_eq!(n, 8);
+        assert_eq!(crate::audio::pending_bytes(), 8);
+
+        let mut out = [0u8; 8];
+        let drained = crate::audio::drain_into(&mut out);
+        assert_eq!(drained, 8);
+        assert_eq!(out, pcm);
+
+        sys_close(&mut proc, &mut host, fd).unwrap();
+    }
+
+    #[test]
+    fn read_dsp_returns_zero() {
+        // OSS write-only: read returns 0 (EOF-like), not EAGAIN — same
+        // policy as /dev/null. Stops fbDOOM from spinning if it ever
+        // tries to read back the ring.
+        let _g = DSP_OWNER_LOCK.lock().unwrap();
+        reset_dsp_state();
+
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_open(&mut proc, &mut host, b"/dev/dsp",
+                          O_RDONLY, 0).unwrap();
+
+        let mut buf = [0u8; 8];
+        let n = sys_read(&mut proc, &mut host, fd, &mut buf).unwrap();
+        assert_eq!(n, 0);
+        sys_close(&mut proc, &mut host, fd).unwrap();
+    }
+
+    #[test]
+    fn ioctl_dsp_speed_roundtrips_through_ring_config() {
+        use wasm_posix_shared::oss::*;
+        let _g = DSP_OWNER_LOCK.lock().unwrap();
+        reset_dsp_state();
+
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_open(&mut proc, &mut host, b"/dev/dsp",
+                          O_WRONLY, 0).unwrap();
+
+        let mut arg = 44100i32.to_le_bytes();
+        sys_ioctl(&mut proc, fd, SNDCTL_DSP_SPEED, &mut arg).unwrap();
+        // The kernel echoes back the rate it actually configured.
+        assert_eq!(i32::from_le_bytes(arg), 44100);
+        assert_eq!(crate::audio::current_config().0, 44100);
+
+        sys_close(&mut proc, &mut host, fd).unwrap();
+    }
+
+    #[test]
+    fn ioctl_dsp_setfmt_rejects_non_s16_le() {
+        use wasm_posix_shared::oss::*;
+        let _g = DSP_OWNER_LOCK.lock().unwrap();
+        reset_dsp_state();
+
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_open(&mut proc, &mut host, b"/dev/dsp",
+                          O_WRONLY, 0).unwrap();
+
+        let mut arg = 0x08u32.to_le_bytes(); // AFMT_U8 — unsupported
+        let err = sys_ioctl(&mut proc, fd, SNDCTL_DSP_SETFMT, &mut arg).unwrap_err();
+        assert_eq!(err, Errno::EINVAL);
+
+        let mut arg = AFMT_S16_LE.to_le_bytes();
+        sys_ioctl(&mut proc, fd, SNDCTL_DSP_SETFMT, &mut arg).unwrap();
+        sys_close(&mut proc, &mut host, fd).unwrap();
+    }
+
+    #[test]
+    fn ioctl_dsp_getfmts_reports_s16_le_only() {
+        use wasm_posix_shared::oss::*;
+        let _g = DSP_OWNER_LOCK.lock().unwrap();
+        reset_dsp_state();
+
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_open(&mut proc, &mut host, b"/dev/dsp",
+                          O_WRONLY, 0).unwrap();
+
+        let mut arg = [0u8; 4];
+        sys_ioctl(&mut proc, fd, SNDCTL_DSP_GETFMTS, &mut arg).unwrap();
+        assert_eq!(u32::from_le_bytes(arg), AFMT_S16_LE);
+
+        sys_close(&mut proc, &mut host, fd).unwrap();
+    }
+
+    #[test]
+    fn ioctl_dsp_reset_drains_ring() {
+        use wasm_posix_shared::oss::*;
+        let _g = DSP_OWNER_LOCK.lock().unwrap();
+        reset_dsp_state();
+
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_open(&mut proc, &mut host, b"/dev/dsp",
+                          O_WRONLY, 0).unwrap();
+
+        sys_write(&mut proc, &mut host, fd, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(crate::audio::pending_bytes(), 4);
+
+        let mut arg = [0u8; 0];
+        sys_ioctl(&mut proc, fd, SNDCTL_DSP_RESET, &mut arg).unwrap();
+        assert_eq!(crate::audio::pending_bytes(), 0);
+
+        sys_close(&mut proc, &mut host, fd).unwrap();
+    }
+
+    #[test]
+    fn close_dsp_releases_owner_and_clears_ring() {
+        use core::sync::atomic::Ordering;
+        let _g = DSP_OWNER_LOCK.lock().unwrap();
+        reset_dsp_state();
+
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let fd = sys_open(&mut proc, &mut host, b"/dev/dsp",
+                          O_WRONLY, 0).unwrap();
+        assert_eq!(crate::audio::DSP_OWNER.load(Ordering::SeqCst),
+                   proc.pid as i32);
+
+        sys_write(&mut proc, &mut host, fd, &[1, 2, 3, 4]).unwrap();
+        sys_close(&mut proc, &mut host, fd).unwrap();
+        assert_eq!(crate::audio::DSP_OWNER.load(Ordering::SeqCst), -1);
+        assert_eq!(crate::audio::pending_bytes(), 0,
+                   "close should drain the ring when releasing ownership");
+    }
+
+    #[test]
+    fn exec_clears_dsp_owner() {
+        use core::sync::atomic::Ordering;
+        let _g = DSP_OWNER_LOCK.lock().unwrap();
+        reset_dsp_state();
+
+        let mut proc = Process::new(1);
+        let mut host = MockHostIO::new();
+        let _fd = sys_open(&mut proc, &mut host, b"/dev/dsp",
+                           O_WRONLY, 0).unwrap();
+        assert_eq!(crate::audio::DSP_OWNER.load(Ordering::SeqCst),
+                   proc.pid as i32);
+
+        sys_write(&mut proc, &mut host, _fd, &[5, 5, 5, 5]).unwrap();
+        sys_execve(&mut proc, &mut host, b"/bin/sh").unwrap();
+        assert_eq!(crate::audio::DSP_OWNER.load(Ordering::SeqCst), -1);
+        assert_eq!(crate::audio::pending_bytes(), 0,
+                   "exec should drain the ring when releasing ownership");
     }
 }
