@@ -78,10 +78,11 @@ const SM_NODE_COMMAND = [
   "console.log('SpiderMonkey Node', process.version, process.arch);",
   "console.log(b.toString('hex'));",
   "console.log(new Intl.NumberFormat('de-DE').format(1234567.89));",
-  "const sab=new SharedArrayBuffer(4);",
+  "const sab=new SharedArrayBuffer(8);",
   "const view=new Int32Array(sab);",
-  "new Worker('const view=new Int32Array(workerData); Atomics.store(view,0,42); Atomics.notify(view,0);',{eval:true,workerData:sab});",
-  "Atomics.wait(view,0,0,5000);",
+  "new Worker('const view=new Int32Array(workerData); Atomics.store(view,0,42); Atomics.store(view,1,1); Atomics.notify(view,1);',{eval:true,workerData:sab});",
+  "if(Atomics.load(view,1)===0) Atomics.wait(view,1,0,5000);",
+  "if(Atomics.load(view,1)!==1) throw new Error('worker did not finish');",
   "console.log('worker', Atomics.load(view,0));",
   "\"",
   "; npm --version",
@@ -92,10 +93,11 @@ const SM_NODE_RUNTIME_DEMO_COMMAND = [
   "const {Worker}=require('worker_threads');",
   "console.log('node', process.version, process.arch);",
   "console.log('intl', new Intl.NumberFormat('de-DE').format(1234567.89));",
-  "const sab=new SharedArrayBuffer(4);",
+  "const sab=new SharedArrayBuffer(8);",
   "const view=new Int32Array(sab);",
-  "new Worker('const view=new Int32Array(workerData); Atomics.store(view,0,7); Atomics.notify(view,0);',{eval:true,workerData:sab});",
-  "Atomics.wait(view,0,0,5000);",
+  "new Worker('const view=new Int32Array(workerData); Atomics.store(view,0,7); Atomics.store(view,1,1); Atomics.notify(view,1);',{eval:true,workerData:sab});",
+  "if(Atomics.load(view,1)===0) Atomics.wait(view,1,0,5000);",
+  "if(Atomics.load(view,1)!==1) throw new Error('worker did not finish');",
   "console.log('worker', Atomics.load(view,0));",
   "\"",
 ].join(" ");
@@ -137,8 +139,8 @@ const SPIDERMONKEY_NODE_GUIDE: DemoGuideConfig = {
           id: "enter-repl",
           label: "Open REPL",
           description: "Start an interactive Node-compatible REPL.",
-          kind: "terminal.run",
-          payload: "node",
+          kind: "terminal.write",
+          payload: "node\n",
         },
         {
           id: "repl-expression",
@@ -291,13 +293,12 @@ async function boot(host: LiveKernelHost, descriptor: BootDescriptor): Promise<v
       env: SHELL_ENV,
       cwd: "/work",
     });
-    host.setStatus("running");
-
     tick("running SpiderMonkey Node smoke...");
-    void host.runShellCommand(SM_NODE_COMMAND).catch((err) => {
+    await host.runShellCommand(SM_NODE_COMMAND).catch((err) => {
       tick(`command failed: ${err instanceof Error ? err.message : String(err)}`);
     });
     tick("ready");
+    host.setStatus("running");
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     host.pushDmesg({ t: (t += 50), level: "err", facility: "kandelo", msg: message });
