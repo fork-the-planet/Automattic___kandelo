@@ -4225,13 +4225,21 @@ pub extern "C" fn kernel_set_current_pid(pid: u32) {
     table.set_current_pid(pid);
 }
 
-/// Set the current thread id for the next `kernel_handle_channel` call (and
-/// for any subsequent signal syscalls that need to know which thread is
-/// executing — `sigprocmask`, `sigsuspend`, `ppoll`/`pselect`, …).
+/// Set the current kernel/libc thread id for the next `kernel_handle_channel`
+/// call and for subsequent signal syscalls that need to know which POSIX thread
+/// is executing (`sigprocmask`, `sigsuspend`, `ppoll`/`pselect`, etc.).
 ///
-/// The host tracks `(pid, channelOffset) → tid` in its own map (`channelTids`)
+/// The host tracks `(pid, channelOffset) -> tid` in its own map (`channelTids`)
 /// and must call this *before* dispatching a thread-originated syscall. The
-/// main thread uses `tid = 0`, which is also the default.
+/// channel offset identifies the host mailbox; this value supplies the
+/// guest-visible pthread identity used by gettid, set_tid_address, per-thread
+/// signal state, and clear-TID cleanup.
+///
+/// This is ambient dispatch context for today's serialized host/kernel entry
+/// model. If a single kernel instance ever services channels concurrently or
+/// reentrantly, the TID should move into the syscall header or be passed as a
+/// `kernel_handle_channel` argument. The main thread uses `tid = 0`, which is
+/// also the default.
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_set_current_tid(tid: u32) {
     let table = unsafe { &mut *PROCESS_TABLE.0.get() };
@@ -9382,21 +9390,25 @@ pub extern "C" fn kernel_getaddrinfo(
 }
 
 // ---------------------------------------------------------------------------
-// Thread identity stubs (pre-threading)
+// Thread identity
 // ---------------------------------------------------------------------------
 
-/// gettid — returns pid (tid == pid until threading is implemented).
+/// gettid - returns pid for the main thread or the host-bound worker TID.
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_gettid() -> i32 {
     let (_gkl, proc) = unsafe { get_process() };
     syscalls::sys_gettid(proc)
 }
 
-/// set_tid_address — STUB: ignores tidptr, returns pid.
+/// set_tid_address - stores the calling worker thread's clear-TID pointer.
+///
+/// This is part of the musl pthread syscall ABI Kandelo supports so POSIX
+/// pthreads can join and clean up correctly; it is not a promise of Linux
+/// kernel compatibility.
 #[unsafe(no_mangle)]
-pub extern "C" fn kernel_set_tid_address(_tidptr: usize) -> i32 {
+pub extern "C" fn kernel_set_tid_address(tidptr: usize) -> i32 {
     let (_gkl, proc) = unsafe { get_process() };
-    syscalls::sys_set_tid_address(proc)
+    syscalls::sys_set_tid_address(proc, tidptr)
 }
 
 /// set_robust_list — stores the robust list head pointer (no-op for now).

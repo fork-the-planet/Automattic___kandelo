@@ -87,6 +87,7 @@ import {
   signalExitStatus,
   SIGSEGV,
 } from "./trap-signals";
+import { threadWorkerFailureDisposition } from "./thread-worker-disposition";
 import type {
   CentralizedWorkerInitMessage,
   CentralizedThreadInitMessage,
@@ -1406,9 +1407,12 @@ async function handleClone(
   const failThread = (reason: string) => {
     const text = `[kernel-worker] pid=${pid} tid=${tid}: ${reason}\n`;
     post({ type: "stderr", pid, data: new TextEncoder().encode(text) });
-    kernelWorker.notifyThreadExit(pid, tid);
-    kernelWorker.removeChannel(pid, alloc.channelOffset);
+    const disposition = threadWorkerFailureDisposition(reason);
+    kernelWorker.finalizeThreadExit(pid, tid, alloc.channelOffset);
     void terminateThreadEntry();
+    if (disposition.kind === "guest-fatal-trap") {
+      handleExit(pid, disposition.exitStatus, disposition.signum);
+    }
   };
 
   threadWorker.on("message", (msg: unknown) => {
