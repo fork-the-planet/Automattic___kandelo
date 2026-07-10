@@ -160,6 +160,12 @@ const CLD_KILLED = 2;
 /** SIGCHLD */
 const SIGCHLD = 17;
 const SIGALRM = 14;
+/** SIGKILL — used only as the host-teardown "exit now" marker handed to the
+ *  guest glue (see killAllBlockedForTeardown). SIGKILL is never delivered to
+ *  the guest in normal operation, so the glue treats it unambiguously.
+ *  [JSC-TERMINATE-ATOMICS-WAIT-LEAK] — part of the workaround; see
+ *  docs/jsc-terminate-atomics-wait-workaround.md. */
+const SIGKILL = 9;
 
 /** Network ioctl request codes */
 const SIOCGIFCONF = 0x8912;
@@ -2747,6 +2753,108 @@ export class CentralizedKernelWorker {
 
     // Re-listen for next syscall
     this.relistenChannel(channel);
+  }
+
+  /**
+   * Host-teardown reclamation.
+   *
+   * [JSC-TERMINATE-ATOMICS-WAIT-LEAK] — WORKAROUND, remove when the engine bug
+   * is fixed; see docs/jsc-terminate-atomics-wait-workaround.md.
+   *
+   * On JSC (Safari, and Bun via `bun`'s JavaScriptCore), `Worker.terminate()`
+   * cannot kill (or free the memory of) a worker parked in `Atomics.wait` on
+   * its syscall channel — which is where every idle/blocked process worker sits
+   * (accept, read, poll, select, sleep, futex, the channel round-trip).
+   * Terminating them directly leaks their threads + committed working set, so
+   * each image switch accumulates a whole machine and the tab OOMs. V8 (Chrome,
+   * Node) interrupts the wait on terminate and reclaims, so this is a no-op cost
+   * there and is invoked unconditionally by both host entries for parity.
+   *
+   * For every worker currently parked at CH_PENDING we complete its syscall
+   * with EINTR AND queue a SIGKILL into the channel signal slot. The glue's
+   * `__deliver_pending_signal` (run right after the syscall returns) sees
+   * SIGKILL and calls the `kernel_exit` import directly (NOT musl `_exit()`,
+   * which would re-park the worker in the SYS_exit spin loop) → the `unreachable`
+   * trap that worker-main catches → the worker posts `{exit}` and returns to its
+   * JS event loop, where the host's `terminate()` (or the `{exit}` handler) can
+   * finally reclaim it.
+   *
+   * SIGKILL is never delivered to the guest in normal operation (it is
+   * uncatchable — the kernel enforces the default terminate action itself), so
+   * the glue treats a queued SIGKILL unambiguously as "exit now".
+   */
+  killAllBlockedForTeardown(): Set<number> {
+    // Drop all pending-retry bookkeeping first so nothing tries to re-arm a
+    // syscall behind the teardown. The actual wake is driven off the channels'
+    // CH_STATUS below, not off these maps — a worker parked on accept(),
+    // epoll_pwait(), a socket read, or a futex may not appear in any of these
+    // maps, but it is always sitting at CH_PENDING on its channel.
+    for (const e of this.pendingPollRetries.values()) if (e.timer) clearTimeout(e.timer);
+    for (const e of this.pendingSelectRetries.values()) if (e.timer) clearTimeout(e.timer);
+    for (const e of this.pendingSleeps.values()) clearTimeout(e.timer);
+    this.pendingPipeReaders.clear();
+    this.pendingPipeWriters.clear();
+    this.pendingPollRetries.clear();
+    this.pendingSelectRetries.clear();
+    this.pendingSleeps.clear();
+    this.pendingFutexWaits.clear();
+
+    // Wake every channel (process main threads + pthreads) that is parked in
+    // Atomics.wait — i.e. status CH_PENDING — completing its syscall with
+    // -EINTR and queueing SIGKILL so the guest glue runs its cooperative exit.
+    // Returns the set of pids we actually woke so the caller can drain only for
+    // those (a not-woken straggler never posts {exit} and must be terminated
+    // directly, not waited on).
+    const woken = new Set<number>();
+    const getExitStatus = this.kernelInstance?.exports
+      .kernel_get_process_exit_status as ((pid: number) => number) | undefined;
+    for (const registration of this.processes.values()) {
+      // Skip processes that have already exited (kernel state == Exited, i.e.
+      // status != -1). A sibling thread may have called exit_group and set the
+      // process's real exit status while this thread is still parked; forcing
+      // our own kernel_exit on that parked thread would clobber that status
+      // (e.g. a pthread exit(0) turning into 137). Only genuinely-live processes
+      // need waking; already-exited stragglers are reaped/terminated normally.
+      if (getExitStatus && getExitStatus(registration.pid) !== -1) continue;
+      for (const channel of registration.channels) {
+        let status: number;
+        try {
+          const i32 = new Int32Array(channel.memory.buffer, channel.channelOffset);
+          status = Atomics.load(i32, CH_STATUS / 4);
+        } catch { continue; }
+        if (status !== CH_PENDING) continue;
+        try {
+          this.wakeChannelForTeardownExit(channel);
+          woken.add(channel.pid);
+        } catch (err) {
+          console.error(`[killAllBlockedForTeardown] wake failed for pid=${channel.pid} off=${channel.channelOffset}: ${err}`);
+        }
+      }
+    }
+    return woken;
+  }
+
+  /** Complete a blocked channel with EINTR and queue SIGKILL so the guest glue
+   *  runs its cooperative exit. See {@link killAllBlockedForTeardown}.
+   *  [JSC-TERMINATE-ATOMICS-WAIT-LEAK] — see
+   *  docs/jsc-terminate-atomics-wait-workaround.md. */
+  private wakeChannelForTeardownExit(channel: ChannelInfo): void {
+    const pv = new DataView(channel.memory.buffer, channel.channelOffset);
+    // Queue SIGKILL for the glue's post-syscall __deliver_pending_signal. The
+    // syscall handlers may have called dequeueSignalForDelivery, but SIGKILL
+    // is never a queued Handler signal, so this slot is ours to set. Zero the
+    // handler slot too: SIGKILL is uncatchable, so it must never dispatch a
+    // userspace handler — the glue keys off signum==9 and exits before reading
+    // the handler, but clearing it keeps this write self-consistent.
+    pv.setUint32(CH_SIG_SIGNUM, SIGKILL, true);
+    pv.setUint32(CH_SIG_HANDLER, 0, true);
+    // Read the still-pending syscall request and complete it with -EINTR.
+    const syscallNr = pv.getUint32(CH_SYSCALL, true);
+    const origArgs: number[] = [];
+    for (let i = 0; i < CH_ARGS_COUNT; i++) {
+      origArgs.push(Number(pv.getBigInt64(CH_ARGS + i * CH_ARG_SIZE, true)));
+    }
+    this.completeChannel(channel, syscallNr, origArgs, SYSCALL_ARGS[syscallNr], -1, EINTR_ERRNO);
   }
 
   /**
