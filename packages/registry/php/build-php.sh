@@ -1054,11 +1054,25 @@ if [ -f main/build-defs.h ]; then
         main/build-defs.h && rm -f main/build-defs.h.bak
 fi
 
-# SQLite's feature probes can be distorted by the cross-linker's permitted
-# undefined imports. Keep PHP aligned with the actual Kandelo SQLite package:
-# sqlite3_expanded_sql() is present, while column metadata and runtime loadable
-# extensions are intentionally omitted. Do not turn those missing producer
-# symbols into fictional env imports in php.wasm.
+# SQLite's feature probes are link probes, and the SDK links with
+# -Wl,--allow-undefined. A call to a symbol libsqlite3.a does not export still
+# links, so the probe reports "present" for everything and AC_DEFINEs the macro
+# either way. The probe therefore cannot be trusted: pin each macro to what the
+# Kandelo SQLite package actually ships.
+#
+# sqlite3_expanded_sql() and the column-metadata family
+# (sqlite3_column_table_name() and friends) are present — the latter because
+# libsqlite3.a is built with -DSQLITE_ENABLE_COLUMN_METADATA, see
+# packages/registry/sqlite/build-sqlite.sh. Runtime loadable extensions are
+# intentionally omitted.
+#
+# Both directions matter. A macro left defined for a symbol the package does not
+# export lets wasm-ld emit it as an `env.` import, which worker-main.ts fills
+# with a throwing stub: the first call kills the *calling process* (the host
+# reports the trap and the kernel marks that pid SIGSEGV-terminated; the kernel
+# itself is unaffected). A macro undefined for a symbol the package does export
+# silently compiles the feature out — here, the "table" key of
+# PDOStatement::getColumnMeta() (#577).
 # PHP's fopencookie probe is also distorted by wasm cross-linking. Kandelo's
 # musl sysroot provides fopencookie(3), and PHP uses it for generic stream →
 # stdio casts rather than requiring every user stream wrapper to implement its
@@ -1066,7 +1080,7 @@ fi
 if [ -f main/php_config.h ]; then
     sed -i.bak \
         -e 's|^/\* #undef HAVE_SQLITE3_EXPANDED_SQL \*/|#define HAVE_SQLITE3_EXPANDED_SQL 1|' \
-        -e 's|^#define HAVE_SQLITE3_COLUMN_TABLE_NAME 1|/* #undef HAVE_SQLITE3_COLUMN_TABLE_NAME */|' \
+        -e 's|^/\* #undef HAVE_SQLITE3_COLUMN_TABLE_NAME \*/|#define HAVE_SQLITE3_COLUMN_TABLE_NAME 1|' \
         -e 's|^/\* #undef SQLITE_OMIT_LOAD_EXTENSION \*/|#define SQLITE_OMIT_LOAD_EXTENSION 1|' \
         -e 's|^/\* #undef HAVE_FOPENCOOKIE \*/|#define HAVE_FOPENCOOKIE 1|' \
         -e 's|^/\* #undef HAVE_PRCTL \*/|#define HAVE_PRCTL 1|' \
@@ -1081,6 +1095,12 @@ if [ -f main/php_config.h ]; then
     # fopencookie instead of falling back to wrapper-specific stream_cast hooks.
     rm -f main/streams/cast.o main/streams/cast.lo main/streams/.libs/cast.o
     rm -f ext/pcntl/pcntl.o ext/pcntl/pcntl.lo ext/pcntl/.libs/pcntl.o
+    # pdo_sqlite reads HAVE_SQLITE3_COLUMN_TABLE_NAME at compile time to decide
+    # whether getColumnMeta() reports a "table" key. Rebuild the statement unit
+    # so an incremental tree does not keep an object compiled before the
+    # override above.
+    rm -f ext/pdo_sqlite/sqlite_statement.o ext/pdo_sqlite/sqlite_statement.lo \
+        ext/pdo_sqlite/.libs/sqlite_statement.o
     # The same dependency-tracking gap can leave ext/iconv compiled against an
     # older config after switching from musl iconv to GNU libiconv. Rebuild this
     # unit so the libiconv header aliases are reflected in the final binary.
