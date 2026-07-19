@@ -273,14 +273,18 @@ exactly one installed `homebrew/core` Formula with the expected canonical name.
 `brew missing` must also report no missing dependencies before the native tree
 can be used.
 
-The native prefix is deliberately short enough to fit in the fixed
+The native prefix has exactly the same byte length as the fixed
 `/home/linuxbrew/.linuxbrew` strings stored in official host-tool bottles.
-Native Brew alone receives `HOMEBREW_RELOCATE_BUILD_PREFIX=1`, so Homebrew can
-pour those bottles and rewrite their build prefix into the isolated native
-realm. The target Brew and target Formula never receive that setting. These
-Linuxbrew bottles provide CI executables such as CMake or WABT; they are not
-Kandelo package dependencies, target bottle contents, or VFS inputs. Kandelo
-bottles are still built from the upstream sources declared by the tap Formulae.
+Homebrew pads a shorter replacement with NUL bytes when it relocates binary
+files. Some runtimes expose that padding through compiled path arrays such as
+Perl's `@INC`, making otherwise valid relocated tools unusable. Native Brew
+alone receives `HOMEBREW_RELOCATE_BUILD_PREFIX=1`, so Homebrew can pour those
+bottles and rewrite their build prefix into the exact-length isolated native
+realm without padding or truncation. The target Brew and target Formula never
+receive that setting. These Linuxbrew bottles provide CI executables such as
+CMake or WABT; they are not Kandelo package dependencies, target bottle
+contents, or VFS inputs. Kandelo bottles are still built from the upstream
+sources declared by the tap Formulae.
 
 After those checks, the publisher makes the complete native prefix root-owned
 and read-only. The target build can read that sealed prefix, but only each
@@ -288,6 +292,10 @@ planned direct dependency's selected keg is copied into a root-owned, read-only
 proxy under the canonical target Cellar. Its target `opt` link points to that
 real target keg. Homebrew requires a keg's grandparent to resolve to the active
 Cellar, so a rack symlink into the native prefix is not a valid substitute.
+If that direct keg contains a relative link into its recursive native closure,
+the publisher rewrites the copied link to the exact resolved path in the sealed
+native prefix. This preserves host tools whose launchers are supplied by another
+keg without copying or exposing that transitive keg in the target Cellar.
 Unselected keg versions and native transitive dependencies stay in the native
 prefix and cannot claim target Cellar names. Native install logs remain
 separate from Kandelo bottle dependency provenance.
@@ -298,6 +306,12 @@ while a protected Kandelo target plan is active. A usable Bubblewrap already
 provided by the host can still be detected and used, but Homebrew cannot fetch
 unplanned native code into the target Cellar after isolation begins. Native
 Homebrew has no target plan and retains its normal sandbox dependency behavior.
+The publisher also suppresses Homebrew's Linux-only global dependencies while
+it loads any Formula from the selected Kandelo tap. Homebrew recursively loads
+same-tap dependencies when it writes the target receipt; without this
+tap-scoped guard, native Bubblewrap or libcap could be recorded as a Kandelo
+guest runtime dependency. Formulae from other taps and the separate native
+Homebrew prefix retain Homebrew's normal Linux dependency behavior.
 The dedicated build identity, transient systemd service, `NoNewPrivileges`,
 immutable inputs, and teardown checks remain the publisher's primary process
 boundary when the host cannot create a rootless Bubblewrap sandbox. The builder
@@ -1015,6 +1029,11 @@ tap-identity drift, duplicate roots or metadata, cache-key drift, missing
 packages, dependency cycles, unsafe paths, and link-manifest bottle drift
 before any bottle bytes are extracted. It resolves the requested roots and
 their single-tap dependency closure in deterministic dependency-first order.
+Guest-relative link-manifest paths admit literal square brackets so standard
+POSIX utility names such as `bin/[` remain representable. They still reject
+absolute paths, empty and `.`/`..` segments, backslashes, and whitespace. Tap
+metadata references use a separate, narrower path grammar and do not inherit
+the guest filename allowance.
 
 The Node-side builder is `buildHomebrewVfs()` in
 `host/src/homebrew-vfs-builder.ts`. It verifies bottle byte count and sha256,
